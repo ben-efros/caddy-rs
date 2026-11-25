@@ -45,6 +45,11 @@ fn config(mode: &str, with_ca: bool) -> Config {
 
 fn config_with_log(mode: &str, with_ca: bool, log_path: Option<&std::path::Path>) -> Config {
     let mut client_authentication = serde_json::json!({"mode": mode});
+    if matches!(mode, "request" | "require") {
+        // These modes accept any certificate unvalidated; outside `stock_compat` that needs an
+        // explicit acknowledgement (SEC-MEDIUM D2).
+        client_authentication["insecure_accept_any_client_cert"] = serde_json::json!(true);
+    }
     if with_ca {
         client_authentication["ca"] = serde_json::json!({
             "provider": "inline",
@@ -406,4 +411,54 @@ fn implicit_local_ca_config() -> Config {
         }
     }))
     .expect("implicit local CA config decodes")
+}
+
+/// SEC-MEDIUM D2: `request`/`require` accept any client certificate unvalidated. The runtime
+/// threads the generation's `stock_compat` flag into the connection-policy parser: outside
+/// `stock_compat` the configuration is a located load error unless acknowledged, and under
+/// `stock_compat true` it loads exactly as stock Caddy does.
+#[test]
+fn unverified_client_auth_mode_needs_acknowledgement_unless_stock_compat() {
+    let build = |stock_compat: bool, acknowledged: bool| {
+        let mut client_authentication = serde_json::json!({"mode": "require"});
+        if acknowledged {
+            client_authentication["insecure_accept_any_client_cert"] = serde_json::json!(true);
+        }
+        let mut value = serde_json::json!({
+            "admin": {"disabled": true},
+            "apps": {
+                "tls": {"certificates": {"load_pem": [
+                    {"certificate": SERVER_CERT, "key": SERVER_KEY}
+                ]}},
+                "http": {"servers": {"srv0": {
+                    "listen": ["127.0.0.1:0"],
+                    "tls_connection_policies": [{"client_authentication": client_authentication}],
+                    "routes": [{"handle": [{"handler": "static_response", "body": "ok"}]}]
+                }}}
+            }
+        });
+        if stock_compat {
+            value["stock_compat"] = serde_json::json!(true);
+        }
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(GenerationStore::with_builtin_registry());
+        store
+            .load(Config::from_value(value).expect("config decodes"))
+            .expect("generation loads");
+        ServerRuntime::new(store)
+            .with_data_root(directory.path())
+            .validate_provisioning()
+    };
+
+    let error = build(false, false).expect_err("unacknowledged `require` must not load");
+    let message = error.to_string();
+    assert!(
+        message.contains("tls_connection_policies[0].client_authentication.mode")
+            && message.contains("insecure_accept_any_client_cert"),
+        "{message}"
+    );
+    build(false, true).expect("acknowledged `require` loads");
+    build(true, false).expect("stock_compat `require` loads as stock Caddy does");
+    let error = build(true, true).expect_err("the extension is not accepted under stock_compat");
+    assert!(error.to_string().contains("stock_compat"), "{error}");
 }

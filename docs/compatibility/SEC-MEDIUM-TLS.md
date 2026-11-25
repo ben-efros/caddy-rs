@@ -94,3 +94,77 @@ to `fixed` and replace the description with:
 > certificate, freshness unchecked) is closed (SEC-MEDIUM D1). No divergence from stock remains
 > beyond the shared residual that the delegated responder certificate's own revocation status is
 > not checked. `stock_compat` has no effect. Test: `crates/tls/src/ocsp/tests.rs`.
+
+## D2 — client-auth modes `request` / `require` need an explicit acknowledgement
+
+### Upstream
+
+`modules/caddytls/connpolicy.go` (`ClientAuthentication.ConfigureTLSConfig`): `mode` `request` maps
+to `tls.RequestClientCert` and `require` to `tls.RequireAnyClientCert`. Neither verifies the
+presented chain against `ClientCAs`; only `verify_if_given` (`VerifyClientCertIfGiven`) and
+`require_and_verify` (`RequireAndVerifyClientCert`) do. A trust pool configured next to `request`/
+`require` is therefore not used for validation, and `require` without a pin accepts any
+self-signed certificate. caddy-rs mirrors these semantics (`AcceptAnyClientCertVerifier`).
+
+### Problem
+
+The behaviour is stock, but operators read `require` as mutual TLS and a `trusted_ca_certs` next to
+it as the trust anchor; the listener then authenticates nothing while the
+`{http.request.tls.client.*}` placeholders look populated.
+
+### Implemented behaviour
+
+* Default (`stock_compat` absent or `false`): a `client_authentication` with `mode` `request` or
+  `require` that has no exact-leaf pin (`trusted_leaf_certs`, `trusted_leaf_cert_file`, or
+  `verifiers`) is a located configuration error at
+  `tls_connection_policies[0].client_authentication.mode`, unless the caddy-rs extension
+  `"insecure_accept_any_client_cert": true` is present. The error text says that the configured CA
+  certificates are not used in this mode and recommends `require_and_verify`. This is deliberately
+  stricter than "no CA configured": a CA pool does not make these modes verify anything.
+* `insecure_accept_any_client_cert` must be a boolean; `true` with any other effective mode
+  (`verify_if_given`, `require_and_verify`, or no mode) is an error (nothing to acknowledge);
+  `false` is the same as absent.
+* `stock_compat: true`: stock behaviour — `request`/`require` load without pin or acknowledgement,
+  and the extension field is rejected with a located error (stock has no such field; extension
+  fields are never silently accepted under `stock_compat`).
+* An exact-leaf allowlist is a real pin and needs no acknowledgement in either mode.
+* Whenever a listener is built with an unverified mode and no pinned leaf (acknowledged or
+  `stock_compat`), a WARN log states that any client certificate is accepted.
+* The Caddyfile adapter maps the `client_auth` subdirective `insecure_accept_any_client_cert` (no
+  arguments) to the JSON field. `crates/tls` gains the `tracing` workspace dependency for the WARN.
+* Handshake behaviour is unchanged: `require_and_verify` refuses a certificate that does not chain
+  to the CA; acknowledged `require` accepts any certificate but still demands one.
+
+Embedders calling `TlsServerOptions::from_connection_policies{,_with_ca_pool}` get the secure
+(non-`stock_compat`) policy; `from_connection_policies_with_stock_compat` takes the flag, and the
+server runtime passes the generation's `stock_compat`.
+
+### Tests
+
+`crates/tls/src/tls_server.rs`: `unverified_client_auth_without_pinning_is_rejected_by_default`,
+`stock_compat_keeps_stock_unverified_client_auth`, `acknowledged_unverified_client_auth_is_accepted`,
+`leaf_pinned_unverified_client_auth_needs_no_acknowledgement`,
+`verifying_client_auth_modes_are_unaffected_and_reject_a_pointless_acknowledgement`,
+`acknowledgement_field_is_validated_and_a_caddy_rs_extension`,
+`require_and_verify_rejects_and_acknowledged_require_accepts_an_untrusted_cert` (real handshakes).
+`crates/server/tests/http_client_auth.rs`:
+`unverified_client_auth_mode_needs_acknowledgement_unless_stock_compat` (runtime threads the flag).
+`crates/config/tests/upstream_adapt.rs`: `tls_client_auth_accept_any_acknowledgement_adapts_to_json`.
+Existing request/require end-to-end tests (`http_client_auth.rs`, `http3.rs`) now carry the
+acknowledgement.
+
+### Exact program-repository text to merge
+
+New `docs/compatibility/BEHAVIOR-DIVERGENCES.md` entry (`caddy-rs behaviour`, secure default, area
+TLS):
+
+> `tls_connection_policies[].client_authentication.mode` `request` and `require` accept any client
+> certificate without validating its chain (stock Caddy `RequestClientCert` /
+> `RequireAnyClientCert`, which also ignores a configured CA pool in these modes). caddy-rs keeps
+> those semantics but, outside `stock_compat true`, refuses to load such a policy unless an exact
+> leaf allowlist pins the accepted certificates or the caddy-rs extension
+> `client_authentication.insecure_accept_any_client_cert: true` (Caddyfile `client_auth`
+> subdirective of the same name) acknowledges the intent, and logs a WARN when the listener is
+> built. `stock_compat true` restores stock acceptance without acknowledgement and rejects the
+> extension field. `verify_if_given` and `require_and_verify` are unchanged. Tests:
+> `crates/tls/src/tls_server.rs`, `crates/server/tests/http_client_auth.rs`.

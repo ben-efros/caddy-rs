@@ -821,9 +821,10 @@ impl ServerRuntime {
                     tracking_id: "TLS-STRICT-SNI",
                 });
             }
-            let _tls_options = TlsServerOptions::from_connection_policies_with_ca_pool(
+            let _tls_options = TlsServerOptions::from_connection_policies_with_stock_compat(
                 policies,
                 &ca_pool_context,
+                generation.config().stock_compat(),
             )?;
             let _router = Self::build_router(
                 server_name,
@@ -2296,9 +2297,10 @@ impl ServerRuntime {
                     tracking_id: "TLS-STRICT-SNI",
                 });
             }
-            let tls_options = TlsServerOptions::from_connection_policies_with_ca_pool(
+            let tls_options = TlsServerOptions::from_connection_policies_with_stock_compat(
                 policies,
                 &client_auth_ca_pool_context(generation.config(), self.data_root.as_deref()),
+                generation.config().stock_compat(),
             )?;
             let router = Self::build_router(
                 server_name,

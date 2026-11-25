@@ -429,9 +429,22 @@ impl TlsServerOptions {
 
     /// Like [`Self::from_connection_policies`], with the runtime context needed to load
     /// client-auth CA pools from `apps.pki` authorities and the configured storage root.
+    ///
+    /// Uses the secure (non-`stock_compat`) client-authentication policy; see
+    /// [`Self::from_connection_policies_with_stock_compat`].
     pub fn from_connection_policies_with_ca_pool(
         policies: Option<&[Value]>,
         ca_pool: &crate::client_auth::CaPoolContext,
+    ) -> Result<Self> {
+        Self::from_connection_policies_with_stock_compat(policies, ca_pool, false)
+    }
+
+    /// Like [`Self::from_connection_policies_with_ca_pool`], with the generation-wide
+    /// `stock_compat` flag.
+    pub fn from_connection_policies_with_stock_compat(
+        policies: Option<&[Value]>,
+        ca_pool: &crate::client_auth::CaPoolContext,
+        stock_compat: bool,
     ) -> Result<Self> {
         let Some(policies) = policies else {
             return Ok(Self::default());
@@ -567,7 +580,7 @@ impl TlsServerOptions {
             options.cipher_suites = parsed;
         }
         if let Some(client_authentication) = policy.get("client_authentication") {
-            let parsed = parse_client_authentication(client_authentication, ca_pool)?;
+            let parsed = parse_client_authentication(client_authentication, ca_pool, stock_compat)?;
             options.client_auth_configured = true;
             options.client_auth = parsed.mode;
             options.client_auth_roots = parsed.roots;
@@ -1632,6 +1645,14 @@ pub fn build_server_config_with_cert_resolver(
             } else {
                 // Caddy's `request`/`require` modes ask for a certificate but do not verify its
                 // chain; an optional exact-leaf allowlist is still enforced.
+                if trusted_leaves.is_empty() {
+                    tracing::warn!(
+                        mode = ?mode,
+                        "TLS client authentication mode accepts ANY client certificate without \
+                         validating its chain (no trusted leaf certificates are pinned); use \
+                         `require_and_verify` for mutual TLS"
+                    );
+                }
                 Arc::new(AcceptAnyClientCertVerifier {
                     provider: Arc::clone(&provider),
                     mandatory: mode.requires_certificate(),
@@ -2244,6 +2265,9 @@ fn attach_certificate_identity(error: Error, source: Option<&str>, names: &[Stri
 /// Located path for client-authentication configuration errors.
 const CLIENT_AUTH_PATH: &str = "tls_connection_policies[0].client_authentication";
 
+/// caddy-rs extension field acknowledging that `request`/`require` accept any client certificate.
+const ACCEPT_ANY_CLIENT_CERT_FIELD: &str = "insecure_accept_any_client_cert";
+
 /// Parsed `client_authentication` configuration.
 #[derive(Debug, Default)]
 struct ParsedClientAuthentication {
@@ -2258,9 +2282,18 @@ struct ParsedClientAuthentication {
 /// deprecated direct trust fields (`trusted_ca_certs`, `trusted_ca_certs_pem_files`,
 /// `trusted_leaf_certs`) and the task-facing aliases (`trusted_ca_pool`, `trusted_ca_pem_files`,
 /// `trusted_leaf_cert_file`). Unsupported verifier modules and unknown fields fail loudly.
+///
+/// `mode: request` / `mode: require` ask for a client certificate but never validate it (stock
+/// Caddy semantics; a configured CA bundle does not change that — only `verify_if_given` and
+/// `require_and_verify` build a chain). Operators routinely read `require` as mTLS, so outside
+/// `stock_compat` this configuration is a located load error unless an exact-leaf allowlist pins
+/// the accepted certificates or the caddy-rs extension `insecure_accept_any_client_cert: true`
+/// states the intent (SEC-MEDIUM D2). Under `stock_compat true` the configuration loads exactly as
+/// in stock Caddy v2.11.9, and the extension field itself is rejected (stock has no such field).
 fn parse_client_authentication(
     value: &Value,
     ca_pool: &crate::client_auth::CaPoolContext,
+    stock_compat: bool,
 ) -> Result<ParsedClientAuthentication> {
     let object = value.as_object().ok_or_else(|| Error::TlsConfig {
         path: CLIENT_AUTH_PATH.to_string(),
@@ -2268,6 +2301,7 @@ fn parse_client_authentication(
     })?;
     let mut parsed = ParsedClientAuthentication::default();
     let mut mode = None;
+    let mut accept_any_acknowledged = false;
     let mut saw_ca_module = false;
     let mut saw_direct_roots = false;
     for (key, field) in object {
@@ -2313,6 +2347,22 @@ fn parse_client_authentication(
             "verifiers" => {
                 parse_client_auth_verifiers(field, &path, &mut parsed.leaf_certs)?;
             }
+            ACCEPT_ANY_CLIENT_CERT_FIELD => {
+                if stock_compat {
+                    return Err(Error::TlsConfig {
+                        path,
+                        message: format!(
+                            "`{ACCEPT_ANY_CLIENT_CERT_FIELD}` is a caddy-rs extension (not in \
+                             Caddy v2.11.9) and is not supported with `stock_compat true`, where \
+                             `request`/`require` need no acknowledgement"
+                        ),
+                    });
+                }
+                accept_any_acknowledged = field.as_bool().ok_or_else(|| Error::TlsConfig {
+                    path: path.clone(),
+                    message: "must be a boolean".to_string(),
+                })?;
+            }
             other => {
                 return Err(Error::Unsupported {
                     path,
@@ -2326,6 +2376,44 @@ fn parse_client_authentication(
         return Err(Error::TlsConfig {
             path: CLIENT_AUTH_PATH.to_string(),
             message: "conflicting client authentication trust configuration: `ca` cannot be combined with trusted CA fields".to_string(),
+        });
+    }
+    let unverified_mode = matches!(
+        mode,
+        Some(ClientAuthMode::Request | ClientAuthMode::Require)
+    );
+    if accept_any_acknowledged && !unverified_mode {
+        return Err(Error::TlsConfig {
+            path: format!("{CLIENT_AUTH_PATH}.{ACCEPT_ANY_CLIENT_CERT_FIELD}"),
+            message: format!(
+                "`{ACCEPT_ANY_CLIENT_CERT_FIELD}` only applies to `mode` `request` or `require`; \
+                 it has no effect with the configured mode"
+            ),
+        });
+    }
+    if unverified_mode && parsed.leaf_certs.is_empty() && !accept_any_acknowledged && !stock_compat
+    {
+        let hint = if parsed.roots.is_empty() {
+            String::new()
+        } else {
+            "; the configured CA certificates are NOT used to validate the client certificate in \
+             this mode, use `require_and_verify` (or `verify_if_given`) for that"
+                .to_string()
+        };
+        return Err(Error::TlsConfig {
+            path: format!("{CLIENT_AUTH_PATH}.mode"),
+            message: format!(
+                "mode `{}` accepts ANY client certificate without validating its chain (no \
+                 trusted leaf certificates are configured){hint}. Use `require_and_verify`, pin \
+                 `trusted_leaf_certs`, or set `{ACCEPT_ANY_CLIENT_CERT_FIELD}: true` to \
+                 acknowledge this explicitly (stock Caddy behaviour is restored by `stock_compat \
+                 true`)",
+                if mode == Some(ClientAuthMode::Request) {
+                    "request"
+                } else {
+                    "require"
+                }
+            ),
         });
     }
     let actionable = mode.is_some() || !parsed.roots.is_empty() || !parsed.leaf_certs.is_empty();
@@ -4119,7 +4207,9 @@ mod tests {
         let options = TlsServerOptions::from_connection_policies(Some(&[serde_json::json!({
             "alpn": ["http/1.1"],
             "protocols": ["tls1.3"],
-            "client_authentication": {"mode": "request"}
+            // `request` accepts any certificate unvalidated, so outside `stock_compat` it needs an
+            // explicit acknowledgement (SEC-MEDIUM D2).
+            "client_authentication": {"mode": "request", "insecure_accept_any_client_cert": true}
         })]))
         .unwrap();
         assert_eq!(options.alpn, vec![b"http/1.1".to_vec()]);
@@ -4169,10 +4259,9 @@ mod tests {
             ("verify_if_given", ClientAuthMode::VerifyIfGiven),
             ("require_and_verify", ClientAuthMode::RequireAndVerify),
         ] {
-            let options = TlsServerOptions::from_connection_policies(Some(&[
-                serde_json::json!({"client_authentication": {"mode": value}}),
-            ]))
-            .unwrap();
+            // Every stock mode parses; `request`/`require` need `stock_compat` (or the
+            // acknowledgement, covered by the SEC-MEDIUM D2 tests) to load without a pin.
+            let options = parse_client_auth(serde_json::json!({"mode": value}), true).unwrap();
             assert_eq!(options.client_auth, mode, "mode {value}");
         }
         // An empty client_authentication object is inert, like Caddy's inactive config.
@@ -4614,6 +4703,184 @@ mod tests {
             .is_err(),
             "an expired presented certificate must be rejected when verifying"
         );
+    }
+
+    // ---- SEC-MEDIUM D2: unverified client-auth modes need an explicit acknowledgement ----------
+
+    const ACK_FIELD: &str = "insecure_accept_any_client_cert";
+
+    fn parse_client_auth(
+        client_authentication: Value,
+        stock_compat: bool,
+    ) -> Result<TlsServerOptions> {
+        TlsServerOptions::from_connection_policies_with_stock_compat(
+            Some(&[serde_json::json!({ "client_authentication": client_authentication })]),
+            &crate::client_auth::CaPoolContext::new(),
+            stock_compat,
+        )
+    }
+
+    #[test]
+    fn unverified_client_auth_without_pinning_is_rejected_by_default() {
+        let encoded = client_ca_der_base64();
+        for mode in ["request", "require"] {
+            // No trust material at all.
+            let error = parse_client_auth(serde_json::json!({ "mode": mode }), false)
+                .expect_err("an unverified mode with no pin must be a load error");
+            let message = error.to_string();
+            assert!(
+                message.contains("tls_connection_policies[0].client_authentication.mode"),
+                "{mode}: error must name the JSON path: {message}"
+            );
+            assert!(message.contains(ACK_FIELD), "{mode}: {message}");
+
+            // A CA bundle does NOT make these modes verify the chain, so it is not a pin either.
+            let error = parse_client_auth(
+                serde_json::json!({ "mode": mode, "trusted_ca_certs": [encoded] }),
+                false,
+            )
+            .expect_err("a CA bundle does not make an unverified mode safe");
+            let message = error.to_string();
+            assert!(message.contains("require_and_verify"), "{mode}: {message}");
+            assert!(message.contains(ACK_FIELD), "{mode}: {message}");
+        }
+    }
+
+    #[test]
+    fn stock_compat_keeps_stock_unverified_client_auth() {
+        let encoded = client_ca_der_base64();
+        for mode in ["request", "require"] {
+            let options = parse_client_auth(serde_json::json!({ "mode": mode }), true)
+                .expect("stock Caddy accepts this configuration");
+            assert_eq!(options.client_auth, ClientAuthMode::parse(mode).unwrap());
+            parse_client_auth(
+                serde_json::json!({ "mode": mode, "trusted_ca_certs": [encoded] }),
+                true,
+            )
+            .expect("stock Caddy accepts this configuration");
+        }
+    }
+
+    #[test]
+    fn acknowledged_unverified_client_auth_is_accepted() {
+        for mode in ["request", "require"] {
+            let options =
+                parse_client_auth(serde_json::json!({ "mode": mode, ACK_FIELD: true }), false)
+                    .expect("explicit acknowledgement accepts the unverified mode");
+            assert_eq!(options.client_auth, ClientAuthMode::parse(mode).unwrap());
+        }
+    }
+
+    #[test]
+    fn leaf_pinned_unverified_client_auth_needs_no_acknowledgement() {
+        let encoded = client_ca_der_base64();
+        for mode in ["request", "require"] {
+            let options = parse_client_auth(
+                serde_json::json!({ "mode": mode, "trusted_leaf_certs": [encoded] }),
+                false,
+            )
+            .expect("an exact-leaf allowlist is a real pin");
+            assert_eq!(options.client_auth_leaf_certs.len(), 1);
+        }
+    }
+
+    #[test]
+    fn verifying_client_auth_modes_are_unaffected_and_reject_a_pointless_acknowledgement() {
+        let encoded = client_ca_der_base64();
+        for mode in ["verify_if_given", "require_and_verify"] {
+            parse_client_auth(
+                serde_json::json!({ "mode": mode, "trusted_ca_certs": [encoded] }),
+                false,
+            )
+            .unwrap_or_else(|error| panic!("{mode}: {error}"));
+            let error = parse_client_auth(
+                serde_json::json!({
+                    "mode": mode, "trusted_ca_certs": [encoded], ACK_FIELD: true
+                }),
+                false,
+            )
+            .expect_err("acknowledging an unverified mode while verifying is contradictory");
+            assert!(error.to_string().contains(ACK_FIELD), "{error}");
+        }
+    }
+
+    #[test]
+    fn acknowledgement_field_is_validated_and_a_caddy_rs_extension() {
+        // Wrong type.
+        let error = parse_client_auth(
+            serde_json::json!({ "mode": "require", ACK_FIELD: "yes" }),
+            false,
+        )
+        .expect_err("non-boolean acknowledgement");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("client_authentication.{ACK_FIELD}")),
+            "{error}"
+        );
+        // `false` is the same as absent.
+        assert!(parse_client_auth(
+            serde_json::json!({ "mode": "require", ACK_FIELD: false }),
+            false
+        )
+        .is_err());
+        // Not a stock Caddy field: rejected loudly under stock_compat instead of being ignored.
+        let error = parse_client_auth(
+            serde_json::json!({ "mode": "require", ACK_FIELD: true }),
+            true,
+        )
+        .expect_err("stock Caddy has no such field");
+        assert!(error.to_string().contains("stock_compat"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn require_and_verify_rejects_and_acknowledged_require_accepts_an_untrusted_cert() {
+        let encoded = client_ca_der_base64();
+        let resolver =
+            Arc::new(CertificateResolver::from_certificates([example()]).expect("resolver builds"));
+        let build = |auth: Value, stock_compat: bool| {
+            let options = parse_client_auth(auth, stock_compat).expect("configuration loads");
+            build_server_config(Arc::clone(&resolver), &options).expect("server config builds")
+        };
+        let untrusted = Some((UNTRUSTED_CLIENT_CERT, UNTRUSTED_CLIENT_KEY));
+
+        // Real mTLS: the untrusted certificate is refused.
+        let verifying = build(
+            serde_json::json!({ "mode": "require_and_verify", "trusted_ca_certs": [encoded] }),
+            false,
+        );
+        assert!(
+            handshake_with_client_auth(Arc::clone(&verifying), untrusted, TLS12_AND_13)
+                .await
+                .is_err(),
+            "require_and_verify must refuse a certificate that does not chain to the CA"
+        );
+        // ... and a trusted one is accepted.
+        handshake_with_client_auth(verifying, Some((CLIENT_CERT, CLIENT_KEY)), TLS12_AND_13)
+            .await
+            .expect("a certificate chaining to the CA is accepted");
+
+        // Acknowledged `require`: any certificate is accepted (stock semantics, now explicit).
+        let acknowledged = build(
+            serde_json::json!({ "mode": "require", ACK_FIELD: true }),
+            false,
+        );
+        handshake_with_client_auth(Arc::clone(&acknowledged), untrusted, TLS12_AND_13)
+            .await
+            .expect("acknowledged require accepts an arbitrary certificate");
+        // It still requires *a* certificate.
+        assert!(
+            handshake_with_client_auth(acknowledged, None, TLS12_AND_13)
+                .await
+                .is_err(),
+            "require must still demand a certificate"
+        );
+
+        // stock_compat `require` without acknowledgement behaves identically.
+        let stock = build(serde_json::json!({ "mode": "require" }), true);
+        handshake_with_client_auth(stock, untrusted, TLS12_AND_13)
+            .await
+            .expect("stock require accepts an arbitrary certificate");
     }
 
     /// Look up one of the aws-lc-rs provider's cipher suites by its wire identifier.
