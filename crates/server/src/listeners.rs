@@ -3040,11 +3040,24 @@ where
 fn admin_request_headers(
     mut headers: http::HeaderMap,
     uri: &http::Uri,
+    version: http::Version,
 ) -> Result<http::HeaderMap, caddy_rs_admin::AdminResponse> {
     if headers.get_all(http::header::HOST).iter().count() > 1 {
         return Err(caddy_rs_admin::AdminResponse::api_error(
             http::StatusCode::BAD_REQUEST,
             "too many Host headers",
+        ));
+    }
+    // hyper serves an HTTP/1.1 request without `Host`; Go answers `400 missing required Host
+    // header`. Do the same, so a host-less request cannot skip the rebinding check (HTTP/1.0 may
+    // omit it, as in Go; HTTP/2 carries `:authority`).
+    if version == http::Version::HTTP_11
+        && uri.authority().is_none()
+        && !headers.contains_key(http::header::HOST)
+    {
+        return Err(caddy_rs_admin::AdminResponse::api_error(
+            http::StatusCode::BAD_REQUEST,
+            "missing required Host header",
         ));
     }
     if let Some(authority) = uri.authority() {
@@ -3092,7 +3105,7 @@ impl hyper::service::Service<hyper::Request<Incoming>> for AdminService {
         let body_slots = Arc::clone(&self.body_slots);
         Box::pin(async move {
             let (parts, body) = request.into_parts();
-            let headers = match admin_request_headers(parts.headers, &parts.uri) {
+            let headers = match admin_request_headers(parts.headers, &parts.uri, parts.version) {
                 Ok(headers) => headers,
                 Err(rejection) => {
                     return Ok::<_, std::convert::Infallible>(admin_hyper_response(rejection))
@@ -3784,7 +3797,7 @@ pub(crate) async fn bind_admin_remote(
                             let body_slots = Arc::clone(&body_slots);
                             async move {
                                 let (parts, body) = request.into_parts();
-                                let headers = match admin_request_headers(parts.headers, &parts.uri)
+                                let headers = match admin_request_headers(parts.headers, &parts.uri, parts.version)
                                 {
                                     Ok(headers) => headers,
                                     Err(rejection) => {
@@ -5021,25 +5034,38 @@ mod admin_host_check_tests {
             headers.insert(http::header::HOST, value.parse().unwrap());
             headers
         };
+        use http::Version as V;
         // Origin-form keeps the header.
-        let resolved = admin_request_headers(with_host("a.example"), &uri("/x")).unwrap();
+        let resolved = admin_request_headers(with_host("a.example"), &uri("/x"), V::HTTP_11).unwrap();
         assert_eq!(resolved.get(http::header::HOST).unwrap(), "a.example");
         // An authority (absolute-form / :authority) replaces it; userinfo is not part of the host.
-        let resolved =
-            admin_request_headers(with_host("a.example"), &uri("http://u:p@b.example:1/x"))
-                .unwrap();
+        let resolved = admin_request_headers(
+            with_host("a.example"),
+            &uri("http://u:p@b.example:1/x"),
+            V::HTTP_11,
+        )
+        .unwrap();
         assert_eq!(resolved.get(http::header::HOST).unwrap(), "b.example:1");
         // And supplies it when the header is absent (HTTP/2).
-        let resolved =
-            admin_request_headers(http::HeaderMap::new(), &uri("http://c.example/x")).unwrap();
+        let resolved = admin_request_headers(
+            http::HeaderMap::new(),
+            &uri("http://c.example/x"),
+            V::HTTP_2,
+        )
+        .unwrap();
         assert_eq!(resolved.get(http::header::HOST).unwrap(), "c.example");
-        // Neither: still absent.
-        let resolved = admin_request_headers(http::HeaderMap::new(), &uri("/x")).unwrap();
+        // HTTP/1.0 may omit Host (as in Go): still absent.
+        let resolved =
+            admin_request_headers(http::HeaderMap::new(), &uri("/x"), V::HTTP_10).unwrap();
         assert!(resolved.get(http::header::HOST).is_none());
+        // HTTP/1.1 without Host: 400 like Go.
+        let rejected =
+            admin_request_headers(http::HeaderMap::new(), &uri("/x"), V::HTTP_11).unwrap_err();
+        assert_eq!(rejected.status, http::StatusCode::BAD_REQUEST);
         // Two Host headers: 400.
         let mut headers = with_host("a.example");
         headers.append(http::header::HOST, "b.example".parse().unwrap());
-        let rejected = admin_request_headers(headers, &uri("/x")).unwrap_err();
+        let rejected = admin_request_headers(headers, &uri("/x"), V::HTTP_11).unwrap_err();
         assert_eq!(rejected.status, http::StatusCode::BAD_REQUEST);
     }
 }
@@ -5275,6 +5301,17 @@ mod admin_unix_tests {
             vec![std::ffi::OsString::from("admin.sock")],
             "{names:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_http11_request_without_host_is_a_400_like_go() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (configured, path) = unix_listen(directory.path());
+        let handle = bind_admin(&configured, api(), None).await.expect("bind");
+        let response =
+            raw_exchange(&path, b"GET /config/ HTTP/1.1\r\nConnection: close\r\n\r\n").await;
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        handle.stop().await;
     }
 
     #[tokio::test]
