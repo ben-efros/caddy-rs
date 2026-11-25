@@ -5170,6 +5170,28 @@ mod admin_limits_tests {
     /// Go's `ReadTimeout` covers one request; between requests only `IdleTimeout` (60 s) applies.
     /// The per-read timer used to run during the idle wait too, closing a keep-alive connection
     /// after 10 s.
+    /// A graceful stop must close an idle keep-alive admin connection promptly, or a drain (the
+    /// runtime waits for ordinary connections before forcing) is held open by it.
+    #[tokio::test]
+    async fn a_graceful_stop_closes_an_idle_keep_alive_admin_connection() {
+        let (handle, address) = listener().await;
+        let mut stream = TcpStream::connect(address).await.expect("connect");
+        stream
+            .write_all(b"GET /config/ HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buffer = [0_u8; 4096];
+        let read = stream.read(&mut buffer).await.expect("response");
+        assert!(buffer[..read].starts_with(b"HTTP/1.1 200"));
+        handle.begin_graceful();
+        let closed = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buffer)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+            "an idle keep-alive connection must close on graceful shutdown: {closed:?}"
+        );
+        handle.stop().await;
+    }
+
     #[tokio::test]
     async fn an_idle_keep_alive_connection_survives_past_the_read_timeout() {
         let (handle, address) = listener().await;
