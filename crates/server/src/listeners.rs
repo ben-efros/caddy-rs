@@ -257,6 +257,9 @@ pub(crate) struct ListenerHandle {
     pub(crate) task: JoinHandle<()>,
     pub(crate) bound: String,
     pub(crate) socket_addr: Option<SocketAddr>,
+    /// Further sockets bound for the same configured address (`localhost` also listens on `[::1]`),
+    /// so that closing the listener forgets every one of them, not only the primary.
+    pub(crate) secondary_addrs: Vec<SocketAddr>,
     /// For a Unix admin listener: the socket path and the identity of the file this listener
     /// created there (the `/stop` exit path removes it only if it is still that file).
     pub(crate) unix_socket: Option<(std::path::PathBuf, SocketIdentity)>,
@@ -323,6 +326,71 @@ type BinderRef<'a> = Option<&'a crate::graceful_restart::ListenerBinder>;
 #[cfg(not(feature = "graceful-restart"))]
 type BinderRef<'a> = Option<&'a std::convert::Infallible>;
 
+/// One or more bound TCP listeners that serve a single configured address.
+///
+/// Most addresses are one socket. `localhost` is two (`127.0.0.1` and `::1`, on the same port): a
+/// client resolves the name to either family (Windows resolvers and many HTTP clients try `::1`
+/// first), and a listener that held only one of them made `localhost:PORT` refuse connections for
+/// whoever resolved to the other. The first listener is the primary one: it is the address that is
+/// reported as bound.
+pub(crate) struct AcceptSet {
+    listeners: Vec<TcpListener>,
+    /// Rotates the first listener polled, so a busy family cannot starve the other.
+    next: AtomicUsize,
+}
+
+impl AcceptSet {
+    fn single(listener: TcpListener) -> Self {
+        Self {
+            listeners: vec![listener],
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    /// The primary listener's address (the one reported as bound).
+    pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.listeners[0].local_addr()
+    }
+
+    /// The addresses of every socket after the primary one.
+    pub(crate) fn secondary_addrs(&self) -> Vec<SocketAddr> {
+        self.listeners
+            .iter()
+            .skip(1)
+            .filter_map(|listener| listener.local_addr().ok())
+            .collect()
+    }
+
+    /// Every bound address, primary first.
+    #[cfg(test)]
+    fn local_addrs(&self) -> Vec<SocketAddr> {
+        self.listeners
+            .iter()
+            .filter_map(|listener| listener.local_addr().ok())
+            .collect()
+    }
+
+    /// Accept the next connection from any of the sockets.
+    pub(crate) async fn accept(&self) -> io::Result<(tokio::net::TcpStream, SocketAddr)> {
+        if self.listeners.len() == 1 {
+            return self.listeners[0].accept().await;
+        }
+        std::future::poll_fn(|cx| {
+            let count = self.listeners.len();
+            let start = self.next.fetch_add(1, Ordering::Relaxed) % count;
+            for offset in 0..count {
+                if let Poll::Ready(result) =
+                    self.listeners[(start + offset) % count].poll_accept(cx)
+                {
+                    return Poll::Ready(result);
+                }
+            }
+            Poll::Pending
+        })
+        .await
+    }
+}
+
 /// Bind the listener for a Caddy listen address, or adopt an inherited systemd socket.
 ///
 /// When `inherited` is `Some`, the descriptor passed by systemd is adopted instead of binding a
@@ -358,13 +426,14 @@ pub(crate) async fn bind(
                         socket = %socket.local(),
                         "adopting inherited systemd TCP socket"
                     );
-                    adopt_tcp(socket, configured)?
+                    AcceptSet::single(adopt_tcp(socket, configured)?)
                 }
                 None => bind_configured_tcp(configured, &address, binder).await?,
             };
             let socket_addr = listener
                 .local_addr()
                 .map_err(|error| Error::bind(configured, error))?;
+            let secondary_addrs = listener.secondary_addrs();
             let (shutdown, receiver) = watch::channel(false);
             let (force, force_receiver) = watch::channel(false);
             let tracker = Arc::new(ConnectionTracker::default());
@@ -384,6 +453,7 @@ pub(crate) async fn bind(
                 task,
                 bound: socket_addr.to_string(),
                 socket_addr: Some(socket_addr),
+                secondary_addrs,
                 unix_socket: None,
             })
         }
@@ -445,6 +515,7 @@ pub(crate) async fn bind(
                 task,
                 bound: path,
                 socket_addr: None,
+                secondary_addrs: Vec::new(),
                 unix_socket: None,
             })
         }
@@ -517,6 +588,7 @@ pub(crate) async fn bind(
                 task,
                 bound: socket_addr.to_string(),
                 socket_addr: Some(socket_addr),
+                secondary_addrs: Vec::new(),
                 unix_socket: None,
             })
         }
@@ -543,7 +615,7 @@ async fn bind_configured_tcp(
     configured: &str,
     address: &ListenAddr,
     #[cfg_attr(not(feature = "graceful-restart"), allow(unused_variables))] binder: BinderRef<'_>,
-) -> Result<TcpListener, Error> {
+) -> Result<AcceptSet, Error> {
     if address.host().is_empty() {
         let port = address.port().ok_or_else(|| Error::Listen {
             listen: configured.to_string(),
@@ -552,46 +624,130 @@ async fn bind_configured_tcp(
         // The dual-stack wildcard is a TCP listener like any other, so it goes through the same
         // ecdysis routing: a hostless listener is the common case for a public site, and missing it
         // here would reintroduce the refused-connection window on exactly the busiest listener.
-        return bind_tcp_wildcard(configured, port, binder);
+        return bind_tcp_wildcard(configured, port, binder).map(AcceptSet::single);
     }
     match address.socket_addr() {
         // IP literal: bind exactly that address/family, through ecdysis when the graceful-restart
         // feature is on so the socket is inherited across `exec` rather than rebound.
-        Some(socket_addr) => bind_tcp_ip(configured, socket_addr, binder),
-        // Hostname: resolve and bind like Caddy's `net.Listen("tcp", "host:port")`. Bind the
-        // address without a `tcp/`/`udp/` network prefix (the prefix is already parsed above).
+        Some(socket_addr) => bind_tcp_ip(configured, socket_addr, binder).map(AcceptSet::single),
+        // `localhost` is always loopback (RFC 6761), so it is bound on both loopback addresses
+        // instead of whichever one the resolver lists first.
+        None if is_localhost(address.host()) && address.port().is_some() => {
+            bind_localhost(configured, address.port().unwrap_or_default(), binder)
+        }
+        // Any other hostname: resolve and bind one address like Caddy's
+        // `net.Listen("tcp", "host:port")`, which prefers an IPv4 address when the name has both.
+        // Tokio's own `bind` would take the first address in resolver order, which on Windows puts
+        // `::1` ahead of `127.0.0.1`.
         None => {
-            let first = TcpListener::bind(&address.address).await;
-            match first {
-                Ok(listener) => Ok(listener),
-                Err(error) => {
-                    // ADR-0046: retry once under CAP_NET_BIND_SERVICE only for EACCES on a
-                    // TCP/UDP nonzero-port address. Everything else keeps the original error.
-                    let address_owned = address.clone();
-                    let bind_address = address_owned.address.clone();
-                    // The seam's error is passed through UNCHANGED and handed to `Error::bind`,
-                    // which is what keeps the located error naming the configured address. A
-                    // previous revision rebuilt it as `std::io::Error::new(error.kind(), reason)`
-                    // with `reason` captured BEFORE the retry, which silently discarded the second
-                    // attempt's message -- including the seam's deliberate
-                    // "(raising CAP_NET_BIND_SERVICE: <why>)" explanation. An operator then saw the
-                    // first attempt's wording with no hint that escalation was tried and failed.
-                    let retried =
-                        crate::bindcap::with_bind_capability(&address_owned, error, move || {
-                            // A fresh single-threaded runtime: this runs on the dedicated thread
-                            // the seam spawned, not on the caller's Tokio runtime.
-                            let runtime = tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()?;
-                            runtime.block_on(TcpListener::bind(&bind_address))
-                        })
-                        .map_err(|error| located_bind_error(configured, error));
-                    match retried {
-                        Ok(listener) => Ok(listener),
-                        Err(error) => Err(error),
-                    }
+            if let Ok(resolved) = tokio::net::lookup_host(&address.address).await {
+                let resolved: Vec<SocketAddr> = resolved.collect();
+                if let Some(chosen) = preferred_address(&resolved) {
+                    return bind_tcp_ip(configured, chosen, binder).map(AcceptSet::single);
                 }
             }
+            // Resolution failed or returned nothing: let the plain bind report the real error.
+            bind_unresolved_hostname(configured, address)
+                .await
+                .map(AcceptSet::single)
+        }
+    }
+}
+
+/// The address to bind for a hostname that resolved to `resolved`: the first IPv4 address, else
+/// the first address (Go's `net.Listen` makes the same choice).
+fn preferred_address(resolved: &[SocketAddr]) -> Option<SocketAddr> {
+    resolved
+        .iter()
+        .find(|address| address.is_ipv4())
+        .or(resolved.first())
+        .copied()
+}
+
+/// Whether `host` is the name `localhost` (case-insensitive, with or without a trailing dot).
+fn is_localhost(host: &str) -> bool {
+    host.trim_end_matches('.').eq_ignore_ascii_case("localhost")
+}
+
+/// The I/O error kind behind a bind error, when it carries one.
+fn error_io_kind(error: &Error) -> Option<io::ErrorKind> {
+    match error {
+        Error::Bind { cause, .. } => Some(cause.kind()),
+        _ => None,
+    }
+}
+
+/// Bind `127.0.0.1:port` and, on the same port, `[::1]:port`.
+///
+/// The IPv4 socket is required and primary. The IPv6 one is best effort: a host without IPv6, or
+/// one where the port is taken on `::1` only, still serves IPv4 (logged, not fatal), so enabling
+/// this cannot turn a working `localhost:PORT` configuration into a start-up failure. With port `0`
+/// the IPv6 socket reuses the port the kernel chose for IPv4.
+fn bind_localhost(configured: &str, port: u16, binder: BinderRef<'_>) -> Result<AcceptSet, Error> {
+    let v4 = bind_tcp_ip(
+        configured,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        binder,
+    )?;
+    let chosen = v4
+        .local_addr()
+        .map_err(|error| Error::bind(configured, error))?
+        .port();
+    let mut listeners = vec![v4];
+    match bind_tcp_ip(
+        configured,
+        SocketAddr::from((Ipv6Addr::LOCALHOST, chosen)),
+        binder,
+    ) {
+        Ok(v6) => listeners.push(v6),
+        Err(error) => {
+            // No IPv6 on the host is ordinary and quiet. A port that is taken on `::1` is not: a
+            // client that resolves `localhost` to `::1` first would reach whoever holds it.
+            if matches!(
+                error_io_kind(&error),
+                Some(io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied)
+            ) {
+                tracing::warn!(
+                    listen = configured,
+                    %error,
+                    "localhost is served on IPv4 only: [::1] could not be bound"
+                );
+            } else {
+                tracing::debug!(listen = configured, %error, "localhost is served on IPv4 only");
+            }
+        }
+    }
+    Ok(AcceptSet {
+        listeners,
+        next: AtomicUsize::new(0),
+    })
+}
+
+/// The previous hostname path: `TcpListener::bind` on the unresolved name, with the one-shot
+/// `CAP_NET_BIND_SERVICE` retry (ADR-0046). Reached only when resolution gave no address.
+async fn bind_unresolved_hostname(
+    configured: &str,
+    address: &ListenAddr,
+) -> Result<TcpListener, Error> {
+    let first = TcpListener::bind(&address.address).await;
+    match first {
+        Ok(listener) => Ok(listener),
+        Err(error) => {
+            // ADR-0046: retry once under CAP_NET_BIND_SERVICE only for EACCES on a
+            // TCP/UDP nonzero-port address. Everything else keeps the original error.
+            let address_owned = address.clone();
+            let bind_address = address_owned.address.clone();
+            // The seam's error is passed through UNCHANGED and handed to `Error::bind`, which is
+            // what keeps the located error naming the configured address.
+            crate::bindcap::with_bind_capability(&address_owned, error, move || {
+                // A fresh single-threaded runtime: this runs on the dedicated thread the seam
+                // spawned, not on the caller's Tokio runtime.
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(TcpListener::bind(&bind_address))
+            })
+            .map_err(|error| located_bind_error(configured, error))
         }
     }
 }
@@ -2069,7 +2225,7 @@ impl Drop for ConnectionPermit {
 }
 
 fn spawn_tcp_accept_loop(
-    listener: TcpListener,
+    listener: AcceptSet,
     listen_key: String,
     listeners: SharedListeners,
     store: Arc<GenerationStore>,
@@ -4215,6 +4371,7 @@ async fn bind_admin_unix(
         task,
         bound: configured.to_string(),
         socket_addr: None,
+        secondary_addrs: Vec::new(),
         unix_socket: Some((socket_path.to_path_buf(), identity)),
     })
 }
@@ -4339,6 +4496,7 @@ pub(crate) async fn bind_admin_with(
         task,
         bound: socket_addr.to_string(),
         socket_addr: Some(socket_addr),
+        secondary_addrs: Vec::new(),
         unix_socket: None,
     })
 }
@@ -4584,6 +4742,7 @@ pub(crate) async fn bind_admin_remote(
         task,
         bound: socket_addr.to_string(),
         socket_addr: Some(socket_addr),
+        secondary_addrs: Vec::new(),
         unix_socket: None,
     })
 }
@@ -6901,6 +7060,108 @@ mod bind_capability_tests {
             !body.contains("Error::bind(configured, std::io::Error::new("),
             "the wildcard site must not rebuild the error lossily: {body}"
         );
+    }
+
+    #[test]
+    fn localhost_is_matched_by_name_only() {
+        for host in ["localhost", "LOCALHOST", "Localhost.", "localhost."] {
+            assert!(super::is_localhost(host), "{host}");
+        }
+        for host in [
+            "localhost.example.com",
+            "mylocalhost",
+            "127.0.0.1",
+            "",
+            "local",
+        ] {
+            assert!(!super::is_localhost(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn a_hostname_with_both_families_binds_ipv4() {
+        let v4: std::net::SocketAddr = "127.0.0.1:80".parse().unwrap();
+        let v6: std::net::SocketAddr = "[::1]:80".parse().unwrap();
+        // Resolver order puts `::1` first on Windows; IPv4 still wins.
+        assert_eq!(super::preferred_address(&[v6, v4]), Some(v4));
+        assert_eq!(super::preferred_address(&[v4, v6]), Some(v4));
+        assert_eq!(super::preferred_address(&[v6]), Some(v6));
+        assert_eq!(super::preferred_address(&[]), None);
+    }
+
+    /// Whether this host can bind `[::1]` at all (IPv6 can be disabled).
+    fn ipv6_loopback_available() -> bool {
+        std::net::TcpListener::bind("[::1]:0").is_ok()
+    }
+
+    /// `localhost:PORT` serves both loopback families on one port, reports the IPv4 address as the
+    /// bound one, and accepts a connection arriving on either.
+    #[tokio::test]
+    async fn localhost_binds_ipv4_and_ipv6_on_one_port_and_accepts_on_both() {
+        let configured = "localhost:0";
+        let address = ListenAddr::parse(configured).expect("parses");
+        let set = bind_configured_tcp(configured, &address, None)
+            .await
+            .expect("localhost binds");
+        let primary = set.local_addr().expect("local addr");
+        assert_eq!(
+            primary.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+        let addrs = set.local_addrs();
+        if !ipv6_loopback_available() {
+            assert_eq!(addrs.len(), 1, "IPv6 unavailable: IPv4 only, no error");
+            return;
+        }
+        assert_eq!(addrs.len(), 2, "{addrs:?}");
+        assert_eq!(
+            addrs[1].ip(),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        );
+        assert_eq!(
+            addrs[1].port(),
+            primary.port(),
+            "same port on both families"
+        );
+
+        for target in addrs {
+            let connect = tokio::net::TcpStream::connect(target);
+            let (client, accepted) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::join!(connect, set.accept())
+                })
+                .await
+                .unwrap_or_else(|_| panic!("no connection accepted on {target}"));
+            client.unwrap_or_else(|error| panic!("connect to {target}: {error}"));
+            let (_stream, peer) = accepted.expect("accepted");
+            assert_eq!(
+                peer.is_ipv4(),
+                target.is_ipv4(),
+                "{target} accepted from {peer}"
+            );
+        }
+    }
+
+    /// A taken IPv6 loopback port must not fail `localhost`: IPv4 is the required socket.
+    #[tokio::test]
+    async fn localhost_still_binds_when_the_ipv6_port_is_taken() {
+        if !ipv6_loopback_available() {
+            return;
+        }
+        // Find a port that is free on both, then occupy it on IPv6 only.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        let Ok(holder) = std::net::TcpListener::bind(("::1", port)) else {
+            return; // raced with another process; nothing to prove
+        };
+        drop(probe);
+        let configured = format!("localhost:{port}");
+        let address = ListenAddr::parse(&configured).expect("parses");
+        let set = bind_configured_tcp(&configured, &address, None)
+            .await
+            .expect("IPv4 still binds");
+        assert_eq!(set.local_addrs().len(), 1, "served on IPv4 only");
+        drop(holder);
     }
 
     /// ADR-0046 §1 through the PRODUCTION entry points: a successful bind makes no capability call.
