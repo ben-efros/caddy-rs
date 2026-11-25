@@ -37,6 +37,13 @@ pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Default HTTP/1 header-read timeout, matching Caddy's `defaultReadHeaderTimeout` (1 minute).
 pub const DEFAULT_READ_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Caddy's `read_idle_timeout` default: how long a request-body read may stall before the request
+/// is aborted. A negative configured value disables it.
+pub const DEFAULT_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Caddy server field for the stalled-read timeout (preserved in the unknown-field map).
+pub const READ_IDLE_TIMEOUT_FIELD: &str = "read_idle_timeout";
+
 /// caddy-rs extension: maximum request body size in bytes (`0`/absent = unlimited).
 pub const MAX_REQUEST_BODY_SIZE_FIELD: &str = "max_request_body_size";
 
@@ -93,6 +100,11 @@ pub struct ServerLimits {
     /// Maximum time to read HTTP/1 request headers. Always set; Caddy's default is 1 minute.
     pub read_header_timeout: Duration,
 
+    /// How long a request-body read may stall before the request is aborted (Caddy's
+    /// `read_idle_timeout`, default 1 minute; `None` when configured negative). Enforced on
+    /// HTTP/3 request bodies; HTTP/1.1 and HTTP/2 rely on `read_timeout` (DIV-0029).
+    pub read_idle_timeout: Option<Duration>,
+
     /// Maximum size in bytes of the request head. `None` uses the hyper default.
     pub max_header_bytes: Option<usize>,
 
@@ -114,6 +126,7 @@ impl Default for ServerLimits {
             write_timeout: None,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             read_header_timeout: DEFAULT_READ_HEADER_TIMEOUT,
+            read_idle_timeout: Some(DEFAULT_READ_IDLE_TIMEOUT),
             max_header_bytes: None,
             max_request_body_size: None,
             max_connections: None,
@@ -216,6 +229,23 @@ impl ServerLimits {
             READ_HEADER_TIMEOUT_FIELD,
         )?
         .unwrap_or(DEFAULT_READ_HEADER_TIMEOUT);
+        let read_idle_timeout = match server.extra.get(READ_IDLE_TIMEOUT_FIELD) {
+            None => Some(DEFAULT_READ_IDLE_TIMEOUT),
+            Some(value) if value.is_null() => Some(DEFAULT_READ_IDLE_TIMEOUT),
+            Some(value) => {
+                let nanos = parse_caddy_duration(value).map_err(|message| {
+                    CoreError::invalid(
+                        format!("{base}.{READ_IDLE_TIMEOUT_FIELD}"),
+                        format!("invalid duration: {message}"),
+                    )
+                })?;
+                match nanos {
+                    nanos if nanos < 0 => None,
+                    0 => Some(DEFAULT_READ_IDLE_TIMEOUT),
+                    nanos => Some(Duration::from_nanos(nanos as u64)),
+                }
+            }
+        };
 
         let max_header_bytes = extra_size(
             &server.extra,
@@ -252,6 +282,7 @@ impl ServerLimits {
             write_timeout,
             idle_timeout,
             read_header_timeout,
+            read_idle_timeout,
             max_header_bytes,
             max_request_body_size,
             max_connections,
@@ -645,5 +676,51 @@ mod budget_tests {
         drop(hog);
         assert!(other.try_grow(1024), "the budget is returned on drop");
         assert!(other.try_grow(1024), "a reservation can keep growing");
+    }
+}
+
+#[cfg(test)]
+mod read_idle_timeout_tests {
+    use super::*;
+
+    fn limits(server_fields: serde_json::Value) -> Result<ServerLimits, CoreError> {
+        let mut server = serde_json::json!({"listen": [":8080"], "routes": []});
+        for (key, value) in server_fields.as_object().unwrap() {
+            server[key] = value.clone();
+        }
+        let server: HttpServer = serde_json::from_value(server).unwrap();
+        ServerLimits::from_http_server("srv0", &server, false, false)
+    }
+
+    /// Stock Caddy: `read_idle_timeout` defaults to one minute, a negative value disables it, and
+    /// zero means "use the default".
+    #[test]
+    fn read_idle_timeout_follows_caddys_semantics() {
+        assert_eq!(
+            limits(serde_json::json!({})).unwrap().read_idle_timeout,
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            limits(serde_json::json!({"read_idle_timeout": "5s"}))
+                .unwrap()
+                .read_idle_timeout,
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            limits(serde_json::json!({"read_idle_timeout": "-1s"}))
+                .unwrap()
+                .read_idle_timeout,
+            None,
+            "a negative value disables the timeout"
+        );
+        assert_eq!(
+            limits(serde_json::json!({"read_idle_timeout": 0}))
+                .unwrap()
+                .read_idle_timeout,
+            Some(Duration::from_secs(60)),
+            "zero keeps the default"
+        );
+        let error = limits(serde_json::json!({"read_idle_timeout": "soon"})).unwrap_err();
+        assert!(error.to_string().contains("read_idle_timeout"), "{error}");
     }
 }
