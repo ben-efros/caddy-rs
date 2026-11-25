@@ -360,6 +360,12 @@ pub struct User {
     /// it would lock them out of the account they were trying to protect if they abandoned
     /// enrollment. Confirmation clears this flag, which is what actually activates the factor.
     pub totp_pending: bool,
+    /// Replacement secret issued by [`AuthnService::totp_reenroll`] while an active factor exists.
+    ///
+    /// It is stored *beside* the active [`totp_secret`](Self::totp_secret), never over it: the old
+    /// factor keeps gating login (and `has_totp` stays true) until a code from this secret
+    /// confirms it, so an abandoned or hostile re-enrolment cannot weaken the account.
+    pub totp_pending_secret: Option<String>,
     /// Highest TOTP time step accepted for this user, used for replay protection.
     ///
     /// Any code whose time step is at or below this value is rejected: a consumed code is a
@@ -468,6 +474,7 @@ impl UserRecord {
             password_hash,
             totp_secret,
             totp_pending: false,
+            totp_pending_secret: None,
             totp_last_step: record.totp_last_step,
             auth_epoch: record.auth_epoch,
             created_at: record.created_at,
@@ -522,6 +529,10 @@ impl std::fmt::Debug for User {
             .field(
                 "totp_secret",
                 &self.totp_secret.as_ref().map(|_| "[redacted]"),
+            )
+            .field(
+                "totp_pending_secret",
+                &self.totp_pending_secret.as_ref().map(|_| "[redacted]"),
             )
             .field("totp_last_step", &self.totp_last_step)
             .field("auth_epoch", &self.auth_epoch)
@@ -1331,6 +1342,15 @@ fn username_throttle_key(username: &str) -> String {
     }
 }
 
+/// Which of a user's two TOTP secrets a verification targets.
+#[derive(Debug, Clone, Copy)]
+enum TotpSlot {
+    /// The secret in [`User::totp_secret`] (pending first enrolment or the active factor).
+    Active,
+    /// The replacement in [`User::totp_pending_secret`], awaiting confirmation.
+    Pending,
+}
+
 /// Throttle key for TOTP verification of one account outside the login flow.
 fn totp_throttle_key(user_id: UserId) -> String {
     format!("totp:{}", user_id.0)
@@ -1946,6 +1966,7 @@ impl<S: UserStore> AuthnService<S> {
             role,
             totp_secret: None,
             totp_pending: false,
+            totp_pending_secret: None,
             totp_last_step: None,
             auth_epoch: 0,
             created_at: now,
@@ -1975,6 +1996,7 @@ impl<S: UserStore> AuthnService<S> {
             role: Role::admin(),
             totp_secret: None,
             totp_pending: false,
+            totp_pending_secret: None,
             totp_last_step: None,
             auth_epoch: 0,
             created_at: now,
@@ -2055,14 +2077,8 @@ impl<S: UserStore> AuthnService<S> {
         Ok(user)
     }
 
-    /// Enable TOTP for a user. Returns `(secret, otpauth URI)`.
-    pub async fn totp_setup(&self, user_id: UserId) -> AuthResult<(String, String)> {
-        let mut user = self
-            .store
-            .get_user(user_id)
-            .await?
-            .ok_or(AuthError::UserNotFound)?;
-
+    /// Generate a fresh TOTP secret and its `otpauth://` URI for `username`.
+    fn new_totp_secret(&self, username: &str) -> (String, String) {
         let mut secret_bytes = [0u8; 20];
         OsRng.fill_bytes(&mut secret_bytes);
         let secret = base32::encode(Alphabet::Rfc4648 { padding: false }, &secret_bytes);
@@ -2071,19 +2087,88 @@ impl<S: UserStore> AuthnService<S> {
         let uri = format!(
             "otpauth://totp/{}:{}?secret={}&issuer={}&algorithm=SHA1&digits={}&period={}",
             urlencoding::encode(issuer),
-            urlencoding::encode(&user.username),
+            urlencoding::encode(username),
             secret,
             urlencoding::encode(issuer),
             TOTP_DIGITS,
             TOTP_STEP_SECONDS,
         );
+        (secret, uri)
+    }
 
+    /// Begin first-time TOTP enrolment. Returns `(secret, otpauth URI)`.
+    ///
+    /// The secret is *pending* until [`totp_confirm`](Self::totp_confirm) succeeds. Calling this
+    /// again while the enrolment is still pending replaces the pending secret.
+    ///
+    /// Refuses with [`AuthError::TotpAlreadyEnabled`] when a confirmed factor exists. Overwriting an
+    /// active secret would silently strip the second factor (login only checks codes for an active
+    /// factor), so a stolen access token could downgrade the account to password-only and enrol
+    /// the attacker's own authenticator. Replacing an active factor is
+    /// [`totp_reenroll`](Self::totp_reenroll), which demands a current code.
+    pub async fn totp_setup(&self, user_id: UserId) -> AuthResult<(String, String)> {
+        let mut user = self
+            .store
+            .get_user(user_id)
+            .await?
+            .ok_or(AuthError::UserNotFound)?;
+        if user.has_totp() {
+            return Err(AuthError::TotpAlreadyEnabled);
+        }
+
+        let (secret, uri) = self.new_totp_secret(&user.username);
         user.totp_secret = Some(secret.clone());
         user.totp_pending = true;
+        user.totp_pending_secret = None;
         user.totp_last_step = None;
         user.updated_at = Timestamp::now();
         self.store.update_user(user).await?;
 
+        Ok((secret, uri))
+    }
+
+    /// Begin replacing the secret of an *active* factor. Returns `(secret, otpauth URI)`.
+    ///
+    /// The caller must prove possession of the current factor with `current_code`, which is
+    /// verified (and its step consumed) exactly like a login code, including the failure throttle.
+    /// The new secret is stored as [`User::totp_pending_secret`] *beside* the active one: the old
+    /// factor keeps gating login until [`totp_confirm`](Self::totp_confirm) is called with a code
+    /// from the new secret, so an abandoned re-enrolment weakens nothing.
+    ///
+    /// When no factor is active there is nothing to prove, and this behaves like
+    /// [`totp_setup`](Self::totp_setup) (`current_code` is ignored).
+    pub async fn totp_reenroll(
+        &self,
+        user_id: UserId,
+        current_code: &str,
+    ) -> AuthResult<(String, String)> {
+        let user = self
+            .store
+            .get_user(user_id)
+            .await?
+            .ok_or(AuthError::UserNotFound)?;
+        if !user.has_totp() {
+            return self.totp_setup(user_id).await;
+        }
+        if !self.totp_verify(user_id, current_code).await? {
+            return Err(AuthError::InvalidTotpCode);
+        }
+
+        // Re-read: verification advanced `totp_last_step`, and writing the stale copy back would
+        // un-consume the code that just proved possession.
+        let mut user = self
+            .store
+            .get_user(user_id)
+            .await?
+            .ok_or(AuthError::UserNotFound)?;
+        if !user.has_totp() {
+            // Disabled between the proof and the write; do not resurrect a half-state.
+            return Err(AuthError::TotpNotConfigured);
+        }
+        let (secret, uri) = self.new_totp_secret(&user.username);
+        user.totp_pending_secret = Some(secret.clone());
+        user.updated_at = Timestamp::now();
+        self.store.update_user(user).await?;
         Ok((secret, uri))
     }
 
@@ -2105,6 +2190,9 @@ impl<S: UserStore> AuthnService<S> {
             .get_user(user_id)
             .await?
             .ok_or(AuthError::UserNotFound)?;
+        if let Some(replacement) = pending.totp_pending_secret.clone() {
+            return self.confirm_reenrolment(user_id, code, replacement).await;
+        }
         if pending.totp_secret.is_none() {
             return Err(AuthError::TotpNotConfigured);
         }
@@ -2126,6 +2214,54 @@ impl<S: UserStore> AuthnService<S> {
             .await?
             .ok_or(AuthError::UserNotFound)?;
         user.totp_pending = false;
+        bump_epoch(&mut user)?;
+        user.updated_at = Timestamp::now();
+        let user_id = user.id;
+        self.store.update_user(user).await?;
+        self.store
+            .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
+            .await?;
+
+        self.store
+            .get_user(user_id)
+            .await?
+            .ok_or(AuthError::UserNotFound)
+    }
+
+    /// Swap the active secret for the pending replacement once a code from it is presented.
+    ///
+    /// The code is checked against the *replacement* (through the same throttle and replay record
+    /// as every other verification); the old secret is only discarded after that succeeds. The
+    /// step consumed by the possession proof in [`totp_reenroll`](Self::totp_reenroll) is already
+    /// recorded, so the confirming code must come from a later step.
+    async fn confirm_reenrolment(
+        &self,
+        user_id: UserId,
+        code: &str,
+        replacement: String,
+    ) -> AuthResult<User> {
+        if !self
+            .totp_verify_throttled(user_id, code, TotpSlot::Pending)
+            .await?
+        {
+            return Err(AuthError::InvalidTotpCode);
+        }
+
+        let mut user = self
+            .store
+            .get_user(user_id)
+            .await?
+            .ok_or(AuthError::UserNotFound)?;
+        if user.totp_pending_secret.as_deref() != Some(replacement.as_str()) {
+            // A concurrent re-enrolment replaced or cleared the secret this code was checked
+            // against; do not install a secret the caller did not just prove.
+            return Err(AuthError::InvalidTotpCode);
+        }
+        user.totp_secret = Some(replacement);
+        user.totp_pending = false;
+        user.totp_pending_secret = None;
+        // The confirming step stays recorded (`totp_last_step` was advanced by the verification),
+        // so the code that activated the new secret cannot be replayed against it.
         bump_epoch(&mut user)?;
         user.updated_at = Timestamp::now();
         let user_id = user.id;
@@ -2166,9 +2302,21 @@ impl<S: UserStore> AuthnService<S> {
     /// confirmation, factor removal) and not just for [`login`](Self::login), which has its own
     /// per-username budget.
     pub async fn totp_verify(&self, user_id: UserId, code: &str) -> AuthResult<bool> {
+        self.totp_verify_throttled(user_id, code, TotpSlot::Active)
+            .await
+    }
+
+    /// [`totp_verify`](Self::totp_verify) against the chosen secret, sharing the per-account
+    /// throttle so the pending secret of a re-enrolment cannot be guessed outside the budget.
+    async fn totp_verify_throttled(
+        &self,
+        user_id: UserId,
+        code: &str,
+        slot: TotpSlot,
+    ) -> AuthResult<bool> {
         let key = totp_throttle_key(user_id);
         self.reserve_attempt(&key)?;
-        let verified = self.totp_verify_unthrottled(user_id, code).await?;
+        let verified = self.totp_verify_unthrottled(user_id, code, slot).await?;
         if verified {
             self.clear_attempts(&key);
         }
@@ -2176,16 +2324,22 @@ impl<S: UserStore> AuthnService<S> {
     }
 
     /// The verification itself, with no failure accounting: the caller owns the throttle.
-    async fn totp_verify_unthrottled(&self, user_id: UserId, code: &str) -> AuthResult<bool> {
+    async fn totp_verify_unthrottled(
+        &self,
+        user_id: UserId,
+        code: &str,
+        slot: TotpSlot,
+    ) -> AuthResult<bool> {
         let user = self
             .store
             .get_user(user_id)
             .await?
             .ok_or(AuthError::UserNotFound)?;
-        let secret = user
-            .totp_secret
-            .as_deref()
-            .ok_or(AuthError::TotpNotConfigured)?;
+        let secret = match slot {
+            TotpSlot::Active => user.totp_secret.as_deref(),
+            TotpSlot::Pending => user.totp_pending_secret.as_deref(),
+        }
+        .ok_or(AuthError::TotpNotConfigured)?;
         let secret_bytes = base32::decode(Alphabet::Rfc4648 { padding: false }, secret)
             .ok_or_else(|| AuthError::Internal("invalid base32 TOTP secret".to_string()))?;
 
@@ -2245,6 +2399,8 @@ impl<S: UserStore> AuthnService<S> {
             .ok_or(AuthError::UserNotFound)?;
 
         user.totp_secret = None;
+        user.totp_pending = false;
+        user.totp_pending_secret = None;
         user.totp_last_step = None;
         // Removing a factor weakens the account, so tokens minted while it was enabled are
         // retired rather than allowed to outlive the downgrade.
@@ -2295,7 +2451,10 @@ impl<S: UserStore> AuthnService<S> {
 
         if user.has_totp() {
             let code = totp_code.ok_or(AuthError::InvalidTotpCode)?;
-            match self.totp_verify_unthrottled(user.id, code).await {
+            match self
+                .totp_verify_unthrottled(user.id, code, TotpSlot::Active)
+                .await
+            {
                 Ok(true) => {}
                 Ok(false) => return Err(AuthError::InvalidTotpCode),
                 Err(AuthError::TotpReplay) => {

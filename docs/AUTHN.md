@@ -119,15 +119,15 @@ TOTP enrolment is exposed as service methods, not as PM API routes:
 
 | Method | Behaviour |
 | --- | --- |
-| `totp_setup(user_id)` | Generates a 20-byte random secret, stores it on the user, clears the replay state, and returns `(secret, otpauth_uri)`. **The secret becomes active immediately** — there is no pending-enrolment state. |
-| `totp_verify(user_id, code)` | Verifies a code and atomically consumes its step. |
-| `totp_disable(user_id)` | Removes the secret and clears the replay state. |
+| `totp_setup(user_id)` | Generates a 20-byte random secret, stores it **pending** (it does not gate login), clears the replay state, and returns `(secret, otpauth_uri)`. Refused with `TotpAlreadyEnabled` while a confirmed factor exists. |
+| `totp_confirm(user_id, code)` | Verifies a code from the pending secret and activates it (epoch bump, refresh tokens revoked). |
+| `totp_reenroll(user_id, current_code)` | Replace an *active* factor: proves possession with a current code, then stores the new secret beside the old one until `totp_confirm` swaps them. |
+| `totp_verify(user_id, code)` | Verifies a code and atomically consumes its step (throttled). |
+| `totp_disable(user_id)` | Removes the secret (and any pending replacement) and clears the replay state. |
 
-Because `totp_setup` activates the secret before the user proves possession, an interrupted
-enrolment can leave the account requiring codes from a secret the user never saved. Recovery is to
-call `totp_setup` again (or have an administrator reset the account); callers should therefore show
-the secret/URI to the user before treating enrolment as complete. The `pm-api` crate does not
-currently expose TOTP enrolment endpoints — its tests call `totp_setup` directly.
+A pending secret never gates login, so an interrupted enrolment cannot lock the account; an
+interrupted *re*-enrolment leaves the old factor fully in force. `pm-api` exposes these as
+`/auth/totp/setup|confirm|disable` (see [TOTP.md](TOTP.md)).
 
 ## Related documentation
 

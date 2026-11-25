@@ -333,7 +333,7 @@ Compile, Config}` and carry the relevant path. No error contains plaintext secre
 | `POST` | `/auth/refresh` | Consume the refresh token and return a rotated pair; a reused token is `401` |
 | `POST` | `/auth/logout` | Revoke the presented refresh token (body optional); always `204`, so it is idempotent |
 | `GET` | `/auth/me` | The caller's own `{id, username, role, totp_enabled, auth_epoch}`; needs a bearer token |
-| `POST` | `/auth/totp/setup` | Begin TOTP enrolment; returns `{secret, otpauth_uri}` **once** and leaves the factor pending (login still works by password until confirmed) |
+| `POST` | `/auth/totp/setup` | Begin TOTP enrolment; returns `{secret, otpauth_uri}` **once** and leaves the factor pending (login still works by password until confirmed). With a factor already active it is `409`, unless the body carries the current `{"totpCode": "..."}`, in which case the replacement is stored beside the old factor, which keeps gating login until `confirm`. Any role may call the `/auth/totp/*` routes for its own account; guessing is throttled (`429` + `Retry-After`) |
 | `POST` | `/auth/totp/confirm` | `{"totpCode": "..."}` — activate the pending factor; `409` if nothing is pending or it is already on |
 | `POST` | `/auth/totp/disable` | `{"totpCode": "..."}` — remove the factor; needs a live code, so a session token alone cannot strip it |
 | `GET` | `/users` | Paginated `PublicUser` list (`{items,total,limit,offset}`), sorted by username; requires `users:view` |

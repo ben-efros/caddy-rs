@@ -479,3 +479,251 @@ fn the_throttle_configuration_rejects_unusable_values() {
     }
     assert!(LoginThrottleConfig::default().validate().is_ok());
 }
+
+// ---------------------------------------------------------------------------------------------
+// E2: totp_setup must not strip an active second factor
+// ---------------------------------------------------------------------------------------------
+
+/// A service over `store` pinned to TOTP step `step`.
+fn at_step(store: &MemoryUserStore, step: u64) -> AuthnService<MemoryUserStore> {
+    AuthnService::new(store.clone(), fast_config())
+        .expect("build service")
+        .with_test_step(step)
+}
+
+/// An account with an *active* factor whose confirmation consumed `STEP`.
+async fn active_factor_account() -> (MemoryUserStore, UserId, Vec<u8>) {
+    let store = MemoryUserStore::new();
+    let service = at_step(&store, STEP);
+    let user = service
+        .create_user("mallory-target", "correct horse", Role::admin())
+        .await
+        .unwrap();
+    let (secret, _) = service.totp_setup(user.id).await.unwrap();
+    let bytes = decode(&secret);
+    service
+        .totp_confirm(user.id, &totp_code(&bytes, STEP))
+        .await
+        .unwrap();
+    (store, user.id, bytes)
+}
+
+#[tokio::test]
+async fn setup_is_refused_while_a_factor_is_active_and_changes_nothing() {
+    let (store, id, old) = active_factor_account().await;
+    let before = store.get_user(id).await.unwrap().unwrap();
+
+    // The attack: a briefly held access token calls setup to turn the account password-only.
+    let attacker = at_step(&store, STEP + 1);
+    assert!(matches!(
+        attacker.totp_setup(id).await,
+        Err(AuthError::TotpAlreadyEnabled)
+    ));
+
+    let after = store.get_user(id).await.unwrap().unwrap();
+    assert_eq!(
+        after.totp_secret, before.totp_secret,
+        "the secret is untouched"
+    );
+    assert!(after.has_totp(), "the factor is still active");
+    assert_eq!(after.totp_last_step, before.totp_last_step);
+    assert!(after.totp_pending_secret.is_none());
+    assert_eq!(after.auth_epoch, before.auth_epoch);
+
+    // Login still demands a code from the original secret.
+    assert!(matches!(
+        attacker
+            .login("mallory-target", "correct horse", None)
+            .await,
+        Err(AuthError::InvalidTotpCode)
+    ));
+    attacker
+        .login(
+            "mallory-target",
+            "correct horse",
+            Some(&totp_code(&old, STEP + 1)),
+        )
+        .await
+        .expect("the legitimate factor still works");
+}
+
+#[tokio::test]
+async fn reenrolment_demands_a_valid_current_code() {
+    let (store, id, old) = active_factor_account().await;
+    let service = at_step(&store, STEP + 1);
+
+    assert!(matches!(
+        service.totp_reenroll(id, "abcdef").await,
+        Err(AuthError::InvalidTotpCode)
+    ));
+    // The code that confirmed the factor is spent: presenting it again is a replay, not a proof.
+    assert!(matches!(
+        service.totp_reenroll(id, &totp_code(&old, STEP)).await,
+        Err(AuthError::TotpReplay)
+    ));
+    let user = store.get_user(id).await.unwrap().unwrap();
+    assert!(
+        user.totp_pending_secret.is_none(),
+        "no replacement secret is stored without proof"
+    );
+    assert!(user.has_totp());
+}
+
+#[tokio::test]
+async fn reenrolment_keeps_the_old_factor_active_until_confirmed() {
+    let (store, id, old) = active_factor_account().await;
+    let proof_step = at_step(&store, STEP + 1);
+    let (new_secret, uri) = proof_step
+        .totp_reenroll(id, &totp_code(&old, STEP + 1))
+        .await
+        .expect("a current code authorises re-enrolment");
+    assert!(uri.contains(&new_secret));
+    let new = decode(&new_secret);
+
+    let user = store.get_user(id).await.unwrap().unwrap();
+    assert!(
+        user.has_totp(),
+        "has_totp never goes false during re-enrolment"
+    );
+    assert_ne!(user.totp_secret.as_deref(), Some(new_secret.as_str()));
+    assert_eq!(
+        user.totp_pending_secret.as_deref(),
+        Some(new_secret.as_str())
+    );
+    assert!(user.public().totp_enabled);
+
+    // An abandoned re-enrolment weakens nothing: login needs a code, and only the OLD secret's
+    // code is accepted; the unconfirmed new secret's code is not.
+    let later = at_step(&store, STEP + 2);
+    assert!(matches!(
+        later.login("mallory-target", "correct horse", None).await,
+        Err(AuthError::InvalidTotpCode)
+    ));
+    assert!(matches!(
+        later
+            .login(
+                "mallory-target",
+                "correct horse",
+                Some(&totp_code(&new, STEP + 2))
+            )
+            .await,
+        Err(AuthError::InvalidTotpCode)
+    ));
+    later
+        .login(
+            "mallory-target",
+            "correct horse",
+            Some(&totp_code(&old, STEP + 2)),
+        )
+        .await
+        .expect("the old factor still logs in");
+}
+
+#[tokio::test]
+async fn confirming_a_reenrolment_swaps_the_secret_and_bumps_the_epoch() {
+    let (store, id, old) = active_factor_account().await;
+    let (new_secret, _) = at_step(&store, STEP + 1)
+        .totp_reenroll(id, &totp_code(&old, STEP + 1))
+        .await
+        .unwrap();
+    let new = decode(&new_secret);
+    let epoch_before = store.get_user(id).await.unwrap().unwrap().auth_epoch;
+
+    // A code from the OLD secret cannot confirm the replacement.
+    let confirming = at_step(&store, STEP + 2);
+    assert!(matches!(
+        confirming
+            .totp_confirm(id, &totp_code(&old, STEP + 2))
+            .await,
+        Err(AuthError::InvalidTotpCode)
+    ));
+    assert!(store
+        .get_user(id)
+        .await
+        .unwrap()
+        .unwrap()
+        .totp_pending_secret
+        .is_some());
+
+    let confirmed = confirming
+        .totp_confirm(id, &totp_code(&new, STEP + 2))
+        .await
+        .expect("a code from the new secret confirms it");
+    assert!(confirmed.has_totp());
+    assert_eq!(confirmed.totp_secret.as_deref(), Some(new_secret.as_str()));
+    assert!(confirmed.totp_pending_secret.is_none());
+    assert_eq!(confirmed.auth_epoch, epoch_before + 1);
+
+    // From now on only the NEW secret logs in.
+    let after = at_step(&store, STEP + 3);
+    assert!(matches!(
+        after
+            .login(
+                "mallory-target",
+                "correct horse",
+                Some(&totp_code(&old, STEP + 3))
+            )
+            .await,
+        Err(AuthError::InvalidTotpCode)
+    ));
+    after
+        .login(
+            "mallory-target",
+            "correct horse",
+            Some(&totp_code(&new, STEP + 3)),
+        )
+        .await
+        .expect("the new factor logs in");
+}
+
+#[tokio::test]
+async fn a_second_reenrolment_replaces_the_pending_secret_and_disable_clears_it() {
+    let (store, id, old) = active_factor_account().await;
+    let (first, _) = at_step(&store, STEP + 1)
+        .totp_reenroll(id, &totp_code(&old, STEP + 1))
+        .await
+        .unwrap();
+    let (second, _) = at_step(&store, STEP + 2)
+        .totp_reenroll(id, &totp_code(&old, STEP + 2))
+        .await
+        .unwrap();
+    assert_ne!(first, second);
+    let user = store.get_user(id).await.unwrap().unwrap();
+    assert_eq!(user.totp_pending_secret.as_deref(), Some(second.as_str()));
+
+    at_step(&store, STEP + 3).totp_disable(id).await.unwrap();
+    let user = store.get_user(id).await.unwrap().unwrap();
+    assert!(user.totp_secret.is_none() && user.totp_pending_secret.is_none());
+    assert!(!user.has_totp());
+}
+
+#[tokio::test]
+async fn reenroll_without_an_active_factor_is_a_plain_setup() {
+    let store = MemoryUserStore::new();
+    let service = at_step(&store, STEP);
+    let user = service
+        .create_user("fresh", "correct horse", Role::viewer())
+        .await
+        .unwrap();
+    let (secret, _) = service
+        .totp_reenroll(user.id, "ignored")
+        .await
+        .expect("nothing to prove when no factor is active");
+    let stored = store.get_user(user.id).await.unwrap().unwrap();
+    assert_eq!(stored.totp_secret.as_deref(), Some(secret.as_str()));
+    assert!(stored.totp_pending && !stored.has_totp());
+    assert!(stored.totp_pending_secret.is_none());
+    // A still-pending first enrolment may be restarted.
+    assert!(service.totp_setup(user.id).await.is_ok());
+}
+
+#[tokio::test]
+async fn the_pending_secret_never_reaches_debug_output() {
+    let (store, id, old) = active_factor_account().await;
+    let (pending, _) = at_step(&store, STEP + 1)
+        .totp_reenroll(id, &totp_code(&old, STEP + 1))
+        .await
+        .unwrap();
+    let user = store.get_user(id).await.unwrap().unwrap();
+    assert!(!format!("{user:?}").contains(&pending));
+}

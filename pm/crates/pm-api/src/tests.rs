@@ -3274,6 +3274,113 @@ async fn a_replayed_confirm_code_is_refused() {
 }
 
 #[tokio::test]
+async fn a_non_admin_can_enrol_and_confirm_their_own_totp_factor() {
+    // The /auth/totp/* handlers act only on the caller's own account, so they must not need
+    // `settings:admin` (the default-deny capability for an unlisted mutating path).
+    let (_dir, server, authn) = server_with_authn();
+    let _admin = first_admin(&server).await;
+    let (_viewer, tokens) = user_tokens(&authn, "vera", caddy_rs_authn::Role::viewer()).await;
+
+    let enrollment = begin_enrollment(&server, &tokens.access_token).await;
+    let confirmed = confirm_enrollment(
+        &server,
+        &tokens.access_token,
+        &totp_code_for(&enrollment.otpauth_uri),
+    )
+    .await;
+    assert_eq!(
+        confirmed.status_code(),
+        StatusCode::OK,
+        "a viewer manages their own factor: {}",
+        confirmed.text()
+    );
+    assert!(confirmed.json::<EnrollmentStatus>().totp_enabled);
+}
+
+#[tokio::test]
+async fn an_active_factor_cannot_be_replaced_without_the_current_code() {
+    let (_dir, server, authn) = server_with_totp_window();
+    let _admin = first_admin(&server).await;
+    let (_user, tokens) = user_tokens(&authn, "vera", caddy_rs_authn::Role::editor()).await;
+    let enrollment = begin_enrollment(&server, &tokens.access_token).await;
+    // Steps are consumed strictly in order inside the +-1 window: confirm with the previous step,
+    // log in with the current one, prove possession with the next one.
+    let confirmed = confirm_enrollment(
+        &server,
+        &tokens.access_token,
+        &totp_code_for_offset(&enrollment.otpauth_uri, -1),
+    )
+    .await;
+    assert_eq!(
+        confirmed.status_code(),
+        StatusCode::OK,
+        "{}",
+        confirmed.text()
+    );
+    let login = server
+        .post("/api/v1/auth/login")
+        .json(&serde_json::json!({
+            "username": "vera",
+            "password": SETUP_PASSWORD,
+            "totp_code": totp_code_for_offset(&enrollment.otpauth_uri, 0),
+        }))
+        .await;
+    assert_eq!(login.status_code(), StatusCode::OK, "{}", login.text());
+    let session: SessionTokens = login.json();
+
+    // The attack: a stolen access token calls setup to strip the factor.
+    let bare = server
+        .post("/api/v1/auth/totp/setup")
+        .add_header("Authorization", bearer(&session.access_token))
+        .await;
+    assert_eq!(bare.status_code(), StatusCode::CONFLICT, "{}", bare.text());
+    let wrong = server
+        .post("/api/v1/auth/totp/setup")
+        .add_header("Authorization", bearer(&session.access_token))
+        .json(&serde_json::json!({"totpCode": "abcdef"}))
+        .await;
+    assert_eq!(
+        wrong.status_code(),
+        StatusCode::UNAUTHORIZED,
+        "{}",
+        wrong.text()
+    );
+    let password_only = server
+        .post("/api/v1/auth/login")
+        .json(&serde_json::json!({"username": "vera", "password": SETUP_PASSWORD}))
+        .await;
+    assert_eq!(
+        password_only.status_code(),
+        StatusCode::UNAUTHORIZED,
+        "the factor must still gate login after the refused setups"
+    );
+
+    // With proof of the live factor a replacement secret is issued, beside the old one.
+    let replaced = server
+        .post("/api/v1/auth/totp/setup")
+        .add_header("Authorization", bearer(&session.access_token))
+        .json(&serde_json::json!({"totpCode": totp_code_for_offset(&enrollment.otpauth_uri, 1)}))
+        .await;
+    assert_eq!(
+        replaced.status_code(),
+        StatusCode::OK,
+        "{}",
+        replaced.text()
+    );
+    let replacement: SetupEnrollment = replaced.json();
+    assert_ne!(replacement.secret, enrollment.secret);
+    let still_gated = server
+        .post("/api/v1/auth/login")
+        .json(&serde_json::json!({"username": "vera", "password": SETUP_PASSWORD}))
+        .await;
+    assert_eq!(
+        still_gated.status_code(),
+        StatusCode::UNAUTHORIZED,
+        "an unconfirmed replacement must not weaken login"
+    );
+}
+
+#[tokio::test]
 async fn totp_confirm_guessing_is_throttled_with_429_and_retry_after() {
     let (_dir, server, _authn) = server_with_authn();
     let _admin = first_admin(&server).await;

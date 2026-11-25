@@ -209,6 +209,17 @@ pub struct TotpConfirmRequest {
     pub totp_code: String,
 }
 
+/// Optional body of `POST /api/v1/auth/totp/setup`.
+///
+/// Only needed to replace an *active* factor: the caller's current code proves they hold it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TotpSetupRequest {
+    /// The code currently shown by the authenticator for the active factor.
+    #[serde(default)]
+    pub totp_code: Option<String>,
+}
+
 /// Body of `POST /api/v1/auth/totp/disable`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -402,20 +413,41 @@ pub(crate) fn internal_error(error: impl std::fmt::Display) -> ApiError {
 /// The secret is stored on the user but is not yet *activated* for login purposes in the sense the
 /// caller cares about: `confirm` must succeed before the operator trusts the account to be
 /// protected. Calling setup twice is allowed and simply replaces the pending secret.
+///
+/// An account whose factor is already active is **not** silently re-keyed: that would let a stolen
+/// access token turn the account password-only and enrol the thief's authenticator. Without a
+/// body the call is `409`; with `{"totpCode": "<current code>"}` it proves possession of the live
+/// factor, and the new secret is stored *beside* the old one, which keeps gating login until
+/// `confirm` is called with a code from the new secret.
 pub(crate) async fn totp_setup_handler(
     State(state): State<ApiState>,
     _peer: LocalPeer,
     headers: HeaderMap,
+    body: Option<Json<TotpSetupRequest>>,
 ) -> Result<impl IntoResponse, ApiError> {
     let Claims { sub, .. } = require_claims(&state, &headers).await?;
-    let (secret, otpauth_uri) = state
-        .authn
-        .totp_setup(sub)
-        .await
-        .map_err(|error| match error {
-            AuthError::UserNotFound => ApiError::Unauthorized("invalid access token".to_owned()),
-            other => internal_error(other),
-        })?;
+    let current_code = body
+        .and_then(|Json(body)| body.totp_code)
+        .filter(|code| !code.is_empty());
+    let enrolment = match current_code {
+        Some(code) => state.authn.totp_reenroll(sub, &code).await,
+        None => state.authn.totp_setup(sub).await,
+    };
+    let (secret, otpauth_uri) = enrolment.map_err(|error| match error {
+        AuthError::TotpAlreadyEnabled => ApiError::Conflict(
+            "TOTP is already enabled; to replace the factor send the current code as \
+             {\"totpCode\": \"...\"}"
+                .to_owned(),
+        ),
+        AuthError::InvalidTotpCode => ApiError::Unauthorized("invalid TOTP code".to_owned()),
+        AuthError::TotpReplay => {
+            tracing::warn!(user = %sub.0, "TOTP replay refused at re-enrolment");
+            ApiError::Unauthorized("invalid TOTP code".to_owned())
+        }
+        AuthError::TooManyAttempts { retry_after } => rate_limited(retry_after),
+        AuthError::UserNotFound => ApiError::Unauthorized("invalid access token".to_owned()),
+        other => internal_error(other),
+    })?;
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         Json(TotpSetupResponse {

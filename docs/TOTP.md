@@ -121,6 +121,16 @@ per-account budget. A successful verification resets it. The PM API maps the ref
    the submitted step, increments `auth_epoch` and revokes refresh tokens, so a session token minted
    before the factor existed cannot outlive the change. Confirming an account whose factor is
    already active returns `TotpAlreadyEnabled`.
+   `totp_setup` is **refused with `TotpAlreadyEnabled`** while a confirmed factor exists: login only
+   checks codes for an active factor, so overwriting the secret would silently turn the account
+   password-only. To *replace* an active factor, call
+   `AuthnService::totp_reenroll(user_id, current_code)`: it verifies the current code (same
+   throttle and replay rules as login), then stores the new secret as `User::totp_pending_secret`
+   **beside** the active one. The old secret keeps gating login (`has_totp()` never goes false)
+   until `totp_confirm` is called with a code from the *new* secret, which swaps them, increments
+   `auth_epoch` and revokes refresh tokens. An abandoned re-enrolment therefore weakens nothing,
+   and a new `totp_reenroll` simply replaces the pending replacement. The proof code consumes its
+   time step, so the confirming code must come from a later step (up to 30 s later).
 4. `totp_verify` proves possession and consumes the submitted step (used at login).
 5. `totp_disable(user_id)` removes the secret and clears the replay state. It also increments
    `auth_epoch` and revokes refresh tokens, because removing a factor weakens the account.
@@ -135,11 +145,14 @@ The proxy manager exposes enrolment to a logged-in operator, each `Cache-Control
 
 | Route | Body | Effect |
 |---|---|---|
-| `POST /api/v1/auth/totp/setup` | none | Begins enrolment, returns `{secret, otpauth_uri}` once. The only response that ever carries the secret. |
+| `POST /api/v1/auth/totp/setup` | none, or `{totpCode}` to replace an active factor | Begins enrolment, returns `{secret, otpauth_uri}` once. The only response that ever carries the secret. With a factor already active and no code: `409`; wrong or replayed code: `401`; the old factor stays active until `confirm`. |
 | `POST /api/v1/auth/totp/confirm` | `{totpCode}` | Verifies the code and activates the factor. Returns `{totp_enabled, auth_epoch}`. |
 | `POST /api/v1/auth/totp/disable` | `{totpCode}` | Requires a current code, then removes the factor. Returns `{totp_enabled, auth_epoch}`. |
 
-All three require a bearer token (`401` without one). A wrong, unusable or replayed code is refused
+All three require a bearer token (`401` without one) but no section capability: every role,
+including `viewer`, manages its **own** factor (the routes act only on the token's subject). Before
+this was fixed the default-deny gate demanded `settings:admin`, so non-administrators could not
+enrol at all. A wrong, unusable or replayed code is refused
 with `401` and the same message, so a caller cannot tell which it was. Because confirm and disable
 retire previously minted tokens, a successful call is followed by a fresh login — which, once the
 factor is active, requires the current code.
