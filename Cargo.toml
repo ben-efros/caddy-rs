@@ -48,7 +48,7 @@ authors = ["caddy-rs contributors"]
 # member cannot declare its own [workspace.dependencies] (T-REL-020).
 reqwest = { version = "0.12.28", default-features = false, features = ["json"] }
 ring = "0.17.14"
-sd-notify = "0.2.0"
+sd-notify = "0.5.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 url = "2.5.8"
 # Internal crates (path dependencies declared once). Default features are declared off here so a
