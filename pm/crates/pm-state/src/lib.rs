@@ -19,7 +19,9 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
+#[cfg(unix)]
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -568,14 +570,18 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StateError> {
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
 
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temporary)?;
+    // The temporary name is unique per call, so it is created exclusively and owner-only from the
+    // first byte (mode 0600 on Unix, a protected owner/SYSTEM/Administrators DACL on Windows).
+    let mut file = match caddy_rs_fsperm::create_new_file_private(&temporary) {
+        Ok(file) => file,
+        // A temporary left behind by a crashed run with the same pid and counter (a container often
+        // runs as PID 1): it is ours and stale, so replace it rather than failing the write.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&temporary);
+            caddy_rs_fsperm::create_new_file_private(&temporary)?
+        }
+        Err(error) => return Err(StateError::Io(error)),
+    };
     file.write_all(bytes)?;
     file.sync_all()?;
 

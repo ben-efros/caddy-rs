@@ -318,13 +318,27 @@ fn write_private_file(path: &Path, content: &str) -> anyhow::Result<()> {
 }
 
 /// Write `content` to `path` on platforms without POSIX modes.
+/// Windows: write through a private temporary file (protected owner/SYSTEM/Administrators DACL from
+/// its first byte) and rename it into place, like the Unix `0600` path.
 #[cfg(not(unix))]
 fn write_private_file(path: &Path, content: &str) -> anyhow::Result<()> {
+    use std::io::Write;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+        caddy_rs_fsperm::create_dir_all_private(parent)
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
-    std::fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))?;
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(format!(".tmp-{}", std::process::id()));
+    let temporary = PathBuf::from(temporary);
+    let _ = std::fs::remove_file(&temporary);
+    let mut file = caddy_rs_fsperm::create_new_file_private(&temporary)
+        .with_context(|| format!("failed to create {}", temporary.display()))?;
+    file.write_all(content.as_bytes())
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("failed to write {}", temporary.display()))?;
+    drop(file);
+    std::fs::rename(&temporary, path)
+        .with_context(|| format!("failed to install {}", path.display()))?;
     Ok(())
 }
 
@@ -643,15 +657,17 @@ fn main() {
     let spawned = std::thread::Builder::new()
         .name("caddy-rs-pm-main".to_string())
         .stack_size(MAIN_THREAD_STACK_BYTES)
-        .spawn(|| match tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_stack_size(WORKER_THREAD_STACK_BYTES)
-            .build()
-        {
-            Ok(runtime) => runtime.block_on(async_main()),
-            Err(error) => {
-                eprintln!("caddy-rs-pm: cannot start the async runtime: {error}");
-                std::process::exit(1);
+        .spawn(|| {
+            match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(WORKER_THREAD_STACK_BYTES)
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(async_main()),
+                Err(error) => {
+                    eprintln!("caddy-rs-pm: cannot start the async runtime: {error}");
+                    std::process::exit(1);
+                }
             }
         });
     match spawned.map(std::thread::JoinHandle::join) {
@@ -1289,18 +1305,9 @@ fn resolve_jwt_secret_source(
 /// The key file itself is 0600, but the directory that holds it must not be traversable either:
 /// otherwise a local user can enumerate the data directory.
 fn create_owner_only_dir(dir: &Path) -> Result<(), CliError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(dir)?;
-    }
+    // Mode 0700 on Unix; a protected owner/SYSTEM/Administrators DACL on Windows, where a plain
+    // `create_dir_all` under `%ProgramData%` would inherit read access for `BUILTIN\Users`.
+    caddy_rs_fsperm::create_dir_all_private(dir)?;
     Ok(())
 }
 
@@ -1337,9 +1344,30 @@ fn refuse_group_or_world_readable(path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Windows: the same refusal, read from the file's DACL instead of mode bits. A signing key that any
+/// other principal can read or write lets that principal mint tokens for any account.
 #[cfg(not(unix))]
-fn refuse_group_or_world_readable(_path: &Path) -> Result<(), CliError> {
-    // Non-Unix platforms have no POSIX mode bits to check; ACLs are the platform's own concern.
+fn refuse_group_or_world_readable(path: &Path) -> Result<(), CliError> {
+    let exposure = match caddy_rs_fsperm::exposure(path) {
+        Ok(exposure) => exposure,
+        // Missing is the normal first-boot case: authn creates the file private.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(CliError::InvalidArg(format!(
+                "could not inspect JWT signing key {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    if !exposure.is_private() {
+        return Err(CliError::InvalidArg(format!(
+            "JWT signing key {} can be accessed by other users; restrict it with \
+             `icacls \"{}\" /inheritance:r /grant:r \"%USERNAME%:F\"` or supply the key via \
+             {PM_JWT_SECRET_ENV}",
+            path.display(),
+            path.display()
+        )));
+    }
     Ok(())
 }
 
@@ -1462,7 +1490,22 @@ async fn shutdown_signal() -> ServeSignal {
         sigterm.recv().await;
     };
 
-    #[cfg(not(unix))]
+    // Windows: Ctrl+Break, closing the console and a system shutdown are the SIGTERM equivalents
+    // (Ctrl+C is handled above).
+    #[cfg(windows)]
+    let terminate = async {
+        use tokio::signal::windows::{ctrl_break, ctrl_close, ctrl_shutdown};
+        let mut brk = ctrl_break().expect("failed to listen for Ctrl+Break");
+        let mut close = ctrl_close().expect("failed to listen for console close");
+        let mut shutdown = ctrl_shutdown().expect("failed to listen for system shutdown");
+        tokio::select! {
+            _ = brk.recv() => {}
+            _ = close.recv() => {}
+            _ = shutdown.recv() => {}
+        }
+    };
+
+    #[cfg(not(any(unix, windows)))]
     let terminate = std::future::pending::<()>();
 
     #[cfg(unix)]
@@ -1898,9 +1941,12 @@ mod tests {
         // `ReadWritePaths=/var/lib/caddy-rs`, so installing without creating them leaves a service
         // that cannot start. Every prerequisite has to be created on a host that has none.
         let dir = std::env::temp_dir().join(format!(
-            "pm-prereq-clean-{}-{:?}",
+            "pm-prereq-clean-{}-{}",
             std::process::id(),
+            // `{:?}` of a SystemTime contains `{`, `:` and spaces, which Windows forbids in a name.
             std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
         ));
         let fake = FakeAccounts {
             user_exists: false,
@@ -1937,9 +1983,12 @@ mod tests {
         // Re-install must be idempotent: an operator may have customised the account, so an
         // existing user and group are left alone and only the unit is rewritten.
         let dir = std::env::temp_dir().join(format!(
-            "pm-prereq-existing-{}-{:?}",
+            "pm-prereq-existing-{}-{}",
             std::process::id(),
+            // `{:?}` of a SystemTime contains `{`, `:` and spaces, which Windows forbids in a name.
             std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
         ));
         std::fs::create_dir_all(&dir).expect("dir");
         let fake = FakeAccounts {
@@ -1986,9 +2035,12 @@ mod tests {
         // A file at the data path would leave the service unable to write its store; failing with
         // the path named beats letting systemd report a bare 226/NAMESPACE later.
         let path = std::env::temp_dir().join(format!(
-            "pm-prereq-file-{}-{:?}",
+            "pm-prereq-file-{}-{}",
             std::process::id(),
+            // `{:?}` of a SystemTime contains `{`, `:` and spaces, which Windows forbids in a name.
             std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
         ));
         std::fs::write(&path, b"not a directory").expect("file");
         let fake = FakeAccounts {

@@ -4385,6 +4385,7 @@ mod tests {
         assert!(declined.is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn accepts_unix_dial_in_configuration() {
         let handler = build_handler(serde_json::json!({
@@ -4729,6 +4730,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn unix_socket_tls_upstream_requires_server_name() {
         let directory = tempfile::tempdir().unwrap();

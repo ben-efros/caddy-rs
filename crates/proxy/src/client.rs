@@ -1974,7 +1974,8 @@ mod tests {
                 .strip_prefix(&workspace)
                 .unwrap_or(file)
                 .display()
-                .to_string();
+                .to_string()
+                .replace(std::path::MAIN_SEPARATOR, "/");
             let file_named = exemption_doc.contains(&relative);
             for pattern in patterns {
                 let mut from = 0usize;

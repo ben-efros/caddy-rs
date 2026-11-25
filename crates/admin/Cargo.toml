@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Private log files and directories on Windows (the analogue of Caddy's 0600/0700 defaults).
+caddy-rs-fsperm = { path = "../fsperm" }
 base64 = { workspace = true }
 flate2 = "1"
 zstd = "0.14"

@@ -14,3 +14,10 @@ thiserror = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
+
+[target.'cfg(windows)'.dependencies]
+# Safe-mode imports check the file's DACL and owner, since Windows has no mode bits or uid.
+caddy-rs-fsperm = { path = "../fsperm" }
+
+[dev-dependencies]
+caddy-rs-test-support = { path = "../test-support" }

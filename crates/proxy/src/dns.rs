@@ -1338,6 +1338,7 @@ mod tests {
     /// sockets, matching the default 32768-60999): `bind("0.0.0.0:0")` fails with errno 98
     /// EADDRINUSE -> `AddrInUse`. Asserting through `from_raw_os_error` ties the test to the
     /// platform rather than to a guess, and consumes no ports.
+    #[cfg(target_os = "linux")]
     #[test]
     fn udp_exhaustion_hint_fires_for_the_measured_errno() {
         let refused = std::io::Error::from_raw_os_error(98);

@@ -101,3 +101,21 @@ mod tests {
         assert!(!is_address_in_use("permission denied"));
     }
 }
+
+/// Make a fixture directory private to its owner on Windows; a no-op elsewhere.
+///
+/// Tests that exercise the "other users must not be able to write here" rules (Caddyfile imports,
+/// the data directory, autosave) build their fixtures under the OS temp directory. On Unix that is
+/// `0700`/`0755` and passes. On Windows `%TEMP%` can grant other principals access (a sandbox
+/// account's group, a security agent), and the rules then, correctly, refuse the fixture. Calling
+/// this after creating the directory gives it the DACL a real configuration directory has, so the
+/// test exercises the rule it is about instead of the machine's ambient ACLs.
+///
+/// # Panics
+/// When the permissions cannot be changed, which would invalidate the test.
+pub fn make_private(path: &std::path::Path) {
+    #[cfg(windows)]
+    caddy_rs_fsperm::restrict_dir(path).expect("make the fixture directory private");
+    #[cfg(not(windows))]
+    let _ = path;
+}

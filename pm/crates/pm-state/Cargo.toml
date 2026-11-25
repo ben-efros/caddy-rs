@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Owner-only files and directories (mode bits on Unix, protected ACLs on Windows).
+caddy-rs-fsperm = { path = "../../../crates/fsperm" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

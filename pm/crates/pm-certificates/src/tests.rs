@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -253,19 +254,36 @@ fn repository_stores_metadata_and_secret_files_with_owner_only_permissions() {
     assert_eq!(repo.list().expect("list").len(), 1);
 
     let directory = repo.secrets_dir();
-    assert_eq!(
-        std::fs::metadata(directory)
-            .expect("secrets metadata")
-            .mode()
-            & 0o777,
-        0o700
-    );
-    for file in [
-        &stored.certificate.certificate_file,
-        &stored.certificate.key_file,
-    ] {
-        let metadata = std::fs::metadata(directory.join(file)).expect("secret metadata");
-        assert_eq!(metadata.mode() & 0o777, 0o600, "file {file}");
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            std::fs::metadata(directory)
+                .expect("secrets metadata")
+                .mode()
+                & 0o777,
+            0o700
+        );
+        for file in [
+            &stored.certificate.certificate_file,
+            &stored.certificate.key_file,
+        ] {
+            let metadata = std::fs::metadata(directory.join(file)).expect("secret metadata");
+            assert_eq!(metadata.mode() & 0o777, 0o600, "file {file}");
+        }
+    }
+    // Windows has no mode bits: the directory and key files must carry a private DACL.
+    #[cfg(windows)]
+    {
+        assert!(caddy_rs_fsperm::exposure(directory)
+            .expect("secrets exposure")
+            .is_private());
+        for file in [
+            &stored.certificate.certificate_file,
+            &stored.certificate.key_file,
+        ] {
+            let exposure = caddy_rs_fsperm::exposure(&directory.join(file)).expect("file exposure");
+            assert!(exposure.is_private(), "file {file}: {exposure:?}");
+        }
     }
 
     // The metadata document and any error rendering never contain key material.
@@ -304,12 +322,25 @@ fn repository_allocates_monotonic_ids_and_refuses_overwrite() {
     assert_eq!(repo.list().expect("list").len(), 2);
 }
 
+#[cfg(any(unix, windows))]
 #[test]
 fn repository_refuses_a_symlinked_secrets_directory() {
     let dir = TempDir::new().expect("temp dir");
     let real = dir.path().join("real");
     std::fs::create_dir(&real).expect("real");
+    #[cfg(unix)]
     std::os::unix::fs::symlink(&real, dir.path().join("secrets")).expect("symlink");
+    // A directory junction needs no privilege to create and is a reparse point like a symlink.
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(dir.path().join("secrets"))
+            .arg(&real)
+            .output()
+            .expect("run mklink");
+        assert!(output.status.success(), "mklink /J failed: {output:?}");
+    }
     let store: Arc<dyn StateStore> = Arc::new(MemoryStore::new());
     let repo = CertificateRepository::new(store, dir.path().join("secrets"));
     let (certificate, key) = valid();

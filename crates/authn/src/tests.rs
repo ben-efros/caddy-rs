@@ -14,8 +14,22 @@ fn write_secret_file(path: &std::path::Path, bytes: &[u8], mode: u32) {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
             .expect("set secret file mode");
     }
-    #[cfg(not(unix))]
-    let _ = mode;
+    // Windows has no mode bits: translate the requested mode into a real DACL. An owner-only mode
+    // makes the file private (the ambient `%TEMP%` ACL can grant other principals access); any
+    // group/other bit grants Everyone read access, which is what the "world-readable" tests mean.
+    #[cfg(windows)]
+    {
+        if mode & 0o077 == 0 {
+            caddy_rs_fsperm::restrict_file(path).expect("make the secret file private");
+        } else {
+            let output = std::process::Command::new("icacls")
+                .arg(path)
+                .args(["/grant", "*S-1-1-0:R"])
+                .output()
+                .expect("run icacls");
+            assert!(output.status.success(), "icacls failed: {output:?}");
+        }
+    }
 }
 
 fn test_config() -> AuthnConfig {
@@ -1615,20 +1629,25 @@ fn existing_world_readable_secret_file_is_refused_without_rewriting_it() {
         );
     }
 
-    // Non-Unix platforms have no POSIX mode bits to enforce, so the file stays usable there.
+    // Windows has no POSIX mode bits, but it enforces the same rule from the file's DACL: a signing
+    // key another principal can read is refused, and never rewritten.
     #[cfg(not(unix))]
     {
-        let key = JwtSecretSource::File(path.clone())
+        let error = JwtSecretSource::File(path.clone())
             .resolve()
-            .expect("an existing 32-byte secret is still usable");
-        assert_eq!(
-            key, existing,
-            "the existing secret is honoured, not replaced"
+            .expect_err("a secret other users can read must be refused");
+        assert!(
+            error.to_string().contains("can be accessed by other users"),
+            "{error}"
         );
         assert_eq!(
             std::fs::read(&path).expect("read secret file"),
             existing,
-            "a populated secret file is never rewritten"
+            "a refused secret file is never rewritten"
+        );
+        assert!(
+            JwtSecretSource::File(path.clone()).resolve().is_err(),
+            "the refusal is stable across attempts"
         );
     }
 

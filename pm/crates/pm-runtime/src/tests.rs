@@ -107,6 +107,19 @@ fn open_creates_pm_state_and_secures_created_directories() {
         assert_eq!(mode(&data_dir.join("pm")), 0o700);
         assert_eq!(mode(runtime.state_path()), 0o600);
     }
+    // Windows has no mode bits: the directories and the state file must carry a private DACL
+    // (nobody but this user, SYSTEM and Administrators can read or change them).
+    #[cfg(windows)]
+    {
+        for path in [
+            data_dir.clone(),
+            data_dir.join("pm"),
+            runtime.state_path().to_path_buf(),
+        ] {
+            let exposure = caddy_rs_fsperm::exposure(&path).expect("read the DACL");
+            assert!(exposure.is_private(), "{}: {exposure:?}", path.display());
+        }
+    }
 }
 
 #[test]
@@ -343,7 +356,7 @@ fn open_does_not_change_existing_ownership_or_permissions() {
 fn state_open_error_carries_the_state_path() {
     let (_temp, data_dir) = temp_data_dir();
     fs::create_dir_all(data_dir.join("pm")).expect("pm dir");
-    let state_path = data_dir.join("pm/state.json");
+    let state_path = data_dir.join("pm").join("state.json");
     fs::write(&state_path, b"").expect("empty state file");
 
     let error = open_error(&data_dir);

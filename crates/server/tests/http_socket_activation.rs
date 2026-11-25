@@ -7,6 +7,9 @@
 //! `crates/server/src/activation.rs`; this file proves the fd-adoption path end to end: a socket
 //! created here and handed to the runtime is served without rebinding.
 
+// These tests drive Unix-domain sockets or inherited file descriptors, which Windows does not have.
+#![cfg(unix)]
+
 use std::net::SocketAddr;
 use std::os::fd::IntoRawFd;
 use std::path::PathBuf;

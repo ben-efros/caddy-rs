@@ -1904,6 +1904,7 @@ mod tests {
         String::from_utf8(response.body.to_vec()).unwrap()
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fastcgi_params_env_and_script_filename_match_caddy() {
         let (dial, captured) = spawn_tcp_mock(Behavior::responds(0)).await;
@@ -2176,6 +2177,7 @@ mod tests {
         assert_eq!(body_string(&response), "first-second");
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fastcgi_over_unix_socket() {
         let directory = tempfile::tempdir().unwrap();
@@ -2589,6 +2591,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fastcgi_script_variables_use_the_decoded_cleaned_path() {
         // Caddy derives SCRIPT_NAME/DOCUMENT_URI/PATH_INFO from `NormalizedPath(r.URL.Path)`:
@@ -2622,6 +2625,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fastcgi_script_path_split_requires_a_segment_boundary() {
         // Upstream caddy@b30c01934116: SCRIPT_NAME/PATH_INFO must agree with what the route/file
@@ -2697,6 +2701,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fastcgi_multibyte_path_splits_like_the_ascii_equivalent() {
         // SEC-L9-PROXY: `GET /caf%C3%A9/x.php` panicked ("byte index 5 is not a char boundary")
@@ -2947,6 +2952,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fastcgi_script_filename_valid_path_within_root() {
         let (dial, captured) = spawn_tcp_mock(Behavior::responds(0)).await;

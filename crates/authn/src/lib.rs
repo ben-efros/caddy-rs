@@ -928,17 +928,58 @@ fn open_secret_file(path: &std::path::Path) -> AuthResult<Option<std::fs::File>>
     Ok(Some(file))
 }
 
-/// Non-Unix fallback: no `dev`/`ino` to compare and no POSIX mode bits, so only the pre-open
-/// symlink check is available.
+/// Windows/non-Unix: there is no `dev`/`ino` to compare and no POSIX mode bits, so the same
+/// guarantees come from the file's DACL and owner: the final component must not be a symlink, the
+/// file must be owned by this user (or SYSTEM/Administrators), and no other principal may read or
+/// write it, because a signing key readable by anyone lets them mint tokens.
 #[cfg(not(unix))]
 fn open_secret_file(path: &std::path::Path) -> AuthResult<Option<std::fs::File>> {
+    let link_metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(AuthError::Internal(format!(
+                "could not inspect JWT secret file {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    if link_metadata.file_type().is_symlink() {
+        return Err(AuthError::Internal(format!(
+            "refusing to read JWT secret file {}: the final path component is a symlink or \
+             reparse point; replace it with a regular file or configure a master secret",
+            path.display()
+        )));
+    }
+    let io_error = |what: &str, error: std::io::Error| {
+        AuthError::Internal(format!(
+            "could not {what} JWT secret file {}: {error}",
+            path.display()
+        ))
+    };
+    let exposure = caddy_rs_fsperm::exposure(path)
+        .map_err(|error| io_error("read the permissions of", error))?;
+    if !exposure.is_private() {
+        return Err(AuthError::Internal(format!(
+            "JWT secret file {} can be accessed by other users, who could then mint tokens; \
+             restrict it with `icacls \"{}\" /inheritance:r /grant:r \"%USERNAME%:F\"` or \
+             configure a master secret",
+            path.display(),
+            path.display()
+        )));
+    }
+    if !caddy_rs_fsperm::owned_by_current_user(path)
+        .map_err(|error| io_error("read the owner of", error))?
+    {
+        return Err(AuthError::Internal(format!(
+            "refusing to read JWT secret file {}: it is owned by another user",
+            path.display()
+        )));
+    }
     match std::fs::File::open(path) {
         Ok(file) => Ok(Some(file)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(AuthError::Internal(format!(
-            "could not read JWT secret file {}: {error}",
-            path.display()
-        ))),
+        Err(error) => Err(io_error("read", error)),
     }
 }
 
@@ -994,14 +1035,19 @@ fn unique_secret_temp_path(path: &std::path::Path) -> PathBuf {
 /// Create `temp` exclusively (never following a planted symlink or hardlink) with owner-only
 /// permissions, write the key, and flush it to disk.
 fn write_secret_temp(temp: &std::path::Path, key: &[u8; 32]) -> AuthResult<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
     #[cfg(unix)]
-    {
+    let created = {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
-    }
-    let mut file = options.open(temp).map_err(|error| {
+        options.open(temp)
+    };
+    // Windows: created exclusively with a protected owner/SYSTEM/Administrators DACL by the create
+    // call itself, so the key is never readable by another user, even briefly.
+    #[cfg(not(unix))]
+    let created = caddy_rs_fsperm::create_new_file_private(temp);
+    let mut file = created.map_err(|error| {
         AuthError::Internal(format!(
             "could not create temporary JWT secret file {}: {error}",
             temp.display()

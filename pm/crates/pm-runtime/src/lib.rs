@@ -592,13 +592,10 @@ fn create_directory(path: &Path, allow_symlinks: bool) -> Result<PathBuf, Runtim
 }
 
 fn create_single_directory(path: &Path) -> io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(path)
+    // Owner-only at creation on every platform (mode 0700, or a protected owner/SYSTEM/
+    // Administrators DACL on Windows), and an existing path is reported as `AlreadyExists` so the
+    // caller can inspect it (symlink, racing creator) instead of silently accepting it.
+    caddy_rs_fsperm::create_dir_private(path)
 }
 
 #[cfg(unix)]
@@ -612,9 +609,14 @@ fn secure_directory(path: &Path) -> Result<(), RuntimeError> {
     })
 }
 
+/// Windows: tighten the directory to a protected owner/SYSTEM/Administrators DACL (the analogue of
+/// `0700`), so a directory made by an older version or by `create_dir_all` is not left open.
 #[cfg(not(unix))]
-fn secure_directory(_path: &Path) -> Result<(), RuntimeError> {
-    Ok(())
+fn secure_directory(path: &Path) -> Result<(), RuntimeError> {
+    caddy_rs_fsperm::restrict_dir(path).map_err(|source| RuntimeError::CreateDirectory {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// Create, write, fsync and remove a unique probe file in `directory`.

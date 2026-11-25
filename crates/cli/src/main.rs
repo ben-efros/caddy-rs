@@ -724,15 +724,17 @@ fn main() -> ExitCode {
     let spawned = std::thread::Builder::new()
         .name("caddy-rs-main".to_string())
         .stack_size(MAIN_THREAD_STACK_BYTES)
-        .spawn(|| match tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_stack_size(WORKER_THREAD_STACK_BYTES)
-            .build()
-        {
-            Ok(runtime) => runtime.block_on(async_main()),
-            Err(error) => {
-                eprintln!("caddy-rs: error: cannot start the async runtime: {error}");
-                ExitCode::from(1)
+        .spawn(|| {
+            match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(WORKER_THREAD_STACK_BYTES)
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(async_main()),
+                Err(error) => {
+                    eprintln!("caddy-rs: error: cannot start the async runtime: {error}");
+                    ExitCode::from(1)
+                }
             }
         });
     match spawned.map(std::thread::JoinHandle::join) {

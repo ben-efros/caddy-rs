@@ -412,10 +412,7 @@ fn vars_routes_sort_least_specific_first_like_caddy() {
 /// File-import fixtures need the Caddyfile's source path so `import testdata/...` resolves the
 /// same way as in Caddy's test working directory.
 fn assert_adapts_file_fixture_like_caddy(name: &str) {
-    let path = format!(
-        "{}/tests/fixtures/upstream-imports/{name}",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let path = format!("{}/{name}", upstream_import_fixture_dir().display());
     let raw = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"));
     let (caddyfile, expected) = raw
         .split_once("----------")
@@ -1859,4 +1856,47 @@ fn transport_durations_still_reject_invalid_go_forms() {
             .contains("bad timeout value '1x': time: unknown unit \"x\" in duration \"1x\""),
         "unknown units must use Go's message: {error}"
     );
+}
+
+/// Directory holding the upstream import fixtures.
+///
+/// On Unix it is the checked-in directory. On Windows a repository checkout on a data drive is
+/// modifiable by every authenticated user (that is the drive's default ACL), which the safe-mode
+/// import rule rightly refuses, so the fixtures are copied once into a private temporary directory
+/// and imported from there.
+fn upstream_import_fixture_dir() -> std::path::PathBuf {
+    let source = std::path::PathBuf::from(format!(
+        "{}/tests/fixtures/upstream-imports",
+        env!("CARGO_MANIFEST_DIR")
+    ));
+    #[cfg(not(windows))]
+    {
+        source
+    }
+    #[cfg(windows)]
+    {
+        use std::sync::OnceLock;
+        static COPY: OnceLock<std::path::PathBuf> = OnceLock::new();
+        COPY.get_or_init(|| {
+            fn copy(from: &Path, to: &Path) {
+                std::fs::create_dir_all(to).expect("create fixture directory");
+                for entry in std::fs::read_dir(from).expect("read fixture directory") {
+                    let entry = entry.expect("fixture entry");
+                    let target = to.join(entry.file_name());
+                    if entry.file_type().expect("fixture type").is_dir() {
+                        copy(&entry.path(), &target);
+                    } else {
+                        std::fs::copy(entry.path(), &target).expect("copy fixture");
+                    }
+                }
+            }
+            let root = std::env::temp_dir()
+                .join(format!("caddy-rs-upstream-imports-{}", std::process::id()));
+            std::fs::create_dir_all(&root).expect("create fixture root");
+            caddy_rs_test_support::make_private(&root);
+            copy(&source, &root);
+            root
+        })
+        .clone()
+    }
 }

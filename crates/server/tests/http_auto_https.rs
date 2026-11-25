@@ -8,6 +8,7 @@
 //! rustls handshake.
 
 use std::net::SocketAddr;
+#[cfg(unix)]
 use std::os::fd::IntoRawFd;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1020,6 +1021,12 @@ async fn plain_get(
     host: &str,
     path: &str,
 ) -> (u16, Vec<(String, String)>, String) {
+    // A listener bound to `0.0.0.0` is reached through loopback (Windows refuses to connect to
+    // the unspecified address).
+    let mut address = address;
+    if address.ip().is_unspecified() {
+        address.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
+    }
     let mut stream = TcpStream::connect(address).await.expect("TCP connect");
     http_get(&mut stream, host, path).await
 }
@@ -1102,19 +1109,51 @@ async fn post_plain(address: SocketAddr, path: &str) -> u16 {
     read_response(&mut stream).await.0
 }
 
-/// Pre-bind the TLS listener and hand it to the runtime as a systemd-style inherited socket.
+/// A pre-bound TLS listener for the runtime to serve on (see [`prebound_listener`]).
+struct Prebound {
+    /// Unix: the descriptor, handed over as a systemd-style inherited socket. Windows has no such
+    /// mechanism, so this is `None` and the runtime binds the (just released) port itself.
+    activation: Option<SocketActivation>,
+}
+
+/// Adopt a [`Prebound`] listener into a runtime.
+trait PreboundExt: Sized {
+    fn with_prebound(self, prebound: Prebound) -> Self;
+}
+
+impl PreboundExt for ServerRuntime {
+    fn with_prebound(self, prebound: Prebound) -> Self {
+        match prebound.activation {
+            Some(activation) => self.with_socket_activation(activation),
+            None => self,
+        }
+    }
+}
+
+/// Pre-bind the TLS listener and hand it to the runtime.
 ///
-/// This gives the CA probe a deterministic address without a reserve/drop race, and exercises the
-/// normal inherited-socket binding path used in production.
-fn prebound_listener() -> (SocketAddr, SocketActivation) {
+/// On Unix this passes the bound socket as a systemd-style inherited socket, which gives the CA
+/// probe a deterministic address without a reserve/drop race and exercises the normal
+/// inherited-socket binding path used in production. Windows has no inherited sockets, so there the
+/// port is reserved and released and the runtime binds it again (a window of a few microseconds in
+/// which another process could take it; the retry in `start` helpers covers the rare loss).
+fn prebound_listener() -> (SocketAddr, Prebound) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("pre-bind TLS listener");
     let address = listener.local_addr().expect("pre-bound address");
-    let activation = SocketActivation::from_raw_descriptors(vec![(
-        listener.into_raw_fd(),
-        Some("https".to_string()),
-    )])
-    .expect("valid inherited descriptor");
-    (address, activation)
+    #[cfg(unix)]
+    let activation = Some(
+        SocketActivation::from_raw_descriptors(vec![(
+            listener.into_raw_fd(),
+            Some("https".to_string()),
+        )])
+        .expect("valid inherited descriptor"),
+    );
+    #[cfg(not(unix))]
+    let activation = {
+        drop(listener);
+        None
+    };
+    (address, Prebound { activation })
 }
 
 /// A fixed port number that is currently free, for tests that need a connection to fail (probing a
@@ -1625,7 +1664,7 @@ async fn tls_alpn01_challenge_validates_and_issues_certificate() {
     let mut runtime = ServerRuntime::new(Arc::clone(&store))
         .with_acme_transport(fake.clone())
         .with_data_root(directory.path())
-        .with_socket_activation(activation);
+        .with_prebound(activation);
     runtime
         .apply()
         .await
@@ -1678,7 +1717,7 @@ async fn normal_tls_clients_are_unaffected_by_tls_alpn_overlay() {
     let mut runtime = ServerRuntime::new(Arc::clone(&store))
         .with_acme_transport(fake.clone())
         .with_data_root(directory.path())
-        .with_socket_activation(activation);
+        .with_prebound(activation);
     runtime.apply().await.expect("apply");
     let address = runtime
         .listener_address(&listen)
@@ -1740,7 +1779,7 @@ async fn adaptive_selection_validates_one_of_the_available_challenges() {
     let mut runtime = ServerRuntime::new(Arc::clone(&store))
         .with_acme_transport(fake.clone())
         .with_data_root(directory.path())
-        .with_socket_activation(activation);
+        .with_prebound(activation);
     runtime.apply().await.expect("apply");
     // acmez randomizes the initial challenge order when several types are offered
     // (client.go:281-294), so either type may validate the first issuance; exactly the selected
@@ -1782,7 +1821,7 @@ async fn unvalidatable_tls_alpn_falls_back_to_http01() {
     let mut runtime = ServerRuntime::new(Arc::clone(&store))
         .with_acme_transport(fake.clone())
         .with_data_root(directory.path())
-        .with_socket_activation(activation);
+        .with_prebound(activation);
     runtime
         .apply()
         .await
@@ -1839,7 +1878,7 @@ async fn tls_alpn_probe_failure_keeps_previous_generation() {
     // listener is pre-bound and injected, so the failed apply does not race for a port.
     let (address, activation) = prebound_listener();
     let listen = address.to_string();
-    runtime = runtime.with_socket_activation(activation);
+    runtime = runtime.with_prebound(activation);
     store
         .load(tls_alpn_config(
             &listen,
@@ -2162,7 +2201,7 @@ async fn default_on_issues_certificate_for_implicit_https_site() {
     let mut runtime = ServerRuntime::new(Arc::clone(&store))
         .with_acme_transport(fake.clone())
         .with_data_root(directory.path())
-        .with_socket_activation(activation);
+        .with_prebound(activation);
     runtime
         .apply()
         .await
@@ -2211,7 +2250,7 @@ async fn default_on_disable_does_not_issue_and_fails_loudly_without_certificates
     let mut runtime = ServerRuntime::new(Arc::clone(&store))
         .with_acme_transport(fake.clone())
         .with_data_root(directory.path())
-        .with_socket_activation(activation);
+        .with_prebound(activation);
     let error = runtime
         .apply()
         .await
@@ -2352,7 +2391,7 @@ async fn implicit_https_on_non_standard_port_terminates_tls_and_redirects_to_it(
     let mut runtime = ServerRuntime::new(Arc::clone(&store))
         .with_acme_transport(fake.clone())
         .with_data_root(directory.path())
-        .with_socket_activation(activation);
+        .with_prebound(activation);
     runtime
         .apply()
         .await
@@ -2458,7 +2497,7 @@ async fn configured_storage_root_wins_over_the_data_directory() {
     let mut runtime = ServerRuntime::new(Arc::clone(&store))
         .with_acme_transport(fake.clone())
         .with_data_root(data_dir.path())
-        .with_socket_activation(activation);
+        .with_prebound(activation);
     runtime
         .apply()
         .await

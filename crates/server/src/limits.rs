@@ -641,7 +641,10 @@ mod budget_tests {
         // Twice the body size is reserved, so half the budget in bytes takes all of it.
         assert!(hog.try_grow(BUFFERED_BODY_BUDGET_BYTES / 2));
         let mut other = BufferedBodyReservation::default();
-        assert!(!other.try_grow(1), "an exhausted budget refuses even one byte");
+        assert!(
+            !other.try_grow(1),
+            "an exhausted budget refuses even one byte"
+        );
         drop(hog);
         assert!(other.try_grow(1024), "the budget is returned on drop");
         assert!(other.try_grow(1024), "a reservation can keep growing");

@@ -2176,14 +2176,21 @@ fn storage_path(root: &Path, key: &str) -> Result<PathBuf> {
 /// else. Material written by an earlier version used the default umask (0644 files in 0755
 /// directories); reading or rewriting it must not leave it that way. Best effort: a failure to
 /// chmod must not turn a working ACME account into an outage.
-#[cfg(unix)]
-async fn restrict_to_owner(path: &Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(metadata) = fs::metadata(path).await {
-        if metadata.permissions().mode() & 0o077 != 0 {
-            let _ = fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).await;
+async fn restrict_to_owner(path: &Path, directory: bool) {
+    let path = path.to_path_buf();
+    // Blocking filesystem/ACL calls: keep them off the async workers.
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(exposure) = caddy_rs_fsperm::exposure(&path) {
+            if !exposure.is_private() {
+                let _ = if directory {
+                    caddy_rs_fsperm::restrict_dir(&path)
+                } else {
+                    caddy_rs_fsperm::restrict_file(&path)
+                };
+            }
         }
-    }
+    })
+    .await;
 }
 
 /// [`AcmeStorage`] over the filesystem certificate storage root.
@@ -2202,8 +2209,7 @@ impl AcmeStorage for FileStorage {
             Ok(value) => {
                 // Self-heal material an earlier version wrote world-readable (see
                 // `restrict_to_owner`); without this an existing account key stays 0644 forever.
-                #[cfg(unix)]
-                restrict_to_owner(&path, 0o600).await;
+                restrict_to_owner(&path, false).await;
                 Ok(Some(value))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -2214,22 +2220,23 @@ impl AcmeStorage for FileStorage {
     async fn store(&self, key: &str, value: &[u8]) -> Result<()> {
         let path = storage_path(self.root(), key)?;
         if let Some(parent) = path.parent() {
-            // Owner-only directories: ACME account keys live under here, and a default (0755)
-            // directory plus a default umask made them readable by every local user.
-            let mut builder = fs::DirBuilder::new();
-            builder.recursive(true);
-            #[cfg(unix)]
-            builder.mode(0o700);
-            builder.create(parent).await?;
-            // `DirBuilder::mode` only applies to directories it creates: tighten the ones an
-            // earlier version made 0755, from the key's directory up to (excluding) the root.
-            #[cfg(unix)]
+            // Owner-only directories (mode 0700 on Unix, a protected owner/SYSTEM/Administrators
+            // DACL on Windows): ACME account keys live under here, and the default umask or an
+            // inherited `ProgramData` ACL made them readable by every local user.
+            let parent_owned = parent.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                caddy_rs_fsperm::create_dir_all_private(&parent_owned)
+            })
+            .await
+            .map_err(|error| Error::Io(std::io::Error::other(error)))??;
+            // Creation only protects directories it makes: tighten the ones an earlier version
+            // left open, from the key's directory up to (excluding) the root.
             for ancestor in path
                 .ancestors()
                 .skip(1)
                 .take_while(|ancestor| *ancestor != self.root())
             {
-                restrict_to_owner(ancestor, 0o700).await;
+                restrict_to_owner(ancestor, true).await;
             }
         }
         // A unique temporary name per write, created exclusively and with owner-only permissions
@@ -2248,13 +2255,16 @@ impl AcmeStorage for FileStorage {
             TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let temporary = path.with_file_name(temporary_name);
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
         // Opening exclusively means a failure here names a file this call did not create, so it is
-        // never removed; only a temporary this call made is cleaned up on a later error.
-        let mut file = options.open(&temporary).await?;
+        // never removed; only a temporary this call made is cleaned up on a later error. The file
+        // is created owner-only (mode 0600 / protected DACL) by the create call itself.
+        let temporary_for_create = temporary.clone();
+        let std_file = tokio::task::spawn_blocking(move || {
+            caddy_rs_fsperm::create_new_file_private(&temporary_for_create)
+        })
+        .await
+        .map_err(|error| Error::Io(std::io::Error::other(error)))??;
+        let mut file = fs::File::from_std(std_file);
         let written = async {
             tokio::io::AsyncWriteExt::write_all(&mut file, value).await?;
             tokio::io::AsyncWriteExt::flush(&mut file).await?;
@@ -3082,7 +3092,12 @@ EVdZ8IcAQzAPk1jBxj0YDC0rR5d09Q==
         let mut parent = files[0].parent().unwrap().to_path_buf();
         while parent != directory.path() {
             let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o700, "{} must be 0700, got {mode:o}", parent.display());
+            assert_eq!(
+                mode,
+                0o700,
+                "{} must be 0700, got {mode:o}",
+                parent.display()
+            );
             parent = parent.parent().unwrap().to_path_buf();
         }
     }
@@ -3182,7 +3197,11 @@ EVdZ8IcAQzAPk1jBxj0YDC0rR5d09Q==
         let pid = std::process::id();
         std::fs::create_dir_all(directory.path().join("acme")).unwrap();
         let stale: Vec<PathBuf> = (0..4)
-            .map(|counter| directory.path().join(format!("acme/k.{pid}.0.{counter}.tmp")))
+            .map(|counter| {
+                directory
+                    .path()
+                    .join(format!("acme/k.{pid}.0.{counter}.tmp"))
+            })
             .chain((0..4).map(|counter| directory.path().join(format!("acme/k.{counter}.tmp"))))
             .collect();
         for path in &stale {

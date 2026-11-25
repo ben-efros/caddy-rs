@@ -164,10 +164,52 @@ pub fn resolve_server_data_dir_with(
 /// macOS/Windows/Plan 9 variants of `AppDataDir` are not reachable from the platforms this build
 /// ships on.
 pub fn app_data_dir() -> PathBuf {
+    // Windows has no `HOME`; without this the fallback below is `./caddy` in whatever directory the
+    // server was started from, which puts private keys under the working directory (and, with
+    // `file_server` serving `.`, next to served files). Caddy uses `%AppData%/Caddy` there.
+    if cfg!(windows) && env_is_unset(XDG_DATA_HOME_ENV) {
+        if let Some(directory) = windows_app_dir() {
+            return directory;
+        }
+    }
     app_data_dir_with(
         std::env::var_os(XDG_DATA_HOME_ENV),
         std::env::var_os(HOME_ENV),
     )
+}
+
+/// Directory name Caddy uses under `%AppData%` on Windows for both data and configuration.
+pub const WINDOWS_APP_SUBDIR: &str = "Caddy";
+
+/// Whether an environment variable is unset or empty (Caddy treats empty as unset).
+fn env_is_unset(name: &str) -> bool {
+    std::env::var_os(name).is_none_or(|value| value.is_empty())
+}
+
+/// Caddy's Windows application directory, `%AppData%/Caddy` (data and config share it).
+///
+/// `%AppData%` is used when set, otherwise `%UserProfile%/AppData/Roaming`. `None` when neither
+/// variable exists, in which case callers keep the portable fallback.
+pub fn windows_app_dir() -> Option<PathBuf> {
+    windows_app_dir_from(std::env::var_os("APPDATA"), std::env::var_os("USERPROFILE"))
+}
+
+/// Testable form of [`windows_app_dir`] with the environment values supplied explicitly.
+pub fn windows_app_dir_from(
+    appdata: Option<OsString>,
+    user_profile: Option<OsString>,
+) -> Option<PathBuf> {
+    if let Some(base) = appdata.filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(base).join(WINDOWS_APP_SUBDIR));
+    }
+    user_profile
+        .filter(|value| !value.is_empty())
+        .map(|profile| {
+            PathBuf::from(profile)
+                .join("AppData")
+                .join("Roaming")
+                .join(WINDOWS_APP_SUBDIR)
+        })
 }
 
 /// Testable form of [`app_data_dir`] with the environment values supplied explicitly.
@@ -189,6 +231,11 @@ pub fn app_data_dir_with(xdg_data_home: Option<OsString>, home: Option<OsString>
 /// Caddy's `AppDataDir()`-resolved path: `$XDG_DATA_HOME/caddy`, then
 /// `$HOME/.local/share/caddy`, then `./caddy` resolved against the working directory.
 pub fn caddy_data_dir() -> PathBuf {
+    if cfg!(windows) && env_is_unset(XDG_DATA_HOME_ENV) {
+        if let Some(directory) = windows_app_dir() {
+            return directory;
+        }
+    }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     caddy_data_dir_with(
         &cwd,
@@ -486,6 +533,9 @@ fn preflight_once(root: &Path) -> Result<DataDirReport, DataDirError> {
         }
     }
 
+    #[cfg(not(unix))]
+    check_root_acl(&root, &mut warnings)?;
+
     probe_write(&root)?;
 
     Ok(DataDirReport {
@@ -506,9 +556,11 @@ fn create_root(root: &Path) -> io::Result<()> {
         builder.mode(0o750);
         builder.create(root)
     }
+    // Windows: created with a protected owner/SYSTEM/Administrators DACL, so the directory that will
+    // hold private keys is never briefly readable or replaceable by other users.
     #[cfg(not(unix))]
     {
-        std::fs::create_dir_all(root)
+        caddy_rs_fsperm::create_dir_all_private(root)
     }
 }
 
@@ -655,6 +707,106 @@ fn check_ancestor(ancestor: &Path, root: &Path) -> Result<(), DataDirError> {
             });
         }
     }
+    #[cfg(not(unix))]
+    check_ancestor_acl(ancestor, root)?;
+    Ok(())
+}
+
+/// Windows: the data directory must not be modifiable by, or owned by, another user, because it
+/// holds certificate and CA private keys. Mirrors the Unix mode/owner checks, using the DACL and
+/// owner instead of mode bits and uid.
+///
+/// Unlike an ancestor, the directory itself is held to the strict standard: even the right to
+/// *create* entries counts, since an attacker who can plant a file here can substitute key material.
+#[cfg(not(unix))]
+fn check_root_acl(root: &Path, warnings: &mut Vec<String>) -> Result<(), DataDirError> {
+    let acl_error =
+        |operation: &'static str, kind, source: Option<io::Error>, hint: String| DataDirError {
+            path: root.to_path_buf(),
+            operation,
+            source,
+            kind,
+            parent: root.parent().map(Path::to_path_buf),
+            parent_mode: None,
+            process_uid: None,
+            hint: Some(hint),
+        };
+    let exposure = caddy_rs_fsperm::exposure(root).map_err(|error| {
+        acl_error(
+            "read data-directory permissions",
+            DataDirErrorKind::Io,
+            Some(error),
+            "run as a user that can read the directory's permissions".to_string(),
+        )
+    })?;
+    if exposure.tamperable_by_others() {
+        return Err(acl_error(
+            "reject data directory that other users can modify",
+            DataDirErrorKind::WorldWritable,
+            None,
+            format!(
+                "remove write access for other users: icacls \"{}\" /inheritance:r /grant:r \"%USERNAME%:(OI)(CI)F\" /grant:r \"SYSTEM:(OI)(CI)F\" /grant:r \"Administrators:(OI)(CI)F\"",
+                root.display()
+            ),
+        ));
+    }
+    if !caddy_rs_fsperm::owned_by_current_user(root).map_err(|error| {
+        acl_error(
+            "check data-directory owner",
+            DataDirErrorKind::Io,
+            Some(error),
+            "run as a user that can read the directory's owner".to_string(),
+        )
+    })? {
+        return Err(acl_error(
+            "check data-directory owner",
+            DataDirErrorKind::NotOwned,
+            None,
+            format!(
+                "take ownership as the service user: takeown /F \"{}\" /R",
+                root.display()
+            ),
+        ));
+    }
+    if exposure.readable_by_others {
+        warnings.push(format!(
+            "data directory `{}` can be read by other users; certificate keys inside are created private, but restrict the directory too",
+            root.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Windows: an ancestor is rejected only when another user could replace or delete entries in it
+/// or change its permissions (`C:\` and `ProgramData` let every user create folders, which is
+/// normal and cannot replace the data directory once it exists and is private).
+#[cfg(not(unix))]
+fn check_ancestor_acl(ancestor: &Path, root: &Path) -> Result<(), DataDirError> {
+    let exposure = caddy_rs_fsperm::exposure(ancestor).map_err(|error| DataDirError {
+        path: root.to_path_buf(),
+        operation: "read data-directory ancestor permissions",
+        source: Some(error),
+        kind: DataDirErrorKind::Io,
+        parent: Some(ancestor.to_path_buf()),
+        parent_mode: None,
+        process_uid: None,
+        hint: None,
+    })?;
+    if exposure.writable_by_others {
+        return Err(DataDirError {
+            path: root.to_path_buf(),
+            operation: "reject data-directory ancestor that other users can modify",
+            source: None,
+            kind: DataDirErrorKind::WorldWritable,
+            parent: Some(ancestor.to_path_buf()),
+            parent_mode: None,
+            process_uid: None,
+            hint: Some(format!(
+                "remove write access for other users on `{}`, or choose a path below a directory only you control",
+                ancestor.display()
+            )),
+        });
+    }
     Ok(())
 }
 
@@ -775,7 +927,58 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&path).unwrap();
+        // `%TEMP%` can grant other principals access (this machine's does), which the Windows
+        // preflight rightly refuses for the nearest existing ancestor; fixture parents are made
+        // private like a real install.
+        #[cfg(windows)]
+        caddy_rs_fsperm::restrict_dir(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn windows_app_dir_is_appdata_caddy_with_a_profile_fallback() {
+        assert_eq!(
+            windows_app_dir_from(
+                Some(OsString::from("C:/Users/me/AppData/Roaming")),
+                Some(OsString::from("C:/Users/me"))
+            ),
+            Some(PathBuf::from("C:/Users/me/AppData/Roaming").join("Caddy"))
+        );
+        // `%AppData%` unset or empty: derive it from the user profile.
+        for appdata in [None, Some(OsString::new())] {
+            assert_eq!(
+                windows_app_dir_from(appdata, Some(OsString::from("C:/Users/me"))),
+                Some(
+                    PathBuf::from("C:/Users/me")
+                        .join("AppData")
+                        .join("Roaming")
+                        .join("Caddy")
+                )
+            );
+        }
+        // Neither variable: no Windows directory, the caller keeps its portable fallback.
+        assert_eq!(windows_app_dir_from(None, None), None);
+        assert_eq!(
+            windows_app_dir_from(Some(OsString::new()), Some(OsString::new())),
+            None
+        );
+    }
+
+    /// On a Windows host the process-level resolvers must not fall back to a directory inside the
+    /// working directory, which is where private keys would otherwise land.
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_resolvers_do_not_use_the_working_directory() {
+        if std::env::var_os("APPDATA").is_none() && std::env::var_os("USERPROFILE").is_none() {
+            return; // a stripped environment legitimately falls back
+        }
+        if std::env::var_os(XDG_DATA_HOME_ENV).is_some_and(|value| !value.is_empty()) {
+            return; // an explicit override is honoured instead
+        }
+        let data = caddy_data_dir();
+        assert!(data.is_absolute(), "{}", data.display());
+        assert!(data.ends_with(WINDOWS_APP_SUBDIR), "{}", data.display());
+        assert_eq!(app_data_dir(), data);
     }
 
     #[test]
@@ -1022,6 +1225,16 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o702)).unwrap();
         }
+        // Windows equivalent of o+w: grant Everyone full control through the DACL.
+        #[cfg(windows)]
+        {
+            let output = std::process::Command::new("icacls")
+                .arg(&root)
+                .args(["/grant", "*S-1-1-0:(OI)(CI)F"])
+                .output()
+                .expect("run icacls");
+            assert!(output.status.success(), "icacls failed: {output:?}");
+        }
         let error = preflight(&root).expect_err("world-writable must fail");
         assert_eq!(error.kind, DataDirErrorKind::WorldWritable);
         let _ = std::fs::remove_dir_all(root);
@@ -1048,5 +1261,99 @@ mod tests {
         let error = preflight(&root).expect_err("file must fail");
         assert_eq!(error.kind, DataDirErrorKind::NotDirectory);
         let _ = std::fs::remove_dir_all(parent);
+    }
+    /// Windows has no mode bits, so the preflight reads the DACL. These tests drive it with real
+    /// ACLs (`icacls`) rather than a model.
+    #[cfg(windows)]
+    mod windows_acl {
+        use super::*;
+
+        fn icacls(path: &Path, args: &[&str]) {
+            let output = std::process::Command::new("icacls")
+                .arg(path)
+                .args(args)
+                .output()
+                .expect("run icacls");
+            assert!(output.status.success(), "icacls failed: {output:?}");
+        }
+
+        #[test]
+        fn a_new_data_directory_is_created_private() {
+            let parent = temp_dir("acl-new");
+            let root = parent.join("data");
+            let report = preflight(&root).expect("preflight creates the directory");
+            assert!(report.created);
+            assert!(
+                caddy_rs_fsperm::exposure(&root).unwrap().is_private(),
+                "the directory that will hold private keys must be created private"
+            );
+            let _ = std::fs::remove_dir_all(&parent);
+        }
+
+        #[test]
+        fn a_directory_other_users_can_write_to_is_rejected() {
+            let parent = temp_dir("acl-writable");
+            let root = parent.join("data");
+            std::fs::create_dir_all(&root).unwrap();
+            icacls(&root, &["/grant", "*S-1-1-0:(OI)(CI)F"]);
+            let error =
+                preflight(&root).expect_err("an Everyone-writable data directory is refused");
+            assert_eq!(error.kind, DataDirErrorKind::WorldWritable);
+            assert!(error.hint.as_deref().unwrap_or("").contains("icacls"));
+            let _ = std::fs::remove_dir_all(&parent);
+        }
+
+        #[test]
+        fn a_directory_where_others_can_only_plant_files_is_rejected() {
+            let parent = temp_dir("acl-create");
+            let root = parent.join("data");
+            std::fs::create_dir_all(&root).unwrap();
+            icacls(&root, &["/grant", "*S-1-5-11:(AD)"]);
+            let error =
+                preflight(&root).expect_err("creating entries is enough to plant key material");
+            assert_eq!(error.kind, DataDirErrorKind::WorldWritable);
+            let _ = std::fs::remove_dir_all(&parent);
+        }
+
+        #[test]
+        fn a_directory_others_can_only_read_is_accepted_with_a_warning() {
+            let parent = temp_dir("acl-readable");
+            let root = parent.join("data");
+            std::fs::create_dir_all(&root).unwrap();
+            icacls(&root, &["/grant", "*S-1-5-32-545:(OI)(CI)R"]);
+            let report = preflight(&root).expect("read-only exposure is a warning, not a refusal");
+            assert!(
+                report
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("can be read by other users")),
+                "{:?}",
+                report.warnings
+            );
+            let _ = std::fs::remove_dir_all(&parent);
+        }
+
+        #[test]
+        fn a_new_directory_below_a_create_only_ancestor_is_fine() {
+            // `C:\` and `ProgramData` let every user create folders; that must not make them a
+            // refused ancestor (they cannot replace the data directory once it exists and is
+            // private).
+            let ancestor = temp_dir("acl-shared");
+            icacls(&ancestor, &["/grant", "*S-1-5-11:(AD)"]);
+            let root = ancestor.join("data");
+            let report = preflight(&root).expect("a create-only ancestor is not a refusal");
+            assert!(report.created);
+            let _ = std::fs::remove_dir_all(&ancestor);
+        }
+
+        #[test]
+        fn an_ancestor_other_users_can_replace_entries_in_is_rejected() {
+            let ancestor = temp_dir("acl-replaceable");
+            icacls(&ancestor, &["/grant", "*S-1-1-0:(OI)(CI)M"]);
+            let error =
+                preflight(&ancestor.join("data")).expect_err("a replaceable ancestor is refused");
+            assert_eq!(error.kind, DataDirErrorKind::WorldWritable);
+            let _ = std::fs::remove_dir_all(&ancestor);
+        }
     }
 }

@@ -12,6 +12,8 @@ name = "caddy-rs-pm"
 path = "src/main.rs"
 
 [dependencies]
+# Owner-only files and directories (mode bits on Unix, protected ACLs on Windows).
+caddy-rs-fsperm = { path = "../../../crates/fsperm" }
 anyhow = { workspace = true }
 async-trait.workspace = true
 base64 = { workspace = true }

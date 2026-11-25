@@ -3282,6 +3282,7 @@ mod shutdown_latch_tests {
     /// A Unix admin socket must be registered on the latch, so the `/stop` exit path can remove
     /// it when the exit budget expires before the listener task's `Drop` guard runs
     /// (`std::process::exit` skips destructors).
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_unix_admin_socket_is_registered_for_the_exit_path() {
         let directory = tempfile::tempdir().expect("temporary directory");

@@ -37,9 +37,9 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpListener;
 #[cfg(feature = "http3")]
 use tokio::net::UdpSocket;
-use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::sync::watch;
@@ -4157,6 +4157,7 @@ mod bind_capability_tests {
     /// requires the real OS message text, which no placeholder can produce accidentally, and asserts
     /// the placeholder markers are absent. The same shape is used at every branch, because the last
     /// revision had the escape hatch at all four of them.
+    #[cfg(unix)]
     #[test]
     fn the_real_bind_sites_surface_a_located_error_carrying_the_real_cause() {
         // The real message the kernel produces for an address already in use. Verified against the
@@ -4213,6 +4214,7 @@ mod bind_capability_tests {
     /// `bind_tcp_ip`. Driving it requires a literal hostname (an IP literal takes the
     /// `bind_udp_socket_addr` branch instead), so it binds `udp/localhost:<held port>` and asserts
     /// the real OS message, with no `kind()` escape hatch.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_udp_hostname_site_surfaces_the_real_cause() {
         // `localhost` may resolve to IPv6 first; hold the port on both families so whichever is

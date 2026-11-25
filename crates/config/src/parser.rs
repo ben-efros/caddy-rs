@@ -472,6 +472,40 @@ fn absolute_path(path: &Path) -> PathBuf {
         .unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Undo the Windows verbatim prefix that `std::fs::canonicalize` adds.
+///
+/// `canonicalize` returns `\\?\C:\dir\file` (and `\\?\UNC\server\share\file`). That form never
+/// compares equal to the ordinary `C:\dir` spelling the rest of the parser works with, so
+/// `strip_prefix` against the Caddyfile's directory fails and the verbatim path leaks into
+/// diagnostics. This restores the ordinary form when it is unambiguous (a drive letter or UNC
+/// share) and returns every other path unchanged; it is the identity on non-Windows paths.
+fn simplify_canonical(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        let bytes = rest.as_bytes();
+        let drive = bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes[2] == b'\\';
+        if drive {
+            return PathBuf::from(rest);
+        }
+    }
+    path
+}
+
+/// A relative path spelled with `/` on every platform, so `file:line` diagnostics read the same on
+/// Windows as on Unix (`sub/two.caddyfile:1`).
+fn slash_display(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Normalize a path by resolving `.` and `..` components without requiring the path to exist.
 fn normalize_path(path: &Path) -> PathBuf {
     let mut result = PathBuf::new();
@@ -1606,7 +1640,7 @@ impl Parser {
             .and_then(|source| source.parent().map(Path::to_path_buf));
         if let Some(root_directory) = root_directory {
             if let Ok(relative) = absolute_path(file).strip_prefix(&root_directory) {
-                return relative.display().to_string();
+                return slash_display(relative);
             }
         }
         file.display().to_string()
@@ -1620,7 +1654,7 @@ impl Parser {
             let directory = normalize_path(&directory);
             let normalized = normalize_path(file);
             if let Ok(relative) = normalized.strip_prefix(&directory) {
-                return relative.display().to_string();
+                return slash_display(relative);
             }
         }
         file.file_name()
@@ -1791,7 +1825,7 @@ impl Parser {
         display: &str,
     ) -> Result<PathBuf, ParseError> {
         let resolved = match std::fs::canonicalize(path) {
-            Ok(resolved) => resolved,
+            Ok(resolved) => simplify_canonical(resolved),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(ParseError::syntax(
                     position.clone(),
@@ -1831,6 +1865,38 @@ impl Parser {
                      safe-mode import limit"
                 ),
             ));
+        }
+        // Windows has no mode bits or uid: the same two rules are enforced from the file's DACL
+        // (no other principal may write it) and owner (this user, SYSTEM or Administrators).
+        #[cfg(windows)]
+        {
+            let io_error = |error: std::io::Error| {
+                ParseError::syntax(
+                    position.clone(),
+                    format!("Could not import {display}: {error}"),
+                )
+            };
+            if caddy_rs_fsperm::exposure(&resolved)
+                .map_err(io_error)?
+                .writable_by_others
+            {
+                return Err(ParseError::syntax(
+                    position.clone(),
+                    format!(
+                        "Could not import {display}: file can be modified by other users (the \
+                         safe-mode import rule requires a file only its owner can write)"
+                    ),
+                ));
+            }
+            if !caddy_rs_fsperm::owned_by_current_user(&resolved).map_err(io_error)? {
+                return Err(ParseError::syntax(
+                    position.clone(),
+                    format!(
+                        "Could not import {display}: file is not owned by this user, SYSTEM or \
+                         Administrators (safe-mode import rule)"
+                    ),
+                ));
+            }
         }
         #[cfg(unix)]
         {
@@ -1873,12 +1939,14 @@ impl Parser {
         let Some(directory) = self.importing_directory(position) else {
             return Ok(());
         };
-        let canonical_directory = std::fs::canonicalize(&directory).map_err(|error| {
-            ParseError::syntax(
-                position.clone(),
-                format!("Could not resolve the importing Caddyfile directory: {error}"),
-            )
-        })?;
+        let canonical_directory = std::fs::canonicalize(&directory)
+            .map(simplify_canonical)
+            .map_err(|error| {
+                ParseError::syntax(
+                    position.clone(),
+                    format!("Could not resolve the importing Caddyfile directory: {error}"),
+                )
+            })?;
         if !file.starts_with(&canonical_directory) {
             return Err(ParseError::syntax(
                 position.clone(),
@@ -4263,6 +4331,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(directory.join("parts")).expect("create temp dir");
+        caddy_rs_test_support::make_private(&directory);
         std::fs::write(
             directory.join("parts/respond.conf"),
             "respond \"from {args[0]}\"\n",
@@ -4306,6 +4375,75 @@ mod tests {
     }
 
     #[test]
+    fn verbatim_windows_prefixes_are_simplified_only_when_unambiguous() {
+        let simplify = |text: &str| simplify_canonical(PathBuf::from(text));
+        assert_eq!(simplify(r"\\?\C:\dir\file"), PathBuf::from(r"C:\dir\file"));
+        assert_eq!(
+            simplify(r"\\?\UNC\server\share\file"),
+            PathBuf::from(r"\\server\share\file")
+        );
+        // A volume GUID path has no drive-letter spelling, so it stays verbatim.
+        let volume = r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\dir";
+        assert_eq!(simplify(volume), PathBuf::from(volume));
+        // Ordinary and Unix paths are untouched.
+        assert_eq!(simplify(r"C:\dir\file"), PathBuf::from(r"C:\dir\file"));
+        assert_eq!(
+            simplify("/etc/caddy/Caddyfile"),
+            PathBuf::from("/etc/caddy/Caddyfile")
+        );
+    }
+
+    #[test]
+    fn relative_labels_use_forward_slashes_on_every_platform() {
+        let relative: PathBuf = ["sub", "dir", "two.caddyfile"].iter().collect();
+        assert_eq!(slash_display(&relative), "sub/dir/two.caddyfile");
+        assert_eq!(slash_display(Path::new("one.caddyfile")), "one.caddyfile");
+    }
+
+    /// Windows enforces the safe-mode import rule from the file's DACL, with real ACLs.
+    #[cfg(windows)]
+    #[test]
+    fn imports_other_users_can_write_are_refused_on_windows() {
+        let directory = std::env::temp_dir().join(format!(
+            "caddy-rs-import-acl-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).expect("create temp dir");
+        caddy_rs_test_support::make_private(&directory);
+        std::fs::write(directory.join("shared.conf"), "header X-Shared yes\n").unwrap();
+        std::fs::write(
+            directory.join("Caddyfile"),
+            "example.com {\n\timport shared.conf\n}\n",
+        )
+        .unwrap();
+        let caddyfile = std::fs::read_to_string(directory.join("Caddyfile")).unwrap();
+
+        // Private: accepted.
+        parse_with_source(&caddyfile, Some(&directory.join("Caddyfile")))
+            .expect("a private import is accepted");
+
+        // Everyone can write it: refused, naming the rule.
+        let output = std::process::Command::new("icacls")
+            .arg(directory.join("shared.conf"))
+            .args(["/grant", "*S-1-1-0:F"])
+            .output()
+            .expect("run icacls");
+        assert!(output.status.success(), "icacls failed: {output:?}");
+        let error = parse_with_source(&caddyfile, Some(&directory.join("Caddyfile")))
+            .expect_err("an import other users can modify must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("can be modified by other users"),
+            "{message}"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
     fn file_import_cycles_are_rejected() {
         let directory = std::env::temp_dir().join(format!(
             "caddy-rs-import-cycle-{}-{}",
@@ -4316,6 +4454,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&directory).expect("create temp dir");
+        caddy_rs_test_support::make_private(&directory);
         std::fs::write(directory.join("a.conf"), "import b.conf\n").expect("write a");
         std::fs::write(directory.join("b.conf"), "import a.conf\n").expect("write b");
         // Write the importing Caddyfile so the safe-mode import rule has an ownership anchor.

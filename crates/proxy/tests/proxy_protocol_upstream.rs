@@ -496,6 +496,7 @@ fn unknown_proxy_protocol_values_are_located_config_errors() {
     assert!(error.to_string().contains("must be a string"), "{error}");
 }
 
+#[cfg(unix)]
 #[test]
 fn unix_upstreams_reject_proxy_protocol_loudly() {
     let error = caddy_rs_proxy::ReverseProxyHandler::from_json(

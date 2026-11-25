@@ -58,6 +58,14 @@ fn spawn_fastcgi_upstream() -> (String, Arc<Mutex<Option<BTreeMap<String, String
                 .await;
                 let _ = write_record(&mut stream, FCGI_STDOUT, b"").await;
                 let _ = write_record(&mut stream, FCGI_END_REQUEST, &[0; 8]).await;
+                // Close politely: dropping a socket that still has unread input resets the
+                // connection on Windows and discards the response the client has not read yet.
+                let _ = stream.shutdown().await;
+                let mut sink = [0_u8; 1024];
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while matches!(stream.read(&mut sink).await, Ok(count) if count > 0) {}
+                })
+                .await;
             });
         }
     });

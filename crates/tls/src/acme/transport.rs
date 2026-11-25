@@ -551,6 +551,14 @@ pub fn load_system_root_certificates() -> Result<Vec<CertificateDer<'static>>> {
             }
         }
     }
+    // Windows has no PEM bundle: use the operating system certificate store instead.
+    #[cfg(windows)]
+    {
+        let native = rustls_native_certs::load_native_certs();
+        if !native.certs.is_empty() {
+            return Ok(native.certs);
+        }
+    }
     Err(AcmeError::Transport {
         url: "https://".to_string(),
         reason: format!(

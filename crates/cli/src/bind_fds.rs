@@ -656,7 +656,7 @@ pub fn render_plan(planned: &[PlannedFd], dry_run: bool) -> String {
     output
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

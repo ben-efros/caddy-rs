@@ -93,7 +93,7 @@ fn template_compiles_and_serves_a_request() {
         String::from_utf8_lossy(&build.stderr)
     );
 
-    let binary = target_dir.join("debug").join("module-template");
+    let binary = target_dir.join("debug").join(format!("module-template{}", std::env::consts::EXE_SUFFIX));
     assert!(
         binary.is_file(),
         "template binary not found at {} after a successful build",

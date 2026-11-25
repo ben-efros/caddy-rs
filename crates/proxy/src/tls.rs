@@ -796,11 +796,23 @@ fn load_platform_roots(path: &str) -> HttpResult<RootCertStore> {
         candidates.push(PathBuf::from(file));
     }
     candidates.extend(SYSTEM_CA_BUNDLES.iter().map(PathBuf::from));
-    load_platform_roots_from(
+    let loaded = load_platform_roots_from(
         &candidates,
         std::env::var_os("SSL_CERT_DIR").as_deref(),
         path,
-    )
+    );
+    // Windows has no PEM bundle: the trust anchors live in the operating system certificate
+    // store, which is the equivalent of Go's crypto/x509 system pool there.
+    #[cfg(windows)]
+    if loaded.is_err() {
+        let mut store = RootCertStore::empty();
+        let native = rustls_native_certs::load_native_certs();
+        let (added, _ignored) = store.add_parsable_certificates(native.certs);
+        if added > 0 {
+            return Ok(store);
+        }
+    }
+    loaded
 }
 
 /// Load roots from the given candidate bundle files, then (optionally) from every PEM file in

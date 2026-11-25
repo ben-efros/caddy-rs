@@ -27,6 +27,8 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+# Asserts that secrets are private on Windows, where there are no mode bits.
+caddy-rs-fsperm = { path = "../../../crates/fsperm" }
 axum-test = "22.0.0-rc.1"
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }

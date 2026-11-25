@@ -300,6 +300,9 @@ impl CertificateStorage for FileStorage {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(Error::Io(error)),
         };
+        // Self-heal a key an earlier version wrote readable by other users (the default umask, or
+        // an inherited Windows ACL): tighten it whenever it is read.
+        restrict_if_exposed(&paths.private_key, false).await;
         let private_key_pem = match fs::read_to_string(&paths.private_key).await {
             Ok(text) => private_key_pem(&text)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -356,7 +359,7 @@ impl CertificateStorage for FileStorage {
             )));
         }
         let paths = self.certificate_paths(key)?;
-        fs::create_dir_all(&paths.directory).await?;
+        ensure_private_directory(&self.root, &paths.directory).await?;
 
         let mut chain = String::new();
         for block in &certificate.certificate_pem {
@@ -368,7 +371,6 @@ impl CertificateStorage for FileStorage {
         let mut key_pem = certificate.private_key_pem.trim_end().to_string();
         key_pem.push('\n');
         atomic_write(&paths.private_key, key_pem.as_bytes()).await?;
-        restrict_private_key_permissions(&paths.private_key).await;
 
         // CertMagic serialises `CertificateResource` with `json.MarshalIndent(cert, "", "\t")`:
         // tab indentation, Go struct field order (`sans`, then `issuer_data`), no trailing
@@ -639,12 +641,26 @@ pub(crate) fn serialize_certificate_metadata(
 ///
 /// This mirrors CertMagic's `ACMEIssuer.IssuerKey` and Caddy's `InternalIssuer.IssuerKey`.
 pub fn caddy_issuer_key(ca: &str) -> String {
-    match ca.find("://") {
+    caddy_issuer_key_for(ca, cfg!(windows))
+}
+
+/// [`caddy_issuer_key`] for an explicit platform. A CA directory URL with a port
+/// (`https://localhost:14000/dir`) keeps a `:` in the key; Windows cannot create such a directory
+/// (`ERROR_DIRECTORY`, os error 267; a name with `:` also addresses an NTFS alternate data
+/// stream), so there it is dropped, which is what CertMagic's `KeyBuilder.Safe` does on every
+/// platform.
+pub(crate) fn caddy_issuer_key_for(ca: &str, windows: bool) -> String {
+    let key = match ca.find("://") {
         Some(scheme_end) => {
             let without_scheme = &ca[scheme_end + 3..];
             without_scheme.replace('/', "-")
         }
         None => ca.to_string(),
+    };
+    if windows {
+        key.replace(':', "")
+    } else {
+        key
     }
 }
 
@@ -713,7 +729,25 @@ async fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
         .as_nanos();
     let counter = TEMPORARY_COUNTER.fetch_add(1, Ordering::Relaxed);
     let temporary = path.with_file_name(format!(".{file_name}.{nonce}.{counter}.tmp"));
-    if let Err(error) = fs::write(&temporary, data).await {
+    // Created exclusively and owner-only by the create call itself (mode 0600 on Unix, a protected
+    // owner/SYSTEM/Administrators DACL on Windows), so a private key is never readable by another
+    // user between creation and a later chmod. Certificate chains and metadata get the same
+    // treatment, matching certmagic's 0600 files.
+    let temporary_for_create = temporary.clone();
+    let std_file = tokio::task::spawn_blocking(move || {
+        caddy_rs_fsperm::create_new_file_private(&temporary_for_create)
+    })
+    .await
+    .map_err(|error| Error::Io(std::io::Error::other(error)))??;
+    let mut file = fs::File::from_std(std_file);
+    let written = async {
+        tokio::io::AsyncWriteExt::write_all(&mut file, data).await?;
+        tokio::io::AsyncWriteExt::flush(&mut file).await?;
+        file.sync_all().await
+    }
+    .await;
+    drop(file);
+    if let Err(error) = written {
         let _ = fs::remove_file(&temporary).await;
         return Err(Error::Io(error));
     }
@@ -724,17 +758,41 @@ async fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Make the private key file readable only by the owner (best effort; Unix only).
-async fn restrict_private_key_permissions(path: &Path) {
-    #[cfg(unix)]
+/// Make `path` owner-only when anyone else can read or write it (best effort).
+///
+/// A failure to tighten must not turn a working certificate store into an outage, so errors are
+/// ignored; the next write goes through the private-create path regardless.
+async fn restrict_if_exposed(path: &Path, directory: bool) {
+    let path = path.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(exposure) = caddy_rs_fsperm::exposure(&path) {
+            if !exposure.is_private() {
+                let _ = if directory {
+                    caddy_rs_fsperm::restrict_dir(&path)
+                } else {
+                    caddy_rs_fsperm::restrict_file(&path)
+                };
+            }
+        }
+    })
+    .await;
+}
+
+/// Create `directory` (and missing parents) owner-only, then tighten any existing directory between
+/// it and `root` that an earlier version left open. The root itself is the operator's choice and
+/// is never touched.
+async fn ensure_private_directory(root: &Path, directory: &Path) -> Result<()> {
+    let to_create = directory.to_path_buf();
+    tokio::task::spawn_blocking(move || caddy_rs_fsperm::create_dir_all_private(&to_create))
+        .await
+        .map_err(|error| Error::Io(std::io::Error::other(error)))??;
+    for ancestor in directory
+        .ancestors()
+        .take_while(|ancestor| *ancestor != root)
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await;
+        restrict_if_exposed(ancestor, true).await;
     }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
+    Ok(())
 }
 
 /// Split a PEM document into blocks with the given label.
@@ -1476,6 +1534,19 @@ mod tests {
     }
 
     #[test]
+    fn windows_issuer_keys_drop_the_port_colon() {
+        assert_eq!(
+            caddy_issuer_key_for("https://localhost:14000/dir", true),
+            "localhost14000-dir"
+        );
+        assert_eq!(
+            caddy_issuer_key_for("https://localhost:14000/dir", false),
+            "localhost:14000-dir"
+        );
+        assert_eq!(caddy_issuer_key_for("local", true), "local");
+    }
+
+    #[test]
     fn caddy_issuer_key_matches_certmagic_directory_names() {
         assert_eq!(
             caddy_issuer_key("https://acme-v02.api.letsencrypt.org/directory"),
@@ -1491,7 +1562,11 @@ mod tests {
         );
         assert_eq!(
             caddy_issuer_key("http://localhost:14000/dir"),
-            "localhost:14000-dir"
+            if cfg!(windows) {
+                "localhost14000-dir"
+            } else {
+                "localhost:14000-dir"
+            }
         );
         // Internal issuers use the CA ID unchanged.
         assert_eq!(caddy_issuer_key("local"), "local");

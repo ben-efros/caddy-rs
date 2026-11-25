@@ -221,15 +221,15 @@ impl SocketActivation {
         }
         #[cfg(unix)]
         {
-        let listen_pid = optional_env("LISTEN_PID")?;
-        let listen_fds = optional_env("LISTEN_FDS")?;
-        let listen_fdnames = optional_env("LISTEN_FDNAMES")?;
-        Self::from_env_values(
-            listen_pid.as_deref(),
-            listen_fds.as_deref(),
-            listen_fdnames.as_deref(),
-            std::process::id(),
-        )
+            let listen_pid = optional_env("LISTEN_PID")?;
+            let listen_fds = optional_env("LISTEN_FDS")?;
+            let listen_fdnames = optional_env("LISTEN_FDNAMES")?;
+            Self::from_env_values(
+                listen_pid.as_deref(),
+                listen_fds.as_deref(),
+                listen_fdnames.as_deref(),
+                std::process::id(),
+            )
         }
     }
 
@@ -403,11 +403,7 @@ fn parse_environment(
 
 /// Validate that `fd` is an open listening socket and return its local address.
 #[cfg(not(unix))]
-fn inspect_descriptor(
-    _fd: RawFd,
-    _name: &str,
-    path: &str,
-) -> Result<LocalSocket, ActivationError> {
+fn inspect_descriptor(_fd: RawFd, _name: &str, path: &str) -> Result<LocalSocket, ActivationError> {
     Err(ActivationError::new(
         path,
         "inherited listening sockets are not supported on this platform",
@@ -734,7 +730,9 @@ pub(crate) fn adopt_tcp(
 ) -> Result<tokio::net::TcpListener, Error> {
     Err(Error::SocketActivation {
         path: "LISTEN_FDS".to_string(),
-        message: format!("inherited sockets are not supported on this platform (listener `{listen}`)"),
+        message: format!(
+            "inherited sockets are not supported on this platform (listener `{listen}`)"
+        ),
     })
 }
 

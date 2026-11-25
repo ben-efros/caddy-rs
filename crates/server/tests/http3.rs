@@ -169,6 +169,7 @@ fn is_addr_in_use(error: &str) -> bool {
     lower.contains("address already in use")
         || lower.contains("addrinuse")
         || lower.contains("address in use")
+        || lower.contains("only one usage of each socket address")
 }
 
 async fn start(config: Config) -> (ServerRuntime, caddy_rs_server::RuntimeStatus) {
