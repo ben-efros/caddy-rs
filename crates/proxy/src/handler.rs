@@ -3478,7 +3478,9 @@ fn parse_health_checks(
 /// failures with an empty 502 body, so the client sees no more than it does there. The detail is
 /// logged debug-escaped so request-derived control characters cannot forge log lines.
 fn bad_gateway_body(detail: &str) -> &'static str {
-    eprintln!("caddy-rs: reverse_proxy: 502 Bad Gateway: {detail:?}");
+    // `tracing` at debug level, not a synchronous stderr write: any client can trigger this per
+    // request, and a blocking write to a backpressured stderr would stall the async worker.
+    tracing::debug!(detail = ?detail, "reverse_proxy: 502 Bad Gateway");
     "502 Bad Gateway"
 }
 
@@ -4305,6 +4307,20 @@ mod tests {
         // `stock_compat true` (guard off) is stock Caddy: anything the expansion yields is dialed.
         let stock = ssrf_handler(serde_json::json!({}), false);
         assert_eq!(status_for(&stock, &echo).await, StatusCode::OK);
+    }
+
+    /// `bad_gateway_body` runs once per failing request and the detail is client-influenced, so it
+    /// must not write synchronously to stderr (log flood, blocking on a backpressured pipe).
+    #[test]
+    fn bad_gateway_body_does_not_write_to_stderr() {
+        let source = include_str!("handler.rs");
+        let start = source
+            .find("fn bad_gateway_body")
+            .expect("function present");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").expect("function end")];
+        assert!(!body.contains("eprintln!"), "{body}");
+        assert!(body.contains("tracing::"), "{body}");
     }
 
     /// A `dynamic_upstreams` source stand-in that returns one fixed host.
