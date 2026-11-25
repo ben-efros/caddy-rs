@@ -625,3 +625,125 @@ async fn h2c_upgrade_without_settings_is_served_as_http1() {
 
     runtime.shutdown().await;
 }
+
+/// A server whose only route is a `reverse_proxy` with `retries`, which makes the server buffer
+/// the whole request body in memory before dispatch. The upstream is a closed port: the tests only
+/// care whether the body is accepted (the proxy then answers 502) or refused (413).
+fn buffering_proxy_fields() -> serde_json::Value {
+    serde_json::json!({
+        "routes": [{"handle": [{
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "127.0.0.1:1"}],
+            "load_balancing": {"retries": 1}
+        }]}]
+    })
+}
+
+/// Send a chunked POST of `total` bytes in 1 MiB chunks and return the response head. The write
+/// side runs concurrently and tolerates the server closing early, because a server that enforces
+/// its limit answers before it has read everything.
+async fn post_chunked(address: SocketAddr, total: usize) -> String {
+    const CHUNK: usize = 1024 * 1024;
+    let stream = TcpStream::connect(address).await.expect("connect");
+    let (mut reader, mut writer) = stream.into_split();
+    let writer_task = tokio::spawn(async move {
+        let head = "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n";
+        if writer.write_all(head.as_bytes()).await.is_err() {
+            return;
+        }
+        let chunk = vec![b'a'; CHUNK];
+        let mut sent = 0;
+        while sent < total {
+            let size = CHUNK.min(total - sent);
+            let framed = format!("{size:x}\r\n");
+            if writer.write_all(framed.as_bytes()).await.is_err()
+                || writer.write_all(&chunk[..size]).await.is_err()
+                || writer.write_all(b"\r\n").await.is_err()
+            {
+                return;
+            }
+            sent += size;
+        }
+        let _ = writer.write_all(b"0\r\n\r\n").await;
+        // Keep the connection open (no FIN) until the response has been read.
+        std::future::pending::<()>().await;
+    });
+    let mut received = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let read = async {
+        loop {
+            match reader.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(count) => {
+                    received.extend_from_slice(&buffer[..count]);
+                    if received.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(60), read).await;
+    writer_task.abort();
+    String::from_utf8_lossy(&received).into_owned()
+}
+
+/// Regression test for unbounded request-body buffering: with no `max_request_body_size`
+/// configured, a body the server must hold in memory is still capped (128 MiB), so one
+/// unauthenticated client cannot exhaust memory by streaming a huge chunked body.
+#[tokio::test]
+async fn buffered_request_body_is_capped_even_without_a_configured_limit() {
+    let (_store, runtime, address) = start(buffering_proxy_fields()).await;
+
+    // Within the cap the body is accepted and the proxy tries (and fails) to reach the upstream.
+    let small = post_chunked(address, 1024 * 1024).await;
+    assert!(
+        small.starts_with("HTTP/1.1 502"),
+        "a small body must reach the proxy (502 from the dead upstream), got: {small:?}"
+    );
+
+    // Over the cap the server refuses before dispatch.
+    let large = post_chunked(address, 129 * 1024 * 1024).await;
+    assert!(
+        large.starts_with("HTTP/1.1 413"),
+        "a body over the 128 MiB buffering cap must be refused with 413, got: {large:?}"
+    );
+
+    runtime.shutdown().await;
+}
+
+/// A configured `max_request_body_size` still wins over the default cap.
+#[tokio::test]
+async fn configured_limit_overrides_the_default_buffering_cap() {
+    let mut fields = buffering_proxy_fields();
+    fields["max_request_body_size"] = serde_json::json!(512 * 1024);
+    let (_store, runtime, address) = start(fields).await;
+
+    let response = post_chunked(address, 1024 * 1024).await;
+    assert!(
+        response.starts_with("HTTP/1.1 413"),
+        "a 1 MiB body must exceed the configured 512 KiB limit, got: {response:?}"
+    );
+
+    runtime.shutdown().await;
+}
+
+/// A declared length over the buffering ceiling is refused before any body byte is read.
+#[tokio::test]
+async fn declared_length_over_the_buffering_ceiling_is_refused_up_front() {
+    let (_store, runtime, address) = start(buffering_proxy_fields()).await;
+
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    let request = "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 10737418240\r\n\r\n";
+    stream.write_all(request.as_bytes()).await.expect("send head");
+    // No body is sent: the 413 must come from the declared length alone.
+    let response = read_until_close(&mut stream, Duration::from_secs(5)).await;
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.1 413"),
+        "a 10 GiB Content-Length must be refused immediately, got: {response:?}"
+    );
+
+    runtime.shutdown().await;
+}
+

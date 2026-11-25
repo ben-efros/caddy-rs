@@ -1997,6 +1997,22 @@ fn generate_refresh_token() -> String {
     base32::encode(Alphabet::Rfc4648 { padding: false }, &bytes)
 }
 
+/// Generate a one-time first-run setup token: 256 bits from the OS CSPRNG, base32 encoded.
+///
+/// The management daemon prints it once at start-up when no administrator exists, and
+/// `POST /auth/setup` must present it, so a restart that empties the in-memory user store does not
+/// hand the first administrator account to whichever local caller arrives first.
+#[must_use]
+pub fn generate_setup_token() -> String {
+    generate_refresh_token()
+}
+
+/// Constant-time equality for secrets such as the setup token (length is not hidden).
+#[must_use]
+pub fn secrets_match(a: &str, b: &str) -> bool {
+    a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+}
+
 /// Generate a random token ID used for bookkeeping.
 fn generate_token_id() -> String {
     Uuid::new_v4().to_string()

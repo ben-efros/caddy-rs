@@ -409,9 +409,11 @@ impl FileServerHandler {
                     return None;
                 }
                 Some(if expanded.contains('/') {
-                    fast_abs(Path::new(&expanded), &cwd)
-                        .to_string_lossy()
-                        .into_owned()
+                    normalise_hide_path(
+                        fast_abs(Path::new(&expanded), &cwd)
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
                 } else {
                     expanded
                 })
@@ -716,6 +718,19 @@ impl Handler for FileServerHandler {
         // the root itself; the untrimmed path stays available for the canonical redirect and for
         // the trailing-separator rejection below.
         let stat_relative = sanitized_relative(&decoded_path);
+        // The `..` scan above splits on `/` only, but on Windows `\` is a separator too: `..\x`
+        // would be a parent reference and `C:\x` / `\\host\x` would make `root.join` discard the
+        // root. `request_path_escapes_root` applies the platform's separator rules to the decoded
+        // path; the native component check below is defence in depth (`filepath.IsLocal`).
+        let not_local = !std::path::Path::new(&stat_relative)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)));
+        if not_local || request_path_escapes_root(&decoded_path, cfg!(windows)) {
+            return Ok(Outcome::Respond(Response::text(
+                StatusCode::FORBIDDEN,
+                "403 Forbidden",
+            )));
+        }
         // Expand `{http.vars.root}` and friends (Caddy's file_server root supports placeholders).
         let expanded_root = request.replace_all(&self.root);
         let root = if expanded_root.is_empty() {
@@ -861,6 +876,64 @@ impl Handler for FileServerHandler {
             },
         })
     }
+}
+
+/// Whether a decoded request path can address anything outside the served root once joined to it.
+///
+/// `windows` selects the host's path syntax so both behaviours are testable on any platform. On
+/// Windows a decoded `\` is a separator, so `..\x` is a parent reference; a drive prefix (`C:`), a
+/// UNC or rooted path (`\\host\share`, `\x`) makes `PathBuf::join` discard the root; and `:`
+/// otherwise names an NTFS alternate data stream (`file::$DATA`) that bypasses extension and `hide`
+/// matching. Win32 also strips trailing dots and spaces from a component (`..  ` and `...` can
+/// mean `..`, `secret.env.` opens `secret.env` behind a `hide *.env`), so any component ending in
+/// a dot or space is refused. On other platforms `\` and `:` are
+/// ordinary file-name bytes and only a `/`-separated `..` is a parent reference.
+fn request_path_escapes_root(decoded_path: &str, windows: bool) -> bool {
+    if !windows {
+        return decoded_path.split('/').any(|component| component == "..");
+    }
+    if decoded_path.contains(':') {
+        return true;
+    }
+    // A leading `/` is the URL's own root (repeated `/` are collapsed by `clean_path`); a `\` right
+    // after it (`/\host\share`) is a rooted or UNC path that `PathBuf::join` treats as absolute.
+    let after_url_root = decoded_path.trim_start_matches('/');
+    if after_url_root.starts_with('\\') {
+        return true;
+    }
+    // Win32 path normalisation drops trailing dots and spaces *after* `hide` and the matchers have
+    // looked at the name: `secret.env.` and `secret.env ` open `secret.env` while `*.env` does not
+    // match them. Refuse any component that would be altered that way (`.` itself is a no-op).
+    // Device names (`NUL`, `COM1`, ...) open a device, not a file; Go's `filepath.IsLocal`, which
+    // stock Caddy's `SanitizedPathJoin` relies on, refuses them too.
+    decoded_path.split(['/', '\\']).any(|component| {
+        (component != "." && component.trim_end_matches(['.', ' ']) != component)
+            || is_windows_reserved_name(component)
+    })
+}
+
+/// Whether a path component names a Windows device (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`,
+/// `LPT1`-`LPT9` with the superscript digits, `CONIN$`, `CONOUT$`), with any extension or stream
+/// suffix. Mirrors Go's `isReservedName` (`internal/filepathlite`), but refuses a device name with
+/// an extension unconditionally: Go consults `RtlIsDosDeviceName_U` for that case because Windows
+/// 11 no longer treats `CON.txt` as a device, and this check cannot call it from a portable test.
+fn is_windows_reserved_name(component: &str) -> bool {
+    // Device names can have arbitrary trailing characters after a dot or colon; trailing spaces in
+    // the base are ignored.
+    let base = component.split(['.', ':']).next().unwrap_or("");
+    let upper = base.trim_end_matches(' ').to_ascii_uppercase();
+    if matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    ["COM", "LPT"].iter().any(|prefix| {
+        upper.strip_prefix(prefix).is_some_and(|digit| {
+            matches!(digit, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+                || matches!(digit, "\u{b2}" | "\u{b3}" | "\u{b9}")
+        })
+    })
 }
 
 /// Caddy's `SanitizedPathJoin` relative part for a decoded request path: `path.Clean` (which drops
@@ -1762,14 +1835,16 @@ struct HideMatcher {
 impl HideMatcher {
     /// Caddy's `fileHidden` against one filesystem path.
     fn is_hidden(&self, filename: &str) -> bool {
-        let filename_abs = fast_abs(Path::new(filename), &self.cwd)
-            .to_string_lossy()
-            .into_owned();
+        let filename_abs = normalise_hide_path(
+            fast_abs(Path::new(filename), &self.cwd)
+                .to_string_lossy()
+                .into_owned(),
+        );
         self.patterns.iter().any(|pattern| {
             if !pattern.contains('/') {
                 if filename_abs
                     .split('/')
-                    .any(|component| glob_match(pattern, component, false))
+                    .any(|component| glob_match(pattern, component, cfg!(windows)))
                 {
                     return true;
                 }
@@ -1778,8 +1853,19 @@ impl HideMatcher {
                     return true;
                 }
             }
-            glob_match(pattern, &filename_abs, false)
+            glob_match(pattern, &filename_abs, cfg!(windows))
         })
+    }
+}
+
+/// On Windows `PathBuf` yields `\` separators, which the `/`-based `hide` matching would never
+/// split on (so `hide .env` never matched a basename); compare in `/` form, case-insensitively.
+/// Identity elsewhere, where `\` is an ordinary file-name byte and names are case-sensitive.
+fn normalise_hide_path(path: String) -> String {
+    if cfg!(windows) {
+        path.replace('\\', "/").to_ascii_lowercase()
+    } else {
+        path
     }
 }
 
@@ -2194,6 +2280,102 @@ mod tests {
             "handler",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn windows_separators_and_prefixes_escape_the_root() {
+        for path in [
+            r"/..\secret.txt",
+            r"/a\..\..\secret.txt",
+            r"/..\..\Windows\win.ini",
+            "/C:/Windows/win.ini",
+            "/c:win.ini",
+            r"/\Windows\win.ini",
+            r"/\\host\share\x",
+            "/file.txt::$DATA",
+            "/index.html:stream",
+            "/.. /secret",
+            "/.../secret",
+            r"/a\... \b",
+            "/secret.env.",
+            "/secret.env ",
+            "/secret.env. .",
+            "/dir/secret.env./x",
+            "/NUL",
+            "/nul.txt",
+            "/dir/COM1",
+            "/LPT9.log",
+            "/CONIN$",
+            "/conout$",
+            "/aux ",
+            "/COM\u{b9}",
+        ] {
+            assert!(
+                request_path_escapes_root(path, true),
+                "{path:?} must be refused on Windows"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_windows_paths_are_served() {
+        for path in [
+            "/",
+            "/index.html",
+            "/a/b/c.txt",
+            "//double//slash.txt",
+            r"/dir\file.txt",
+            r"/dir\",
+            "/.hidden",
+            "/a.b.c",
+            "/trailing.dot.txt",
+            "/./x",
+            "/name with spaces.txt",
+            "/CONSOLE",
+            "/COM10",
+            "/COM0",
+            "/nullable.txt",
+            "/auxiliary",
+            "/connect/lpt",
+        ] {
+            assert!(
+                !request_path_escapes_root(path, true),
+                "{path:?} is a plain in-root path on Windows"
+            );
+        }
+    }
+
+    #[test]
+    fn non_windows_treats_backslash_and_colon_as_filename_bytes() {
+        for path in [r"/..\secret.txt", "/C:/x", r"/\x", "/a:b", "/.. /x", "/.../x"] {
+            assert!(
+                !request_path_escapes_root(path, false),
+                "{path:?} is a literal file name outside Windows"
+            );
+        }
+        assert!(request_path_escapes_root("/../secret", false));
+        assert!(request_path_escapes_root("/a/../../secret", false));
+    }
+
+    /// The platform-native guard must refuse parent references for the host this runs on, and a
+    /// plain file must still be served.
+    #[tokio::test]
+    async fn handler_refuses_parent_references_and_still_serves_files() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("ok.txt"), b"ok").unwrap();
+        let handler = handler(root.path()).await;
+
+        let allowed = respond(&handler, make_request(Method::GET, "/ok.txt")).await;
+        assert_eq!(allowed.status, StatusCode::OK);
+
+        let mut escapes = vec!["/%2e%2e/secret", "/a/%2E%2E/%2e%2e/secret"];
+        if cfg!(windows) {
+            escapes.extend(["/..%5csecret", "/C:/Windows/win.ini", "/%5cWindows/win.ini"]);
+        }
+        for path in escapes {
+            let response = respond(&handler, make_request(Method::GET, path)).await;
+            assert_eq!(response.status, StatusCode::FORBIDDEN, "{path} must be 403");
+        }
     }
 
     fn set_mtime(path: &Path, seconds: i64) {
