@@ -73,6 +73,10 @@ const REQUEST_ID: u16 = 1;
 /// as well; without a bound a misbehaving or compromised backend that never ends its headers makes
 /// the proxy buffer without limit.
 const MAX_RESPONSE_HEAD_BYTES: usize = 1 << 20;
+/// Upper bound on the records read before the response head ends. Records carry at most 65 535
+/// content bytes, so a legitimate head needs a handful; the cap stops a backend from streaming
+/// one-byte or empty records (which add no bytes toward the size cap) indefinitely.
+const MAX_HEAD_RECORDS: usize = 1 << 16;
 /// Caddy's default dial timeout for FastCGI.
 const DEFAULT_DIAL_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -785,12 +789,25 @@ impl FastCgiTransport {
     ) -> Result<ResponseHead, FastCgiError> {
         let mut header_bytes = BytesMut::new();
         let mut stderr = BytesMut::new();
+        // Bytes already scanned for the blank line: only new bytes (plus a 3-byte overlap so a
+        // terminator split across records is still found) are searched, keeping the scan linear.
+        let mut scanned = 0_usize;
+        let mut records = 0_usize;
         loop {
+            records += 1;
+            if records > MAX_HEAD_RECORDS {
+                return Err(FastCgiError::Protocol(format!(
+                    "upstream sent more than {MAX_HEAD_RECORDS} records before the response headers ended"
+                )));
+            }
             let record = read_record(reader, read_deadline).await?;
             match record.kind {
                 FCGI_STDOUT => {
                     header_bytes.extend_from_slice(&record.content);
-                    let head_end = find_cgi_header_end(&header_bytes);
+                    let from = scanned.saturating_sub(3);
+                    let head_end = find_cgi_header_end(&header_bytes[from..])
+                        .map(|(header_len, body_start)| (from + header_len, from + body_start));
+                    scanned = header_bytes.len();
                     // Bound the head (SEC-MEDIUM-PROXY C6): a head that is already over the cap, or an
                     // unterminated buffer over the cap, is a protocol error, not more buffering.
                     if head_end.map_or(header_bytes.len(), |(header_len, _)| header_len)
@@ -1918,6 +1935,64 @@ mod tests {
         assert!(!parsed.headers.is_empty());
         // The body was not consumed by the head parser beyond the current record.
         assert!(parsed.leftover.len() <= MAX_WRITE);
+    }
+
+    /// The head scan must be linear and the record count bounded (SEC-MEDIUM-PROXY C6 review): a
+    /// backend streaming one-byte STDOUT records re-scanned the whole buffer per record
+    /// (quadratic), and zero-length records made no progress at all.
+    #[tokio::test]
+    async fn one_byte_and_empty_records_are_bounded() {
+        let started = std::time::Instant::now();
+        let mut stream = Vec::new();
+        for _ in 0..100_000 {
+            write_record(&mut stream, FCGI_STDOUT, b"a", None)
+                .await
+                .unwrap();
+        }
+        let error = read_head(stream)
+            .await
+            .err()
+            .expect("an endless one-byte head is rejected");
+        assert!(error.to_string().contains("records"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "took {:?}",
+            started.elapsed()
+        );
+
+        let mut stream = Vec::new();
+        for _ in 0..100_000 {
+            write_record(&mut stream, FCGI_STDOUT, b"", None)
+                .await
+                .unwrap();
+        }
+        stream.extend(backend_records(FCGI_STDOUT, b"Status: 200 OK\r\n\r\nbody").await);
+        let error = read_head(stream)
+            .await
+            .err()
+            .expect("endless empty records are rejected");
+        assert!(error.to_string().contains("records"), "{error}");
+    }
+
+    /// The incremental scan still finds a terminator split across records, in both spellings.
+    #[tokio::test]
+    async fn a_terminator_split_across_records_is_found() {
+        for (head, body) in [
+            ("Status: 200 OK\r\nX-A: b\r\n\r\n", "rest"),
+            ("Status: 200 OK\nX-A: b\n\n", "rest"),
+        ] {
+            let bytes: Vec<u8> = format!("{head}{body}").into_bytes();
+            let mut stream = Vec::new();
+            for chunk in bytes.chunks(1) {
+                write_record(&mut stream, FCGI_STDOUT, chunk, None)
+                    .await
+                    .unwrap();
+            }
+            let parsed = read_head(stream).await.expect("split terminator found");
+            assert_eq!(parsed.status, StatusCode::OK);
+            assert_eq!(parsed.headers["x-a"], "b");
+            assert!(parsed.leftover.is_empty());
+        }
     }
 
     /// STDERR kept while waiting for the head is bounded too.
