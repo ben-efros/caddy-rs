@@ -641,5 +641,4 @@ async fn the_certificates_gap_guard_is_mode_aware() {
         "expected alert description decode_error (0x32), got {:#04x}: {record:02x?}",
         record[6]
     )
-
 }
