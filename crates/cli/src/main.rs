@@ -2546,6 +2546,12 @@ async fn run_trust(
         ca.id(),
         plan.root_path.display()
     );
+    if cfg!(windows) {
+        eprintln!(
+            "caddy-rs: Windows asks for confirmation when a root certificate is added to your \
+             certificate store: approve the dialog (run this from an interactive session)"
+        );
+    }
     let report = plan.execute()?;
     for kind in &report.installed {
         eprintln!("caddy-rs: installed root certificate into {}", kind.label());
