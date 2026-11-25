@@ -597,20 +597,49 @@ async fn the_certificates_gap_guard_is_mode_aware() {
     let mut socket = tokio::net::TcpStream::connect(addr)
         .await
         .expect("the listener accepts TCP");
-    // A TLS ClientHello is not needed: the listener answers nothing and the connection closes or
-    // yields no certificate, which is the upstream "no certificate of its own" outcome.
     use tokio::io::AsyncReadExt as _;
-    let mut buf = [0u8; 1];
-    let read = tokio::time::timeout(std::time::Duration::from_secs(2), socket.read(&mut buf)).await;
-    // Measured outcome, and the reason this assertion is written as it is: the listener accepts the
-    // connection and then does nothing. It sends no application bytes and does not close, because the
-    // TLS layer has no certificate to present before a ClientHello is read. That matches upstream's
-    // "starts with no subjects" outcome (autohttps.go:185) rather than the refusal this row removed.
-    // Only emitting bytes would contradict it.
-    match read {
-        Err(_elapsed) => {}
-        Ok(Ok(0)) => {}
-        Ok(Err(_)) => {}
-        Ok(Ok(_)) => panic!("an uncovered TLS listener must not emit application bytes"),
-    }
+    use tokio::io::AsyncWriteExt as _;
+    // Send a real TLS record header so the handshake actually starts. An idle connection proves
+    // nothing: an idle connection is idle whether or not a listener is behind it, so asserting on a
+    // read that times out would pass against a dead listener too (reviewer finding on the first
+    // revision of this test).
+    socket
+        .write_all(&[0x16, 0x03, 0x01, 0x00, 0x00])
+        .await
+        .expect("writes the record header");
+    let mut record = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        socket.read_to_end(&mut record),
+    )
+    .await
+    .expect("the listener answers a real handshake attempt rather than going quiet")
+    .expect("reads the alert record");
+    // Measured, not transcribed: the listener rejects the empty handshake with a TLS fatal alert.
+    //   15 03 03 00 02 02 32
+    //   ^^ content type alert        ^^ level fatal   ^^ description decode_error (50)
+    // This is what "the listener has no certificate of its own" looks like on the wire: the process
+    // started (upstream `autohttps.go:185`) and a client that tries to handshake is told so, rather
+    // than the apply being refused. A listener that accepted and then did nothing fails here.
+    assert!(
+        record.len() >= 7,
+        "expected a TLS alert record, got {} bytes: {record:02x?}",
+        record.len()
+    );
+    assert_eq!(
+        record[0], 0x15,
+        "expected content type alert (0x15), got {:#04x}: {record:02x?}",
+        record[0]
+    );
+    assert_eq!(
+        record[5], 0x02,
+        "expected alert level fatal (0x02), got {:#04x}: {record:02x?}",
+        record[5]
+    );
+    assert_eq!(
+        record[6], 0x32,
+        "expected alert description decode_error (0x32), got {:#04x}: {record:02x?}",
+        record[6]
+    )
+
 }
