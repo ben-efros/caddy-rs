@@ -66,6 +66,12 @@ const FCGI_HEADER_LEN: usize = 8;
 const MAX_WRITE: usize = 65500;
 /// Request id used by Caddy (single request per connection, no multiplexing).
 const REQUEST_ID: u16 = 1;
+/// Upper bound on the CGI response head (the STDOUT bytes before the blank line) accepted from a
+/// FastCGI backend, and on the STDERR bytes kept while waiting for it (SEC-MEDIUM-PROXY C6). Go's
+/// `net/textproto` `ReadMIMEHeader`, which Caddy's FastCGI client uses, bounds the head at 1 MiB
+/// as well; without a bound a misbehaving or compromised backend that never ends its headers makes
+/// the proxy buffer without limit.
+const MAX_RESPONSE_HEAD_BYTES: usize = 1 << 20;
 /// Caddy's default dial timeout for FastCGI.
 const DEFAULT_DIAL_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -752,7 +758,17 @@ impl FastCgiTransport {
             match record.kind {
                 FCGI_STDOUT => {
                     header_bytes.extend_from_slice(&record.content);
-                    if let Some((header_len, body_start)) = find_cgi_header_end(&header_bytes) {
+                    let head_end = find_cgi_header_end(&header_bytes);
+                    // Bound the head (SEC-MEDIUM-PROXY C6): a head that is already over the cap, or an
+                    // unterminated buffer over the cap, is a protocol error, not more buffering.
+                    if head_end.map_or(header_bytes.len(), |(header_len, _)| header_len)
+                        > MAX_RESPONSE_HEAD_BYTES
+                    {
+                        return Err(FastCgiError::Protocol(format!(
+                            "upstream response headers exceed {MAX_RESPONSE_HEAD_BYTES} bytes"
+                        )));
+                    }
+                    if let Some((header_len, body_start)) = head_end {
                         let (status, headers) = parse_cgi_head(&header_bytes[..header_len])?;
                         let leftover = Bytes::copy_from_slice(&header_bytes[body_start..]);
                         return Ok(ResponseHead {
@@ -763,7 +779,11 @@ impl FastCgiTransport {
                         });
                     }
                 }
-                FCGI_STDERR => stderr.extend_from_slice(&record.content),
+                // Keep at most the cap of STDERR; the rest is dropped (it is only logged).
+                FCGI_STDERR => {
+                    let room = MAX_RESPONSE_HEAD_BYTES.saturating_sub(stderr.len());
+                    stderr.extend_from_slice(&record.content[..record.content.len().min(room)]);
+                }
                 FCGI_END_REQUEST => {
                     let end = parse_end_request(&record.content)?;
                     return Err(FastCgiError::Protocol(format!(
@@ -1801,6 +1821,86 @@ mod tests {
             }
         });
         captured
+    }
+
+    /// Encode `kind` records carrying `content` the way a backend would (65500-byte chunks).
+    async fn backend_records(kind: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for chunk in content.chunks(MAX_WRITE) {
+            write_record(&mut out, kind, chunk, None)
+                .await
+                .expect("record encodes");
+        }
+        out
+    }
+
+    async fn read_head(bytes: Vec<u8>) -> Result<ResponseHead, FastCgiError> {
+        let transport = FastCgiTransport::from_json(
+            &transport_json(serde_json::json!({ "root": "/srv/www" })),
+            "transport",
+        )
+        .expect("fastcgi transport builds");
+        let mut reader: &[u8] = &bytes;
+        transport.read_response_head(&mut reader, None).await
+    }
+
+    /// SEC-MEDIUM-PROXY C6: a backend that streams STDOUT without ever ending its headers must not
+    /// make the proxy buffer without limit.
+    #[tokio::test]
+    async fn a_response_head_that_never_ends_is_rejected_at_the_cap() {
+        let endless = vec![b'a'; MAX_RESPONSE_HEAD_BYTES + MAX_WRITE];
+        let error = read_head(backend_records(FCGI_STDOUT, &endless).await)
+            .await
+            .err()
+            .expect("an unterminated oversized head is rejected");
+        assert!(
+            matches!(&error, FastCgiError::Protocol(message) if message.contains("exceed")),
+            "{error}"
+        );
+        // Many short lines are bounded the same way.
+        let lines = "X-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n".repeat(40_000);
+        assert!(lines.len() > MAX_RESPONSE_HEAD_BYTES);
+        let error = read_head(backend_records(FCGI_STDOUT, lines.as_bytes()).await)
+            .await
+            .err()
+            .expect("an oversized unterminated head is rejected");
+        assert!(error.to_string().contains("exceed"), "{error}");
+    }
+
+    /// Boundaries: a large but legitimate head is accepted, and the body that follows it is not
+    /// counted against the cap.
+    #[tokio::test]
+    async fn a_large_terminated_head_and_a_large_body_are_accepted() {
+        let mut head = String::from("Status: 200 OK\r\n");
+        while head.len() < MAX_RESPONSE_HEAD_BYTES - 4096 {
+            head.push_str(&format!("X-Pad-{}: {}\r\n", head.len(), "a".repeat(1000)));
+        }
+        head.push_str("\r\n");
+        let body = vec![b'b'; 3 * MAX_RESPONSE_HEAD_BYTES];
+        let mut stream = head.into_bytes();
+        stream.extend_from_slice(&body);
+        let parsed = read_head(backend_records(FCGI_STDOUT, &stream).await)
+            .await
+            .expect("a head just under the cap is accepted");
+        assert_eq!(parsed.status, StatusCode::OK);
+        assert!(!parsed.headers.is_empty());
+        // The body was not consumed by the head parser beyond the current record.
+        assert!(parsed.leftover.len() <= MAX_WRITE);
+    }
+
+    /// STDERR kept while waiting for the head is bounded too.
+    #[tokio::test]
+    async fn stderr_collected_before_the_head_is_bounded() {
+        let mut stream =
+            backend_records(FCGI_STDERR, &vec![b'e'; 4 * MAX_RESPONSE_HEAD_BYTES]).await;
+        stream.extend(backend_records(FCGI_STDOUT, b"Status: 200 OK\r\n\r\nbody").await);
+        let parsed = read_head(stream).await.expect("head still parses");
+        assert_eq!(parsed.status, StatusCode::OK);
+        assert!(
+            parsed.stderr.len() <= MAX_RESPONSE_HEAD_BYTES,
+            "kept {} stderr bytes",
+            parsed.stderr.len()
+        );
     }
 
     fn transport_json(extra: Value) -> Value {

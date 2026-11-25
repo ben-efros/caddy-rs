@@ -190,6 +190,33 @@ Tests: `crates/proxy/src/balancer.rs` `cookie_policy_without_a_secret_is_not_for
 `refusals_do_not_reflect_the_expanded_dial_in_the_response`,
 `dynamic_upstream_empty_or_invalid_expansion_is_a_located_error`.
 
+## C6 — bounded L4 dial and FastCGI response head
+
+- **L4 TCP proxy dial** (`crates/l4/src/handlers/proxy.rs`): `TcpStream::connect` had no deadline, so
+  an upstream that never answers the SYN pinned the accepted client connection and its descriptor
+  for the OS connect timeout. The dial is now bounded by `ProxyOptions::dial_timeout`, default
+  `DEFAULT_DIAL_TIMEOUT` = 10 s, `with_dial_timeout(Duration::ZERO)` disables it. The 10 s default is
+  this implementation's choice; I could not verify from the pinned caddy-l4 source whether its proxy
+  handler applies a default dial timeout (Caddy's own `dial_timeout` convention is zero = unlimited),
+  so treat the default as a hardening that stock caddy-l4 may not have. The l4 crate has no JSON
+  configuration for `ProxyOptions` today, so there is no config field to document.
+- **FastCGI response head** (`crates/proxy/src/fastcgi.rs`): `read_response_head` buffered STDOUT
+  until the blank line with no limit, and STDERR without limit. The head is now capped at
+  `MAX_RESPONSE_HEAD_BYTES` = 1 MiB (Go's `net/textproto.ReadMIMEHeader`, used by Caddy's client,
+  bounds it at the same size); exceeding it is a `FastCgiError::Protocol` (`... response headers
+  exceed 1048576 bytes`) and thus a 502. STDERR kept while waiting for the head is capped at 1 MiB
+  (the excess is dropped; it is only logged). Body bytes after the head are not counted.
+
+Both are unconditional (no stock_compat switch): they only reject inputs no legitimate backend
+produces.
+
+Tests: `crates/l4/src/handlers/proxy.rs`
+`the_default_dial_timeout_is_ten_seconds_and_zero_disables_it`,
+`a_stalled_dial_is_bounded_by_the_dial_timeout`, `dial_errors_and_successes_pass_through_the_timeout`;
+`crates/proxy/src/fastcgi.rs` `a_response_head_that_never_ends_is_rejected_at_the_cap`,
+`a_large_terminated_head_and_a_large_body_are_accepted`,
+`stderr_collected_before_the_head_is_bounded`.
+
 ## Proposed register entries (program repository)
 
 ```text
@@ -261,4 +288,20 @@ Tests: `crates/proxy/src/balancer.rs` `cookie_policy_without_a_secret_is_not_for
 - Tracking: SEC-MEDIUM-PROXY C5
 - Test: `crates/proxy/src/balancer.rs` `cookie_policy_without_a_secret_is_not_forgeable_by_default`;
   `crates/proxy/src/handler.rs` `cookie_secret_default_follows_stock_compat`
+```
+
+```text
+## DIV-NNNN — layer4 proxy dial and FastCGI response head are bounded
+
+- Area: layer4 / reverse_proxy FastCGI
+- Caddy behaviour: the layer4 proxy dial has no caddy-rs-style default deadline (unverified); Go's
+  FastCGI client bounds the response head at 1 MiB via `textproto.ReadMIMEHeader`.
+- caddy-rs behaviour: the L4 TCP dial times out after 10 s by default (0 disables); a FastCGI
+  response head over 1 MiB, or more than 1 MiB of pre-head STDERR kept, is rejected/dropped.
+- Rationale: stalled upstreams must not pin client connections; a backend must not make the proxy
+  buffer without limit.
+- Status: hardening (no stock_compat switch)
+- Tracking: SEC-MEDIUM-PROXY C6
+- Test: `crates/l4/src/handlers/proxy.rs` `a_stalled_dial_is_bounded_by_the_dial_timeout`;
+  `crates/proxy/src/fastcgi.rs` `a_response_head_that_never_ends_is_rejected_at_the_cap`
 ```
