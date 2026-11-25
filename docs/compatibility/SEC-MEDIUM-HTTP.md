@@ -96,11 +96,74 @@ Behaviour-preserving for every valid request: identical in both `stock_compat` s
 (1 GiB sparse file; peak RSS growth measured via `/proc/self/status` `VmHWM`, reset with
 `/proc/self/clear_refs`; before the fix growth was ~1 GiB for range, HEAD and 304),
 `large_full_get_is_streamed_not_buffered` (512 MiB sparse file consumed frame by frame; before the
-fix ~0.9 GiB), `streamed_bodies_match_the_content_and_buffered_framing`,
+fix ~460 MB at the earlier 256 MiB size), `streamed_bodies_match_the_content_and_buffered_framing`,
 `small_bodies_are_not_streamed`, `range_variants_read_exactly_the_requested_bytes` (start, middle,
 end, suffix, open-ended, multiple ranges, `If-Range` match and mismatch, 416, HEAD+Range),
 `read_segments_reports_a_file_shorter_than_planned`, and the pre-existing `apply_ranges` /
 multipart unit tests adapted to the span-based plan. `crates/http/tests/file_server_streaming.rs`
 checks the router (including a nested `subroute`) delivers large bodies as streams.
+
+Register: no divergence; no entry proposed.
+
+## B3. `file_server` browse: the listing honours `hide`
+
+### Upstream source of truth (Caddy v2.11.9)
+
+- `modules/caddyhttp/fileserver/browse.go` builds the listing in `directoryListing`, which skips
+  every entry for which `fileHidden(name, filesToHide)` is true (`filesToHide` comes from
+  `transformHidePaths`). The same `fileHidden` decides the 404 in `staticfiles.go`. This note is
+  written from knowledge of upstream, not from an oracle run.
+
+### Vulnerability and fix
+
+`browse_html` never consulted the `hide` list, so a directory listing named (and, with
+`plain_time_format`, dated) `.env`, `.git` and every other hidden entry even though fetching them
+answered 404. `browse_html` now skips an entry when the handler's own `hidden()` predicate (the one
+used for the fetch decision, including placeholder expansion and glob/path semantics) matches the
+entry's filesystem path. The listing is HTML only in this build; there is no JSON listing to fix.
+
+One nuance: the predicate runs on the entry's full path (the same form the fetch check uses), so a
+path-style `hide` entry (an absolute path) also hides the matching entry from the listing. Upstream
+passes the bare entry name to `fileHidden`, so there such an entry is still listed even though it
+cannot be fetched. This port keeps listing and fetch consistent; for the common name/glob entries
+(`.env`, `.git`, `*.bak`) behaviour equals upstream.
+
+### stock_compat
+
+Identical in both settings: the file server is not given the flag, and the difference above only
+concerns path-style `hide` entries, where hiding more than upstream is the secure direction.
+
+### Tests
+
+`crates/http/src/file_server.rs`: `browse_listing_omits_hidden_entries_in_the_root_and_in_subdirectories`
+(failed before: the root listing contained `.env`, `.git`, `notes.bak` and their times),
+`browse_listing_is_unchanged_without_hide_and_honours_path_entries` (no `hide` lists everything;
+absolute-path entry hides only that entry).
+
+Register: no divergence for name/glob entries. Proposed entry for the path-style nuance:
+
+```
+- DIV id: (assign)
+- Area: HTTP
+- Caddy behaviour: `browse` filters directory entries with `fileHidden(<bare entry name>)`, so a
+  path-style `hide` entry (absolute path) never matches in the listing although it makes the file
+  unfetchable.
+- caddy-rs behaviour: the listing applies the same predicate as the fetch path to the entry's full
+  path, so path-style `hide` entries also hide the entry from the listing.
+- Rationale: listing and fetch must not disagree about what is hidden; the listing leaked names and
+  modification times of files the operator marked hidden.
+- Status: intentional hardening
+- Test: `crates/http/src/file_server.rs`
+  `browse_listing_is_unchanged_without_hide_and_honours_path_entries`
+```
+
+## B4. Dotfiles are served by default (documented, unchanged)
+
+Stock Caddy serves dotfiles (`.env`, `.git/...`) unless `hide` excludes them, and so does this
+build: matching stock behaviour is intentional and nothing was changed. Operators exposing a
+directory that may contain such files must configure `hide` explicitly, for example
+`"hide": [".*"]` (any path component starting with a dot) or specific names such as `".env"` and
+`".git"`; with B3 the setting now applies to the browse listing as well as to fetches. Caddy always
+auto-hides its own config and data directories (see `auto_hide_entries`); that is unrelated.
 
 Register: no divergence; no entry proposed.

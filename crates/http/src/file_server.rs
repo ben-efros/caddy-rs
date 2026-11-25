@@ -786,7 +786,11 @@ impl Handler for FileServerHandler {
                 )));
             }
             if let Some(browse) = &self.browse {
-                let body = browse_html(&filename, request.uri.clone(), relative, browse).await?;
+                let body =
+                    browse_html(&filename, request.uri.clone(), relative, browse, &|entry| {
+                        self.hidden(entry, &request)
+                    })
+                    .await?;
                 return Ok(Outcome::Respond(Response::bytes(
                     StatusCode::OK,
                     "text/html; charset=utf-8",
@@ -1795,12 +1799,19 @@ async fn browse_html(
     uri: Uri,
     relative: &str,
     options: &BrowseOptions,
+    is_hidden: &(dyn Fn(&str) -> bool + Sync),
 ) -> Result<Vec<u8>> {
     let mut entries = fs::read_dir(root).await?;
     let mut names = Vec::new();
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name().to_string_lossy().to_string();
         let path = entry.path();
+        // SEC-MEDIUM-HTTP B3: an entry the `hide` setting makes unfetchable (404) must not be
+        // listed either; names and mtimes of `.env`/`.git` would otherwise leak. Caddy's
+        // `directoryListing` skips `fileHidden` entries the same way.
+        if is_hidden(&path.to_string_lossy()) {
+            continue;
+        }
         let file_type = entry.file_type().await.ok();
         let is_dir = file_type
             .map(|file_type| file_type.is_dir())
@@ -3594,6 +3605,99 @@ mod tests {
     }
 
     // --- the two honoured options change what is SERVED (T-BROWSE-OPTIONS-SILENTLY-DROPPED) ------
+
+    // --- SEC-MEDIUM-HTTP B3: the browse listing honours `hide` -----------------------------------
+
+    fn hidden_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("visible.txt"), "v").unwrap();
+        std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
+        std::fs::write(dir.path().join("notes.bak"), "b").unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/.env"), "SECRET=2").unwrap();
+        std::fs::write(dir.path().join("sub/ok.txt"), "o").unwrap();
+        dir
+    }
+
+    /// Names, mtimes and existence of hidden files must not leak through a directory listing that
+    /// the same `hide` setting makes unfetchable (Caddy's `directoryListing` skips `fileHidden`).
+    #[tokio::test]
+    async fn browse_listing_omits_hidden_entries_in_the_root_and_in_subdirectories() {
+        let dir = hidden_fixture();
+        let handler = configured_handler(
+            dir.path(),
+            serde_json::json!({
+                "browse": {"plain_time_format": " UTC"},
+                "hide": [".env", ".git", "*.bak"]
+            }),
+        );
+        for path in ["/", "/sub/"] {
+            let response = respond(&handler, make_request(Method::GET, path)).await;
+            assert_eq!(response.status, StatusCode::OK, "{path}");
+            let body = String::from_utf8(response.body.to_vec()).unwrap();
+            assert!(!body.contains(".env"), "{path} leaked .env: {body}");
+            assert!(!body.contains(".git"), "{path} leaked .git: {body}");
+            assert!(!body.contains("notes.bak"), "{path} leaked *.bak: {body}");
+        }
+        let root = String::from_utf8(
+            respond(&handler, make_request(Method::GET, "/"))
+                .await
+                .body
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            root.contains("visible.txt") && root.contains("sub/"),
+            "{root}"
+        );
+        let sub = String::from_utf8(
+            respond(&handler, make_request(Method::GET, "/sub/"))
+                .await
+                .body
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(sub.contains("ok.txt"), "{sub}");
+
+        // The hidden entry is also not fetchable, so listing and fetch now agree.
+        let response = respond(&handler, make_request(Method::GET, "/.env")).await;
+        assert_eq!(response.status, StatusCode::NOT_FOUND);
+    }
+
+    /// Without `hide` the listing is unchanged (dotfiles are served by default, like Caddy), and a
+    /// path-style hide entry (absolute path) hides that entry from the listing too.
+    #[tokio::test]
+    async fn browse_listing_is_unchanged_without_hide_and_honours_path_entries() {
+        let dir = hidden_fixture();
+        let handler =
+            configured_handler(dir.path(), serde_json::json!({"browse": true, "hide": []}));
+        let body = String::from_utf8(
+            respond(&handler, make_request(Method::GET, "/"))
+                .await
+                .body
+                .to_vec(),
+        )
+        .unwrap();
+        for name in [".env", ".git", "notes.bak", "visible.txt"] {
+            assert!(body.contains(name), "{name} missing without hide: {body}");
+        }
+
+        let absolute = dir.path().join("notes.bak");
+        let handler = configured_handler(
+            dir.path(),
+            serde_json::json!({"browse": true, "hide": [absolute.to_string_lossy()]}),
+        );
+        let body = String::from_utf8(
+            respond(&handler, make_request(Method::GET, "/"))
+                .await
+                .body
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!body.contains("notes.bak"), "{body}");
+        assert!(body.contains(".env"), "{body}");
+    }
 
     fn browse_fixture() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
