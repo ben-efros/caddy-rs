@@ -165,7 +165,7 @@ impl GeoIpProviderKind {
 
 /// Every field carries the ADR-0020 defaults, so `radar {}` adapts to the documented default
 /// configuration. There is deliberately no `enabled` flag: `mode` replaces it (ADR-0020 §1).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RadarOptions {
     /// `mode auto|on|off` (default `auto`: no polling until an Internet-routable client IP).
     pub mode: RadarMode,
@@ -183,6 +183,33 @@ pub struct RadarOptions {
     pub endpoints: RadarEndpoints,
     /// `filters { ... }` (default: no filters).
     pub filters: RadarFilters,
+}
+
+/// Manual `Debug` that redacts the Radar API token (SEC-MEDIUM D4).
+impl std::fmt::Debug for RadarOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RadarOptions")
+            .field("mode", &self.mode)
+            .field("protect", &self.protect)
+            .field(
+                "api_token",
+                &format_args!(
+                    "{}",
+                    if self.api_token.is_some() {
+                        "Some(<redacted>)"
+                    } else {
+                        "None"
+                    }
+                ),
+            )
+            .field("poll_interval_ns", &self.poll_interval_ns)
+            .field("cache_ttl_ns", &self.cache_ttl_ns)
+            .field("storage", &self.storage)
+            .field("endpoints", &self.endpoints)
+            .field("filters", &self.filters)
+            .finish()
+    }
 }
 
 impl Default for RadarOptions {
@@ -383,7 +410,7 @@ pub struct PkiCertificateAuthority {
 }
 
 /// Explicit certificate/key pair of a PKI CA (`root` / `intermediate` block).
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct PkiKeyPairConfig {
     /// Certificate path or inline value (`cert`).
     pub certificate: Option<String>,
@@ -391,6 +418,28 @@ pub struct PkiKeyPairConfig {
     pub private_key: Option<String>,
     /// Format (`format`); Caddy supports `pem_file`.
     pub format: Option<String>,
+}
+
+/// Manual `Debug` that redacts the private key (its value may be inline PEM; SEC-MEDIUM D4).
+impl std::fmt::Debug for PkiKeyPairConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PkiKeyPairConfig")
+            .field("certificate", &self.certificate)
+            .field(
+                "private_key",
+                &format_args!(
+                    "{}",
+                    if self.private_key.is_some() {
+                        "Some(<redacted>)"
+                    } else {
+                        "None"
+                    }
+                ),
+            )
+            .field("format", &self.format)
+            .finish()
+    }
 }
 
 /// Automatic-HTTPS modes from the global `auto_https` option. Caddy accepts several modes on one
@@ -4560,5 +4609,35 @@ mod tests {
         assert!(error.contains("must be owned by root"), "{error}");
         // Even root's own files are fine, but a third uid is not.
         assert!(check_import_ownership(12345, None, 1000).is_err());
+    }
+}
+
+/// SEC-MEDIUM D4 residual: `{:?}` of parsed options that carry secrets.
+#[cfg(test)]
+mod debug_redaction {
+    use super::*;
+
+    #[test]
+    fn radar_options_and_pki_key_pair_debug_hide_secrets() {
+        let radar = RadarOptions {
+            api_token: Some("RADAR-SECRET-TOKEN".to_string()),
+            ..RadarOptions::default()
+        };
+        let pair = PkiKeyPairConfig {
+            certificate: Some("/etc/ca/root.crt".to_string()),
+            private_key: Some("SECRETBODY".to_string()),
+            format: None,
+        };
+        for text in [
+            format!("{radar:?}"),
+            format!("{radar:#?}"),
+            format!("{pair:?}"),
+            format!("{pair:#?}"),
+        ] {
+            assert!(!text.contains("RADAR-SECRET-TOKEN"), "{text}");
+            assert!(!text.contains("SECRETBODY"), "{text}");
+        }
+        assert!(format!("{radar:?}").contains("poll_interval_ns"));
+        assert!(format!("{pair:?}").contains("/etc/ca/root.crt"));
     }
 }

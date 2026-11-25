@@ -484,10 +484,20 @@ impl fmt::Display for TokenError {
 }
 
 /// In-memory single-use token store; TTL comes from `--registration-timeout`.
-#[derive(Debug)]
 pub struct TokenStore {
     timeout: Duration,
     tokens: HashMap<String, SystemTime>,
+}
+
+/// Manual `Debug`: live single-use activation tokens are never printed, only their count.
+impl fmt::Debug for TokenStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TokenStore")
+            .field("timeout", &self.timeout)
+            .field("tokens", &format_args!("<{} redacted>", self.tokens.len()))
+            .finish()
+    }
 }
 
 impl TokenStore {
@@ -1079,5 +1089,25 @@ mod t_setup_004_tests {
         assert!(ServiceBootRunner::<RecordingSupervisor>::default()
             .service
             .is_none());
+    }
+}
+
+/// SEC-MEDIUM D4 residual: live activation tokens must not appear in `{:?}`.
+#[cfg(test)]
+mod debug_redaction {
+    use super::*;
+
+    #[test]
+    fn token_store_debug_hides_live_tokens() {
+        let mut tokens = HashMap::new();
+        tokens.insert("LIVE-ACTIVATION-TOKEN".to_string(), SystemTime::now());
+        let store = TokenStore {
+            timeout: Duration::from_secs(60),
+            tokens,
+        };
+        for text in [format!("{store:?}"), format!("{store:#?}")] {
+            assert!(!text.contains("LIVE-ACTIVATION-TOKEN"), "{text}");
+            assert!(text.contains("TokenStore"), "{text}");
+        }
     }
 }

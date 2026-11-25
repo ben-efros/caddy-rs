@@ -478,7 +478,7 @@ pub struct CertificateAuthority {
 }
 
 /// A certificate/key pair (`root` / `intermediate` in a PKI CA).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PkiKeyPair {
     /// Path to (or inline value of) the certificate PEM; format-dependent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -495,6 +495,29 @@ pub struct PkiKeyPair {
     /// Unknown key-pair fields, preserved for round-tripping and rejected by validation.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// Manual `Debug` that redacts the private key (its value may be inline PEM; SEC-MEDIUM D4).
+impl std::fmt::Debug for PkiKeyPair {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PkiKeyPair")
+            .field("certificate", &self.certificate)
+            .field(
+                "private_key",
+                &format_args!(
+                    "{}",
+                    if self.private_key.is_some() {
+                        "Some(<redacted>)"
+                    } else {
+                        "None"
+                    }
+                ),
+            )
+            .field("format", &self.format)
+            .field("extra", &self.extra)
+            .finish()
+    }
 }
 
 /// HTTP app configuration (`apps.http`).
@@ -1478,7 +1501,7 @@ pub struct CertKeyFilePair {
 }
 
 /// One certificate/key PEM pair (`load_pem` entry).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CertKeyPemPair {
     /// Certificate (public key) in PEM format.
     pub certificate: String,
@@ -1493,6 +1516,19 @@ pub struct CertKeyPemPair {
     /// Unknown pair fields, preserved.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// Manual `Debug` that redacts the private key PEM (SEC-MEDIUM D4).
+impl std::fmt::Debug for CertKeyPemPair {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CertKeyPemPair")
+            .field("certificate", &self.certificate)
+            .field("key", &format_args!("<redacted>"))
+            .field("tags", &self.tags)
+            .field("extra", &self.extra)
+            .finish()
+    }
 }
 
 /// TLS certificate automation configuration (`apps.tls.automation`).
@@ -2464,5 +2500,38 @@ mod tests {
         assert_eq!(entry.budget().max_inflight_handshakes, 4);
         entry.max_inflight_handshakes = Some(2);
         assert_eq!(entry.budget().max_inflight_handshakes, 2);
+    }
+}
+
+/// SEC-MEDIUM D4 residual: `{:?}` of configuration types that carry private keys.
+#[cfg(test)]
+mod debug_redaction {
+    use super::*;
+
+    #[test]
+    fn cert_key_pem_pair_debug_hides_the_key() {
+        let pair = CertKeyPemPair {
+            certificate: "CERT-PEM-BODY".to_string(),
+            key: "-----BEGIN PRIVATE KEY-----SECRETBODY".to_string(),
+            ..Default::default()
+        };
+        for text in [format!("{pair:?}"), format!("{pair:#?}")] {
+            assert!(!text.contains("SECRETBODY"), "{text}");
+            assert!(!text.contains("PRIVATE KEY"), "{text}");
+            assert!(text.contains("CERT-PEM-BODY"), "{text}");
+        }
+    }
+
+    #[test]
+    fn pki_key_pair_debug_hides_the_private_key() {
+        let pair = PkiKeyPair {
+            certificate: Some("/etc/ca/root.crt".to_string()),
+            private_key: Some("-----BEGIN PRIVATE KEY-----SECRETBODY".to_string()),
+            ..Default::default()
+        };
+        for text in [format!("{pair:?}"), format!("{pair:#?}")] {
+            assert!(!text.contains("SECRETBODY"), "{text}");
+            assert!(text.contains("/etc/ca/root.crt"), "{text}");
+        }
     }
 }

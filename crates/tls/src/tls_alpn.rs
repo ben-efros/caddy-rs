@@ -64,13 +64,26 @@ pub const ACME_IDENTIFIER_OID: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 1, 31];
 const CHALLENGE_VALIDITY_SECONDS: u64 = 24 * 60 * 60 * 365;
 
 /// A generated TLS-ALPN-01 challenge certificate and its private key.
-#[derive(Debug)]
 pub struct TlsAlpn01Challenge {
     domain: String,
     key_authorization: String,
     certificate_der: Vec<u8>,
     private_key_der: Vec<u8>,
     public_key: Vec<u8>,
+}
+
+/// Manual `Debug` that redacts `private_key_der` (SEC-MEDIUM D4).
+impl std::fmt::Debug for TlsAlpn01Challenge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TlsAlpn01Challenge")
+            .field("domain", &self.domain)
+            .field("key_authorization", &self.key_authorization)
+            .field("certificate_der", &self.certificate_der)
+            .field("private_key_der", &format_args!("<redacted>"))
+            .field("public_key", &self.public_key)
+            .finish()
+    }
 }
 
 impl TlsAlpn01Challenge {
@@ -1096,5 +1109,26 @@ mod tests {
             value.extend_from_slice(b"261102000000Z");
             value
         });
+    }
+}
+
+/// SEC-MEDIUM D4 residual: `{:?}` must never print the challenge private key.
+#[cfg(test)]
+mod debug_redaction {
+    use super::*;
+
+    #[test]
+    fn challenge_debug_never_prints_the_private_key() {
+        let challenge = TlsAlpn01Challenge::generate("example.test", "key-authorization").unwrap();
+        let secret: String = format!("{:?}", challenge.private_key_der)
+            .split_whitespace()
+            .collect();
+        for text in [format!("{challenge:?}"), format!("{challenge:#?}")] {
+            let compact: String = text.split_whitespace().collect();
+            assert!(!compact.contains(&secret), "{text}");
+            assert!(!compact.contains("private_key_der:["), "{text}");
+            assert!(text.contains("<redacted>"), "{text}");
+            assert!(text.contains("example.test"), "{text}");
+        }
     }
 }

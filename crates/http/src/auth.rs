@@ -691,7 +691,7 @@ struct Account {
 
 /// A validated account password: the modular-crypt/PHC hash is parsed at configuration load, so
 /// malformed hashes fail loudly instead of turning into request-time 401s.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum PasswordHash {
     /// `$2a$`/`$2b$`/`$2x$`/`$2y$` modular-crypt bcrypt hash (validated by `bcrypt::HashParts`).
     Bcrypt(String),
@@ -701,11 +701,38 @@ enum PasswordHash {
     Plaintext(Vec<u8>),
 }
 
-#[derive(Debug, Clone)]
+/// Manual `Debug`: never prints a plaintext password, a bcrypt hash or an argon2 key.
+impl std::fmt::Debug for PasswordHash {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self {
+            Self::Bcrypt(_) => "Bcrypt",
+            Self::Argon2id(_) => "Argon2id",
+            Self::Plaintext(_) => "Plaintext",
+        };
+        formatter
+            .debug_tuple(kind)
+            .field(&format_args!("<redacted>"))
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 struct Argon2idHash {
     salt: Vec<u8>,
     key: Vec<u8>,
     params: Params,
+}
+
+/// Manual `Debug`: salt and derived key are redacted; the cost parameters stay visible.
+impl std::fmt::Debug for Argon2idHash {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Argon2idHash")
+            .field("salt", &format_args!("<redacted>"))
+            .field("key", &format_args!("<redacted>"))
+            .field("params", &self.params)
+            .finish()
+    }
 }
 
 impl BasicAuthHandler {
@@ -2106,5 +2133,36 @@ mod tests {
             .contains("2001:db8::1".parse().unwrap()));
         assert!(Cidr::parse("not-an-ip").is_none());
         assert!(Cidr::parse("10.0.0.0/33").is_none());
+    }
+}
+
+/// SEC-MEDIUM D4 residual: password material must not appear in `{:?}`.
+#[cfg(test)]
+mod debug_redaction {
+    use super::*;
+
+    #[test]
+    fn password_hash_debug_hides_plaintext_hashes_and_keys() {
+        let argon = PasswordHash::Argon2id(Argon2idHash {
+            salt: vec![251, 252],
+            key: vec![253, 254],
+            params: Params::new(8192, 2, 1, Some(32)).unwrap(),
+        });
+        let cases = [
+            (
+                PasswordHash::Plaintext(b"hunter2-secret".to_vec()),
+                "hunter2",
+            ),
+            (
+                PasswordHash::Bcrypt("$2y$10$BCRYPTSECRETHASH".to_string()),
+                "BCRYPTSECRET",
+            ),
+            (argon, "253"),
+        ];
+        for (hash, secret) in cases {
+            for text in [format!("{hash:?}"), format!("{hash:#?}")] {
+                assert!(!text.contains(secret), "{text}");
+            }
+        }
     }
 }
