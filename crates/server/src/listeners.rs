@@ -47,7 +47,7 @@ use tokio_rustls::TlsAcceptor;
 use caddy_rs_admin::access_log::AccessLogContext;
 use caddy_rs_admin::{common_name_from_subject, AdminApi, AdminRequest, SharedRequestRecorder};
 use caddy_rs_core::{Generation, GenerationStore, ListenAddr, Network};
-use caddy_rs_http::{Body, Router};
+use caddy_rs_http::{Body, Router, StreamingBody};
 use caddy_rs_proxy::trusted_proxies::ServerTrustedProxies;
 
 use crate::activation::{adopt_tcp, adopt_unix, InheritedSocket, LocalSocket};
@@ -1065,10 +1065,14 @@ fn spawn_udp_accept_loop(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let active = Arc::new(AtomicUsize::new(0));
+        // Set when the loop ends because of a graceful shutdown (not a force, and not the endpoint
+        // closing): in-flight HTTP/3 requests are then allowed to finish before the endpoint closes.
+        let mut graceful = false;
         loop {
             tokio::select! {
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
+                        graceful = changed.is_ok();
                         break;
                     }
                 }
@@ -1109,6 +1113,39 @@ fn spawn_udp_accept_loop(
                 }
             }
         }
+        if graceful && !*force.borrow() {
+            // Keep the endpoint (and the UDP socket) open so requests already in flight can finish,
+            // like the TCP listeners drain; every connection task closes its own connection once
+            // its requests are done. Closing the endpoint straight away (as this used to) cut every
+            // in-flight upload and download off.
+            //
+            // The wait runs in a DETACHED task: this accept-loop task is joined by the reload code
+            // (`ListenerHandle::stop` while removing a listener), which must not wait for in-flight
+            // requests (the runtime's contract: "the reload itself does not wait for them"), and a
+            // force signal must stay responsive. New connections are refused outright during the
+            // drain so clients fail fast instead of timing out on the handshake.
+            tokio::spawn(async move {
+                let drained = tracker.wait_drained(None);
+                tokio::pin!(drained);
+                loop {
+                    tokio::select! {
+                        _ = &mut drained => break,
+                        changed = force.changed() => {
+                            if changed.is_err() || *force.borrow() {
+                                break;
+                            }
+                        }
+                        incoming = endpoint.accept() => match incoming {
+                            Some(incoming) => incoming.refuse(),
+                            None => break,
+                        },
+                    }
+                }
+                endpoint.close(0u32.into(), b"listener closed");
+                let _ = tokio::time::timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
+            });
+            return;
+        }
         // Close the endpoint and all its connections (removal/reload); the per-connection tasks
         // observe the closed connections and end, releasing their permits and trackers.
         endpoint.close(0u32.into(), b"listener closed");
@@ -1143,309 +1180,50 @@ async fn serve_h3_connection(
                 return;
             }
         };
+    // In-flight request tasks of this connection. Dropping the set (any exit path) aborts them.
+    let mut requests: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
+                    // Graceful: tell the client (GOAWAY) that no new requests will be accepted
+                    // and let requests already in flight finish (an upload may still be
+                    // arriving); `force` cuts the wait short.
+                    drain_h3_connection(&mut h3_connection, &mut requests, &mut force).await;
                     connection.close(0u32.into(), b"");
                     break;
                 }
             }
             changed = force.changed() => {
                 if changed.is_err() || *force.borrow() {
+                    requests.abort_all();
                     connection.close(0u32.into(), b"");
                     break;
                 }
             }
+            // Reap finished request tasks so the set does not grow with the connection's lifetime.
+            Some(_) = requests.join_next(), if !requests.is_empty() => {}
             accepted = h3_connection.accept() => {
                 match accepted {
                     Ok(Some(resolver)) => {
-                        let (mut request, mut stream) = match resolver.resolve_request().await {
-                            Ok(pair) => pair,
-                            Err(error) => {
-                                tracing::debug!(%error, "HTTP/3 request resolution failed");
-                                continue;
-                            }
-                        };
-                        let started = std::time::Instant::now();
-                        let method = request.method().as_str().to_string();
-                        // Caddy's metrics labels and request-size histogram are computed before
-                        // the request is consumed (`modules/caddyhttp/metrics.go:314-368`).
-                        let host = request_host(request.headers(), request.uri());
-                        let is_https = true;
-                        let request_size = approximate_request_size(
-                            request.method(),
-                            request.version(),
-                            request.uri(),
-                            request.headers(),
-                        );
-                        let mut snapshot = context.access_log.is_enabled().then(|| {
-                            RequestSnapshot::capture_http3(
-                                &request,
-                                Some(remote_addr),
-                                Some(&tls_info),
-                            )
-                        });
-                        if let Some(snapshot) = snapshot.as_mut() {
-                            snapshot.resolve_client_ip(&context.trusted_proxies);
-                        }
-                        // One shared observation context per request: the access logger and the
-                        // metrics recorder both read the handler/error fields the router publishes,
-                        // and the access-log half stays a no-op when no sink is active.
-                        let access_log_context = Some({
-                            let access_log = Arc::new(AccessLogContext::new());
-                            access_log.start(started);
-                            access_log
-                        });
-                        let _request_guard = request_started(
-                            &context.recorder,
-                            &context.server_name,
-                            &host,
-                            is_https,
-                        );
-                        // RFC 9114 has no HTTP/1.1-style `Upgrade`, and caddy-rs has no HTTP/3
-                        // request-stream tunnel for RFC 8441 extended CONNECT. Reject every
-                        // upgrade-style request before routing so a WebSocket/extended-CONNECT
-                        // request can never be silently served as an ordinary request. Caddy
-                        // v2.11.9: quic-go rejects a plain `Upgrade` header with H3_MESSAGE_ERROR
-                        // (no HTTP response) and its reverse_proxy tunnels extended CONNECT; this
-                        // build's loud 501 is the documented divergence (DIV-0004).
-                        if h3_upgrade_request(&request) {
-                            let mut headers = http::HeaderMap::new();
-                            headers.insert(
-                                http::header::CONTENT_TYPE,
-                                http::HeaderValue::from_static("text/plain; charset=utf-8"),
-                            );
-                            let response = http::Response::builder()
-                                .status(http::StatusCode::NOT_IMPLEMENTED)
-                                .header(
-                                    http::header::CONTENT_TYPE,
-                                    "text/plain; charset=utf-8",
-                                )
-                                .body(())
-                                .unwrap_or_else(|_| http::Response::new(()));
-                            let _ = stream.send_response(response).await;
-                            let body = H3_UPGRADE_UNSUPPORTED_BODY;
-                            let _ = stream.send_data(Bytes::from_static(body.as_bytes())).await;
-                            let _ = stream.finish().await;
-                            observe_request(
-                                &context.recorder,
-                                &context.access_log,
-                                &context.access_log_policy,
-                                &context.server_name,
-                                &method,
-                                snapshot.as_ref(),
-                                started,
-                                501,
-                                body.len() as u64,
-                                &headers,
-                                // Rejected before the request pipeline exists, so there is no
-                                // per-request access-log context and no body write to report.
-                                None,
-                                None,
-                                &host,
-                                is_https,
-                                request_size,
-                                std::time::Instant::now(),
-                            );
-                            continue;
-                        }
-                        let limit = context.limits.max_request_body_size;
-                        let mut body = BytesMut::new();
-                        let mut too_large = false;
-                        loop {
-                            match stream.recv_data().await {
-                                Ok(Some(mut chunk)) => {
-                                    let chunk = chunk.copy_to_bytes(chunk.remaining());
-                                    if let Some(limit) = limit {
-                                        if body.len() as u64 + chunk.len() as u64 > limit {
-                                            too_large = true;
-                                            break;
-                                        }
-                                    }
-                                    body.extend_from_slice(&chunk);
-                                }
-                                Ok(None) => break,
-                                Err(error) => {
-                                    tracing::debug!(%error, "HTTP/3 request body read failed");
-                                    break;
-                                }
-                            }
-                        }
-                        if let Some(access_log_context) = &access_log_context {
-                            // The HTTP/3 path buffers the request body here; report the bytes
-                            // actually read from the transport (Caddy's `bytes_read`).
-                            access_log_context.request_bytes().set(body.len() as u64);
-                        }
-                        if too_large {
-                            let response = http::Response::builder()
-                                .status(http::StatusCode::PAYLOAD_TOO_LARGE)
-                                .body(())
-                                .unwrap_or_else(|_| http::Response::new(()));
-                            let _ = stream.send_response(response).await;
-                            let _ = stream
-                                .send_data(Bytes::from_static(b"413 Request Entity Too Large"))
-                                .await;
-                            let _ = stream.finish().await;
-                            observe_request(
-                                &context.recorder,
-                                &context.access_log,
-                                &context.access_log_policy,
-                                &context.server_name,
-                                &method,
-                                snapshot.as_ref(),
-                                started,
-                                413,
-                                0,
-                                &http::HeaderMap::new(),
-                                access_log_context.as_ref(),
-                                None,
-                                &host,
-                                is_https,
-                                request_size,
-                                std::time::Instant::now(),
-                            );
-                            continue;
-                        }
-                        // HTTP/3 carries `:authority` in the request URI; synthesize the Host
-                        // header so Caddy host matching/placeholders behave like h1/h2.
-                        if !request.headers().contains_key(http::header::HOST) {
-                            if let Some(authority) = request.uri().authority() {
-                                if let Ok(value) = http::HeaderValue::from_str(authority.as_str()) {
-                                    request
-                                        .headers_mut()
-                                        .insert(http::header::HOST, value);
-                                }
-                            }
-                        }
-                        let (mut parts, ()) = request.into_parts();
-                        parts.version = http::Version::HTTP_3;
-                        let Some(router) = context.router.clone() else {
-                            let headers = http::HeaderMap::new();
-                            observe_request(
-                                &context.recorder,
-                                &context.access_log,
-                                &context.access_log_policy,
-                                &context.server_name,
-                                &method,
-                                snapshot.as_ref(),
-                                started,
-                                503,
-                                0,
-                                &headers,
-                                access_log_context.as_ref(),
-                                None,
-                                &host,
-                                is_https,
-                                request_size,
-                                std::time::Instant::now(),
-                            );
-                            let response = http::Response::builder()
-                                .status(http::StatusCode::SERVICE_UNAVAILABLE)
-                                .body(())
-                                .unwrap_or_else(|_| http::Response::new(()));
-                            let _ = stream.send_response(response).await;
-                            let _ = stream.finish().await;
-                            continue;
-                        };
-                        let served = crate::http::serve_internal_buffered(
-                            &context.limits,
-                            router,
-                            parts,
-                            body.freeze(),
-                            Some(remote_addr),
-                            Some(local_addr),
-                            true,
-                            Some("h3"),
-                            Arc::clone(&context.trusted_proxies),
-                            h3_client_certificate(&connection, context.client_auth_verified),
-                            request_tls_connection(Some(&tls_info)),
-                            (!tls_info.server_name.is_empty())
-                                .then(|| tls_info.server_name.clone()),
-                            access_log_context.clone(),
-                        )
-                        .await;
-                        let hyper_response = match served {
-                            ServedResponse::Response(response) => response,
-                            ServedResponse::Upgraded { response, .. } => response,
-                        };
-                        let (response_parts, response_body) = hyper_response.into_parts();
-                        let mut response_headers = response_parts.headers;
-                        // A buffered body has a known length, so keep the Caddy-compatible
-                        // `Content-Length`; a streamed body is sent chunk by chunk without one and
-                        // is never collected, so a large file does not have to fit in memory.
-                        let known_size = response_body.exact_size();
-                        if let Some(size) = known_size {
-                            if !response_headers.contains_key(http::header::CONTENT_LENGTH)
-                                && response_parts.status != http::StatusCode::NO_CONTENT
-                                && response_parts.status != http::StatusCode::NOT_MODIFIED
-                            {
-                                if let Ok(value) = http::HeaderValue::from_str(&size.to_string()) {
-                                    response_headers.insert(http::header::CONTENT_LENGTH, value);
-                                }
-                            }
-                        }
-                        let mut response = http::Response::builder()
-                            .status(response_parts.status)
-                            .body(())
-                            .unwrap_or_else(|_| http::Response::new(()));
-                        for (name, value) in &response_headers {
-                            response.headers_mut().append(name.clone(), value.clone());
-                        }
-                        if let Err(error) = stream.send_response(response).await {
-                            tracing::debug!(%error, "HTTP/3 response headers failed");
-                            continue;
-                        }
-                        // Caddy's `response_duration_seconds` is time to response headers.
-                        let response_started = std::time::Instant::now();
-                        let mut body = std::pin::pin!(response_body);
-                        let mut sent = 0_u64;
-                        let mut failed = false;
-                        while let Some(frame) = body.frame().await {
-                            let Ok(frame) = frame else {
-                                failed = true;
-                                break;
-                            };
-                            let Ok(data) = frame.into_data() else {
-                                continue;
-                            };
-                            sent += data.len() as u64;
-                            if method == "HEAD" || data.is_empty() {
-                                continue;
-                            }
-                            if let Err(error) = stream.send_data(data).await {
-                                tracing::debug!(%error, "HTTP/3 response body failed");
-                                failed = true;
-                                break;
-                            }
-                        }
-                        let _ = stream.finish().await;
-                        let write_error = failed
-                            .then(|| format!("response body write failed after {sent} bytes"));
-                        observe_request(
-                            &context.recorder,
-                            &context.access_log,
-                            &context.access_log_policy,
-                            &context.server_name,
-                            &method,
-                            snapshot.as_ref(),
-                            started,
-                            response_parts.status.as_u16(),
-                            sent,
-                            &response_headers,
-                            access_log_context.as_ref(),
-                            write_error.as_deref(),
-                            &host,
-                            is_https,
-                            request_size,
-                            response_started,
-                        );
-                        if failed {
-                            continue;
-                        }
-                        continue;
+                        // One task per request stream: a slow upload or download must not block
+                        // other requests on this connection (quic-go serves each stream in its own
+                        // goroutine). The task set is drained on shutdown.
+                        requests.spawn(serve_h3_request(
+                            resolver,
+                            context.clone(),
+                            connection.clone(),
+                            tls_info.clone(),
+                            remote_addr,
+                            local_addr,
+                        ));
                     }
-                    Ok(None) => break,
+                    Ok(None) => {
+                        // The client closed the connection gracefully (GOAWAY): requests it already
+                        // started are still answered.
+                        drain_h3_requests(&mut requests, &mut force).await;
+                        break;
+                    }
                     Err(error) => {
                         tracing::debug!(%error, "HTTP/3 connection closed");
                         break;
@@ -1453,6 +1231,593 @@ async fn serve_h3_connection(
                 }
             }
         }
+    }
+}
+
+/// Gracefully drain one HTTP/3 connection: send GOAWAY (`max_requests = 0`, no further requests),
+/// keep polling `accept()` so any stream the client opened past the GOAWAY is rejected by h3
+/// (`H3_REQUEST_REJECTED`, which clients retry elsewhere) instead of hanging, and wait for the
+/// in-flight request tasks to finish. `force` aborts them.
+#[cfg(feature = "http3")]
+async fn drain_h3_connection(
+    h3_connection: &mut h3::server::Connection<h3_quinn::Connection, Bytes>,
+    requests: &mut tokio::task::JoinSet<()>,
+    force: &mut watch::Receiver<bool>,
+) {
+    let _ = h3_connection.shutdown(0).await;
+    while !requests.is_empty() {
+        tokio::select! {
+            _ = requests.join_next() => {}
+            accepted = h3_connection.accept() => {
+                if !matches!(accepted, Ok(Some(_))) {
+                    // The connection is closing: only the running requests are left to wait for.
+                    drain_h3_requests(requests, force).await;
+                    return;
+                }
+                // A stream that slipped through is dropped, which refuses it.
+            }
+            changed = force.changed() => {
+                if changed.is_err() || *force.borrow() {
+                    requests.abort_all();
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Wait for the in-flight request tasks of one connection to finish, or abort them when `force`
+/// fires (a second signal, or the grace period ending).
+#[cfg(feature = "http3")]
+async fn drain_h3_requests(
+    requests: &mut tokio::task::JoinSet<()>,
+    force: &mut watch::Receiver<bool>,
+) {
+    while !requests.is_empty() {
+        tokio::select! {
+            _ = requests.join_next() => {}
+            changed = force.changed() => {
+                if changed.is_err() || *force.borrow() {
+                    requests.abort_all();
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Serve one HTTP/3 request stream through the router pipeline.
+///
+/// Runs in its own task (one per request stream, like quic-go's goroutine per stream), so a slow or
+/// stalled request cannot hold up other requests on the same QUIC connection. The body is wrapped
+/// in a single-iteration loop so that the request-level `continue` statements below mean "this
+/// request is finished".
+#[cfg(feature = "http3")]
+#[allow(clippy::never_loop)]
+async fn serve_h3_request(
+    resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
+    context: ConnectionContext,
+    connection: quinn::Connection,
+    tls_info: TlsLogInfo,
+    remote_addr: SocketAddr,
+    local_addr: SocketAddr,
+) {
+    let mut resolver = Some(resolver);
+    for _ in 0..1 {
+        // The body runs exactly once; `take` satisfies the borrow checker for the one-shot loop.
+        let Some(resolver) = resolver.take() else { break };
+        let (mut request, mut stream) = match resolver.resolve_request().await {
+            Ok(pair) => pair,
+            Err(error) => {
+                tracing::debug!(%error, "HTTP/3 request resolution failed");
+                continue;
+            }
+        };
+        let started = std::time::Instant::now();
+        let method = request.method().as_str().to_string();
+        // Caddy's metrics labels and request-size histogram are computed before
+        // the request is consumed (`modules/caddyhttp/metrics.go:314-368`).
+        let host = request_host(request.headers(), request.uri());
+        let is_https = true;
+        let request_size = approximate_request_size(
+            request.method(),
+            request.version(),
+            request.uri(),
+            request.headers(),
+        );
+        let mut snapshot = context.access_log.is_enabled().then(|| {
+            RequestSnapshot::capture_http3(
+                &request,
+                Some(remote_addr),
+                Some(&tls_info),
+            )
+        });
+        if let Some(snapshot) = snapshot.as_mut() {
+            snapshot.resolve_client_ip(&context.trusted_proxies);
+        }
+        // One shared observation context per request: the access logger and the
+        // metrics recorder both read the handler/error fields the router publishes,
+        // and the access-log half stays a no-op when no sink is active.
+        let access_log_context = Some({
+            let access_log = Arc::new(AccessLogContext::new());
+            access_log.start(started);
+            access_log
+        });
+        let _request_guard = request_started(
+            &context.recorder,
+            &context.server_name,
+            &host,
+            is_https,
+        );
+        // RFC 9114 has no HTTP/1.1-style `Upgrade`, and caddy-rs has no HTTP/3
+        // request-stream tunnel for RFC 8441 extended CONNECT. Reject every
+        // upgrade-style request before routing so a WebSocket/extended-CONNECT
+        // request can never be silently served as an ordinary request. Caddy
+        // v2.11.9: quic-go rejects a plain `Upgrade` header with H3_MESSAGE_ERROR
+        // (no HTTP response) and its reverse_proxy tunnels extended CONNECT; this
+        // build's loud 501 is the documented divergence (DIV-0004).
+        if h3_upgrade_request(&request) {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            let response = http::Response::builder()
+                .status(http::StatusCode::NOT_IMPLEMENTED)
+                .header(
+                    http::header::CONTENT_TYPE,
+                    "text/plain; charset=utf-8",
+                )
+                .body(())
+                .unwrap_or_else(|_| http::Response::new(()));
+            let _ = stream.send_response(response).await;
+            let body = H3_UPGRADE_UNSUPPORTED_BODY;
+            let _ = stream.send_data(Bytes::from_static(body.as_bytes())).await;
+            let _ = stream.finish().await;
+            observe_request(
+                &context.recorder,
+                &context.access_log,
+                &context.access_log_policy,
+                &context.server_name,
+                &method,
+                snapshot.as_ref(),
+                started,
+                501,
+                body.len() as u64,
+                &headers,
+                // Rejected before the request pipeline exists, so there is no
+                // per-request access-log context and no body write to report.
+                None,
+                None,
+                &host,
+                is_https,
+                request_size,
+                std::time::Instant::now(),
+            );
+            continue;
+        }
+        // Same rule as HTTP/1.1 and HTTP/2: the body streams to the handlers unless
+        // one of them needs it buffered (`reverse_proxy` retries, FastCGI,
+        // `handle_response`/`forward_auth`) or a body limit is configured for a body
+        // of unknown length (so the 413 can still precede the handler).
+        // A malformed `Content-Length` (several values, a sign, a list that disagrees)
+        // is refused with 400 (RFC 9114 section 4.1.2) before any body is read.
+        let declared = h3_declared_length(request.headers());
+        let header_invalid = declared.is_err();
+        let declared_length = declared.unwrap_or(None);
+        let can_stream = !header_invalid
+            && context.router.as_ref().is_some_and(|router| {
+                !router.requires_buffered_request_body()
+                    && (declared_length.is_some()
+                        || context.limits.max_request_body_size.is_none())
+            });
+        // Send and receive halves are independent: the handler can answer (and
+        // stream a response) while the request body is still arriving.
+        let (mut stream, recv_stream) = stream.split();
+        let mut recv_stream = Some(recv_stream);
+        let mut streamed_body = None;
+        // Longest silence tolerated between body reads. HTTP/1 enforces
+        // `read_timeout` per read at the socket; QUIC has no such wrapper, and its
+        // idle timeout is defeated by keep-alive PINGs, so without this a client
+        // that stalls mid-upload holds the handler (and its upstream) forever.
+        let body_idle_timeout = h3_body_idle_timeout(&context.limits);
+        // Cancels the body reader when this request is done (dropping the guard
+        // resolves the reader's `cancelled` receiver), even if the handler
+        // answered without consuming the whole upload.
+        let mut _body_reader = None;
+        // Status the reader records when the streamed upload fails, so the client
+        // is never told success for an upload that did not complete.
+        let body_failure = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        if can_stream {
+            let reader = recv_stream.take().expect("receive half is present");
+            let (chunks, receiver) = tokio::sync::mpsc::channel(H3_BODY_CHANNEL_DEPTH);
+            let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+            _body_reader = Some(cancel);
+            tokio::spawn(pump_h3_request_body(
+                reader,
+                chunks,
+                cancelled,
+                body_idle_timeout,
+                declared_length,
+                Arc::clone(&body_failure),
+            ));
+            streamed_body = Some(StreamingBody::from_chunks(receiver));
+        }
+        // The buffered path is always bounded.
+        let limit = Some(context.limits.buffered_body_limit());
+        let mut body = BytesMut::new();
+        let mut too_large = false;
+        // Process-wide budget shared with the HTTP/1 and HTTP/2 buffered path; held until
+        // this request's response has been produced.
+        let mut reservation = crate::limits::BufferedBodyReservation::default();
+        let mut overloaded = false;
+        // Set when the body could not be read to the end, or does not match the
+        // declared length: the request is refused instead of being routed with a
+        // truncated body.
+        let mut malformed: Option<http::StatusCode> =
+            header_invalid.then_some(http::StatusCode::BAD_REQUEST);
+        while !can_stream && malformed.is_none() {
+            let Some(reader) = recv_stream.as_mut() else {
+                break;
+            };
+            let next = match tokio::time::timeout(body_idle_timeout, reader.recv_data())
+                .await
+            {
+                Ok(next) => next,
+                Err(_elapsed) => {
+                    tracing::debug!("HTTP/3 request body read timed out");
+                    malformed = Some(http::StatusCode::REQUEST_TIMEOUT);
+                    break;
+                }
+            };
+            match next {
+                Ok(Some(mut chunk)) => {
+                    let chunk = chunk.copy_to_bytes(chunk.remaining());
+                    if let Some(limit) = limit {
+                        if body.len() as u64 + chunk.len() as u64 > limit {
+                            too_large = true;
+                            break;
+                        }
+                    }
+                    if !reservation.try_grow(chunk.len()) {
+                        overloaded = true;
+                        break;
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::debug!(%error, "HTTP/3 request body read failed");
+                    malformed = Some(http::StatusCode::BAD_REQUEST);
+                    break;
+                }
+            }
+        }
+        if !can_stream
+            && malformed.is_none()
+            && !too_large
+            && !overloaded
+            && declared_length.is_some_and(|declared| declared != body.len() as u64)
+        {
+            malformed = Some(http::StatusCode::BAD_REQUEST);
+        }
+        if let (false, Some(access_log_context)) = (can_stream, &access_log_context) {
+            // A buffered request body was read in full here; report the bytes
+            // actually read from the transport (Caddy's `bytes_read`). A streamed
+            // body is counted as the handlers consume it.
+            access_log_context.request_bytes().set(body.len() as u64);
+        }
+        if too_large || overloaded || malformed.is_some() {
+            let (refusal_status, refusal_body): (http::StatusCode, &'static [u8]) =
+                if overloaded {
+                    (
+                        http::StatusCode::SERVICE_UNAVAILABLE,
+                        b"503 Service Unavailable",
+                    )
+                } else if too_large {
+                    (
+                        http::StatusCode::PAYLOAD_TOO_LARGE,
+                        b"413 Request Entity Too Large",
+                    )
+                } else if malformed == Some(http::StatusCode::REQUEST_TIMEOUT) {
+                    (http::StatusCode::REQUEST_TIMEOUT, b"408 Request Timeout")
+                } else {
+                    (http::StatusCode::BAD_REQUEST, b"400 Bad Request")
+                };
+            let response = http::Response::builder()
+                .status(refusal_status)
+                .body(())
+                .unwrap_or_else(|_| http::Response::new(()));
+            let _ = stream.send_response(response).await;
+            let _ = stream
+                .send_data(Bytes::from_static(refusal_body))
+                .await;
+            let _ = stream.finish().await;
+            observe_request(
+                &context.recorder,
+                &context.access_log,
+                &context.access_log_policy,
+                &context.server_name,
+                &method,
+                snapshot.as_ref(),
+                started,
+                refusal_status.as_u16(),
+                0,
+                &http::HeaderMap::new(),
+                access_log_context.as_ref(),
+                None,
+                &host,
+                is_https,
+                request_size,
+                std::time::Instant::now(),
+            );
+            continue;
+        }
+        // HTTP/3 carries `:authority` in the request URI; synthesize the Host
+        // header so Caddy host matching/placeholders behave like h1/h2.
+        if !request.headers().contains_key(http::header::HOST) {
+            if let Some(authority) = request.uri().authority() {
+                if let Ok(value) = http::HeaderValue::from_str(authority.as_str()) {
+                    request
+                        .headers_mut()
+                        .insert(http::header::HOST, value);
+                }
+            }
+        }
+        let (mut parts, ()) = request.into_parts();
+        parts.version = http::Version::HTTP_3;
+        let Some(router) = context.router.clone() else {
+            let headers = http::HeaderMap::new();
+            observe_request(
+                &context.recorder,
+                &context.access_log,
+                &context.access_log_policy,
+                &context.server_name,
+                &method,
+                snapshot.as_ref(),
+                started,
+                503,
+                0,
+                &headers,
+                access_log_context.as_ref(),
+                None,
+                &host,
+                is_https,
+                request_size,
+                std::time::Instant::now(),
+            );
+            let response = http::Response::builder()
+                .status(http::StatusCode::SERVICE_UNAVAILABLE)
+                .body(())
+                .unwrap_or_else(|_| http::Response::new(()));
+            let _ = stream.send_response(response).await;
+            let _ = stream.finish().await;
+            continue;
+        };
+        let request_body = match streamed_body.take() {
+            Some(streaming) => crate::http::H3RequestBody::Streaming(
+                streaming,
+                Arc::clone(&body_failure),
+            ),
+            None => crate::http::H3RequestBody::Buffered(body.freeze()),
+        };
+        let served = crate::http::serve_internal_h3(
+            &context.limits,
+            router,
+            parts,
+            request_body,
+            Some(remote_addr),
+            Some(local_addr),
+            true,
+            Some("h3"),
+            Arc::clone(&context.trusted_proxies),
+            h3_client_certificate(&connection, context.client_auth_verified),
+            request_tls_connection(Some(&tls_info)),
+            (!tls_info.server_name.is_empty())
+                .then(|| tls_info.server_name.clone()),
+            access_log_context.clone(),
+        )
+        .await;
+        let hyper_response = match served {
+            ServedResponse::Response(response) => response,
+            ServedResponse::Upgraded { response, .. } => response,
+        };
+        let (response_parts, response_body) = hyper_response.into_parts();
+        let mut response_headers = response_parts.headers;
+        // A buffered body has a known length, so keep the Caddy-compatible
+        // `Content-Length`; a streamed body is sent chunk by chunk without one and
+        // is never collected, so a large file does not have to fit in memory.
+        let known_size = response_body.exact_size();
+        if let Some(size) = known_size {
+            if !response_headers.contains_key(http::header::CONTENT_LENGTH)
+                && response_parts.status != http::StatusCode::NO_CONTENT
+                && response_parts.status != http::StatusCode::NOT_MODIFIED
+            {
+                if let Ok(value) = http::HeaderValue::from_str(&size.to_string()) {
+                    response_headers.insert(http::header::CONTENT_LENGTH, value);
+                }
+            }
+        }
+        let mut response = http::Response::builder()
+            .status(response_parts.status)
+            .body(())
+            .unwrap_or_else(|_| http::Response::new(()));
+        for (name, value) in &response_headers {
+            response.headers_mut().append(name.clone(), value.clone());
+        }
+        if let Err(error) = stream.send_response(response).await {
+            tracing::debug!(%error, "HTTP/3 response headers failed");
+            continue;
+        }
+        // Caddy's `response_duration_seconds` is time to response headers.
+        let response_started = std::time::Instant::now();
+        let mut body = std::pin::pin!(response_body);
+        let mut sent = 0_u64;
+        let mut failed = false;
+        while let Some(frame) = body.frame().await {
+            let Ok(frame) = frame else {
+                failed = true;
+                break;
+            };
+            let Ok(data) = frame.into_data() else {
+                continue;
+            };
+            sent += data.len() as u64;
+            if method == "HEAD" || data.is_empty() {
+                continue;
+            }
+            if let Err(error) = stream.send_data(data).await {
+                tracing::debug!(%error, "HTTP/3 response body failed");
+                failed = true;
+                break;
+            }
+        }
+        let _ = stream.finish().await;
+        let write_error = failed
+            .then(|| format!("response body write failed after {sent} bytes"));
+        observe_request(
+            &context.recorder,
+            &context.access_log,
+            &context.access_log_policy,
+            &context.server_name,
+            &method,
+            snapshot.as_ref(),
+            started,
+            response_parts.status.as_u16(),
+            sent,
+            &response_headers,
+            access_log_context.as_ref(),
+            write_error.as_deref(),
+            &host,
+            is_https,
+            request_size,
+            response_started,
+        );
+        if failed {
+            continue;
+        }
+        continue;
+    }
+}
+
+/// How many request-body chunks may sit between the QUIC stream and the handler. Small on purpose:
+/// it is the whole read-ahead, so memory per upload is a few chunks regardless of file size.
+#[cfg(feature = "http3")]
+const H3_BODY_CHANNEL_DEPTH: usize = 4;
+
+/// Stand-in for "no timeout" (a negative `read_idle_timeout` and no `read_timeout`): far enough in
+/// the future that it never fires.
+#[cfg(feature = "http3")]
+const H3_BODY_NO_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 24 * 365);
+
+/// The longest silence tolerated between reads of one HTTP/3 request body: the shorter of the
+/// server's `read_timeout` and `read_idle_timeout` (Caddy default 1 minute, negative disables).
+/// A stalled upload otherwise holds its handler and any upstream connection forever, because QUIC
+/// keep-alive PINGs keep the connection itself alive.
+#[cfg(feature = "http3")]
+fn h3_body_idle_timeout(limits: &crate::limits::ServerLimits) -> Duration {
+    [limits.read_timeout, limits.read_idle_timeout]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(H3_BODY_NO_TIMEOUT)
+}
+
+/// Feed one HTTP/3 request body from the QUIC receive half into `chunks`, which the handler reads
+/// as a streaming body.
+///
+/// * The bounded channel is the whole read-ahead: a slow handler stops this task pulling from QUIC,
+///   which closes the stream's flow-control window and slows the client.
+/// * `cancelled` resolves when the request ends (its sender is dropped); the task then just drops
+///   the stream.
+/// * `idle` bounds the silence between reads; on expiry the body fails (the client gets `408`).
+/// * `declared` is the request's `Content-Length`: more data than declared, or a stream that ends
+///   short of it, fails the body (the client gets `400`). Without this a lying length is silently
+///   truncated by the HTTP/1 upstream framing. It only sees data that arrives while the handler is
+///   still reading: if the handler finishes after exactly `declared` bytes, later surplus data is
+///   never observed.
+///
+/// **This function never calls `stop_sending` (or `recv_id`) on the stream, on purpose.** h3-quinn's
+/// `RecvStream` keeps the QUIC stream in an `Option` that is `None` whenever a read future is in
+/// flight, and both methods `unwrap()` it. A read is in flight not only after abandoning
+/// `recv_data()` (timeout, cancel) but also *between* calls: h3 reads ahead after a DATA frame
+/// (looking for trailers or the next frame), so even right after a chunk was delivered the
+/// stream may be absent. Calling `stop_sending` therefore panics intermittently, and with the
+/// `release-minimal` profile (`panic = "abort"`) that lets a client kill the whole process. The
+/// consequence is that the stream is only dropped, so quinn tells the client to stop with
+/// application error code 0 rather than `H3_NO_ERROR` / `H3_MESSAGE_ERROR` / `H3_REQUEST_CANCELLED`
+/// (RFC 9114 section 4.1 says `H3_NO_ERROR` SHOULD be used); the client-visible HTTP status
+/// (`400`/`408`) is unaffected.
+#[cfg(feature = "http3")]
+async fn pump_h3_request_body<S>(
+    mut reader: h3::server::RequestStream<S, Bytes>,
+    chunks: tokio::sync::mpsc::Sender<Result<Bytes, caddy_rs_http::body::BodyError>>,
+    mut cancelled: tokio::sync::oneshot::Receiver<()>,
+    idle: Duration,
+    declared: Option<u64>,
+    failure_status: Arc<std::sync::atomic::AtomicU16>,
+) where
+    S: h3::quic::RecvStream,
+{
+    use std::sync::atomic::Ordering;
+    let fail = |status: u16, error: Box<dyn std::error::Error + Send + Sync>| {
+        // The status is stored before the error is delivered, so a handler that observed the error
+        // always produces an overridden response.
+        failure_status.store(status, Ordering::SeqCst);
+        caddy_rs_http::body::BodyError::Upstream(error)
+    };
+    let mut received: u64 = 0;
+    loop {
+        let next = tokio::select! {
+            _ = &mut cancelled => return,
+            next = tokio::time::timeout(idle, reader.recv_data()) => next,
+        };
+        let error = match next {
+            Err(_elapsed) => fail(
+                408,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "request body read timed out",
+                )),
+            ),
+            Ok(Err(error)) => fail(400, Box::new(error)),
+            Ok(Ok(None)) => match declared {
+                Some(declared) if declared != received => fail(
+                    400,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "request body ended before the declared Content-Length",
+                    )),
+                ),
+                _ => return,
+            },
+            Ok(Ok(Some(mut chunk))) => {
+                let chunk = chunk.copy_to_bytes(chunk.remaining());
+                received += chunk.len() as u64;
+                if declared.is_some_and(|declared| received > declared) {
+                    fail(
+                        400,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "request body is longer than the declared Content-Length",
+                        )),
+                    )
+                } else {
+                    tokio::select! {
+                        _ = &mut cancelled => return,
+                        sent = chunks.send(Ok(chunk)) => {
+                            if sent.is_err() {
+                                // The handler dropped the body.
+                                return;
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+        };
+        let _ = chunks.send(Err(error)).await;
+        return;
     }
 }
 
@@ -1469,7 +1834,7 @@ pub(crate) const H3_UPGRADE_UNSUPPORTED_BODY: &str =
 /// HTTP/3 (RFC 9114) has no HTTP/1.1 `Upgrade` mechanism: a request that carries `Upgrade` is a
 /// WebSocket/other-upgrade attempt that quic-go would reject as malformed. RFC 8441 extended
 /// CONNECT is a `CONNECT` request with a `:protocol` pseudo-header, which `h3` surfaces as an
-/// extension. caddy-rs buffers HTTP/3 requests and has no request-stream tunnel, so both forms are
+/// extension. caddy-rs has no HTTP/3 request-stream tunnel, so both forms are
 /// rejected loudly instead of being handed to the router as ordinary requests. A plain `CONNECT`
 /// without `:protocol` is not an upgrade and keeps the existing routing behaviour.
 #[cfg(feature = "http3")]
@@ -6555,6 +6920,97 @@ mod bind_capability_tests {
             crate::bindcap::seam_entries(),
             before_entries,
             "a successful bind must not consult the capability seam at all"
+        );
+    }
+}
+
+/// The declared request length of an HTTP/3 request, validated the way RFC 9110 section 8.6 and
+/// RFC 9114 section 4.1.2 require: every `Content-Length` value (several headers, or a comma list)
+/// must be plain decimal digits and all must be equal. `Err` means the request is malformed.
+/// quic-go's HTTP/3 body enforces the declared length itself; the h3 crate does not, and Rust's
+/// `str::parse::<u64>` would also accept a leading `+`.
+#[cfg(feature = "http3")]
+fn h3_declared_length(headers: &http::HeaderMap) -> Result<Option<u64>, ()> {
+    let mut found: Option<u64> = None;
+    for value in headers.get_all(http::header::CONTENT_LENGTH) {
+        let text = value.to_str().map_err(|_| ())?;
+        for part in text.split(',') {
+            let part = part.trim();
+            if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(());
+            }
+            let length: u64 = part.parse().map_err(|_| ())?;
+            match found {
+                Some(previous) if previous != length => return Err(()),
+                _ => found = Some(length),
+            }
+        }
+    }
+    Ok(found)
+}
+
+#[cfg(all(test, feature = "http3"))]
+mod h3_declared_length_tests {
+    use super::h3_declared_length;
+
+    fn lengths(values: &[&str]) -> Result<Option<u64>, ()> {
+        let mut headers = http::HeaderMap::new();
+        for value in values {
+            headers.append(
+                http::header::CONTENT_LENGTH,
+                http::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        h3_declared_length(&headers)
+    }
+
+    #[test]
+    fn content_length_is_validated_strictly() {
+        assert_eq!(lengths(&[]), Ok(None));
+        assert_eq!(lengths(&["0"]), Ok(Some(0)));
+        assert_eq!(lengths(&["10"]), Ok(Some(10)));
+        assert_eq!(lengths(&["10", "10"]), Ok(Some(10)), "equal repeats are one value");
+        assert_eq!(lengths(&["10, 10"]), Ok(Some(10)), "an equal list is one value");
+        for bad in [
+            &["10", "20"][..],
+            &["10, 20"],
+            &["+10"],
+            &["-1"],
+            &["1e3"],
+            &[""],
+            &["ten"],
+            &["10,"],
+            &["99999999999999999999999"],
+        ] {
+            assert_eq!(lengths(bad), Err(()), "{bad:?} must be malformed");
+        }
+    }
+}
+
+#[cfg(all(test, feature = "http3"))]
+mod h3_stream_hazard_tests {
+    /// h3-quinn's `RecvStream::stop_sending` and `recv_id` `unwrap()` an `Option` that is `None`
+    /// whenever a read is in flight, and h3 reads ahead after a data frame, so calling either
+    /// panics intermittently (and aborts the whole process under `panic = "abort"`). A timing
+    /// dependent crash cannot be reproduced reliably, so this guards the cause instead: no code in
+    /// this file may call them. Comments are ignored; the needles are built with `concat!` so this
+    /// test does not match itself.
+    #[test]
+    fn no_code_calls_h3_receive_stream_methods_that_panic_while_a_read_is_in_flight() {
+        let source = include_str!("listeners.rs");
+        let needles = [concat!(".stop_", "sending("), concat!(".recv_", "id(")];
+        let offenders: Vec<(usize, &str)> = source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let code = line.trim_start();
+                !code.starts_with("//") && needles.iter().any(|needle| code.contains(needle))
+            })
+            .map(|(index, line)| (index + 1, line.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "h3-quinn panics on these while a read is in flight; see `pump_h3_request_body`: {offenders:?}"
         );
     }
 }
