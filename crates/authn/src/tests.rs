@@ -248,7 +248,13 @@ async fn concurrent_first_admin_setup_has_exactly_one_winner_over_100_runs() {
 #[tokio::test]
 async fn memory_store_refresh_token_lifecycle() {
     let store = MemoryUserStore::new();
-    let user_id = UserId::new();
+    // The store refuses tokens for a user that does not exist, so the user must.
+    let service = AuthnService::new(store.clone(), test_config()).expect("build service");
+    let user_id = service
+        .create_user("lifecycle", "password", Role::viewer())
+        .await
+        .unwrap()
+        .id;
     let now = now_ts().expect("system clock is after the Unix epoch");
     let record = RefreshTokenRecord {
         token_hash: "hash1".to_string(),

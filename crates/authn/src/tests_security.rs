@@ -408,12 +408,14 @@ fn the_tracker_is_bounded_and_evicts_unlocked_entries_first() {
     }
     // Flood with invented names, each a little later.
     for index in 0..50u64 {
-        let _ = tracker.reserve(
+        let _ = tracker.reserve_as(
             &format!("noise-{index}"),
+            false,
             origin + Duration::from_millis(index + 1),
             &config,
         );
-        assert!(tracker.entries.len() <= 3, "bounded at {index}");
+        // The known victim plus at most `max_tracked` invented names.
+        assert!(tracker.len() <= 4, "bounded at {index}");
     }
     assert!(
         tracker
@@ -436,7 +438,7 @@ fn an_idle_key_is_forgiven_and_long_usernames_are_keyed_by_digest() {
     for _ in 0..4 {
         tracker.reserve("k", later, &config).unwrap();
     }
-    assert!(tracker.entries["k"].locked_until.is_none());
+    assert!(tracker.entry("k").unwrap().locked_until.is_none());
 
     let long = "A".repeat(100_000);
     let key = username_throttle_key(&long);
@@ -1280,7 +1282,7 @@ fn an_idle_period_decays_the_backoff_level_gradually_instead_of_forgetting_it() 
         now += config.max_lockout; // past the current lockout
         let _ = tracker.reserve("k", now, &config);
     }
-    assert_eq!(tracker.entries["k"].level, 4);
+    assert_eq!(tracker.entry("k").unwrap().level, 4);
 
     now += config.max_lockout * 2; // one idle period
     assert!(
@@ -1292,7 +1294,7 @@ fn an_idle_period_decays_the_backoff_level_gradually_instead_of_forgetting_it() 
         "but not a fresh budget of max_failures guesses"
     );
     assert!(
-        tracker.entries["k"].level >= 3,
+        tracker.entry("k").unwrap().level >= 3,
         "level only decayed by one period"
     );
 }
@@ -1317,8 +1319,7 @@ fn an_entry_whose_lockout_expired_is_not_the_one_evicted_by_username_flooding() 
         );
     }
     let victim = tracker
-        .entries
-        .get("victim")
+        .entry("victim")
         .expect("the penalised entry survives the flood");
     assert_eq!(victim.level, 1);
     let later = after_lock + Duration::from_secs(1);
@@ -1434,7 +1435,7 @@ async fn service_updates_do_not_revert_a_concurrently_consumed_totp_step() {
         .modify_user(
             alice.id,
             Box::new(|user| {
-                user.totp_secret = Some("JBSWY3DPEHPK3PXP".to_string());
+                user.totp_secret = Some("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string());
                 user.totp_pending = true;
                 Ok(())
             }),
@@ -1518,6 +1519,8 @@ enum Interleave {
     /// On the next `get_user`: snapshot the user, run a refresh with this token to completion, then
     /// return the (now stale) snapshot.
     ReplayOnGetUser(String),
+    /// On the next `get_user_by_username`: snapshot, delete this user, return the snapshot.
+    DeleteOnLookup(UserId),
     /// On the next `get_user_by_username`: snapshot, change the password, return the snapshot.
     ChangePasswordOnLookup {
         user: UserId,
@@ -1562,13 +1565,21 @@ impl UserStore for InterleaveStore {
         let snapshot = self.inner.get_user_by_username(username).await?;
         let armed = {
             let mut hook = self.hook.lock().unwrap();
-            if matches!(*hook, Some(Interleave::ChangePasswordOnLookup { .. })) {
+            if matches!(
+                *hook,
+                Some(Interleave::ChangePasswordOnLookup { .. } | Interleave::DeleteOnLookup(_))
+            ) {
                 hook.take()
             } else {
                 None
             }
         };
-        if let Some(Interleave::ChangePasswordOnLookup { user, old, new }) = armed {
+        if let Some(Interleave::DeleteOnLookup(user)) = armed {
+            self.service()
+                .delete_user(user)
+                .await
+                .expect("the concurrent deletion succeeds");
+        } else if let Some(Interleave::ChangePasswordOnLookup { user, old, new }) = armed {
             self.service()
                 .update_password(user, &old, &new)
                 .await
@@ -1708,7 +1719,7 @@ fn modify_user_cannot_change_the_id_or_username() {
 }
 
 #[test]
-fn an_adaptive_flood_cannot_evict_a_penalised_victim() {
+fn an_adaptive_flood_of_invented_names_cannot_touch_a_penalised_account() {
     let config = LoginThrottleConfig {
         max_tracked: 100,
         ..LoginThrottleConfig::default()
@@ -1719,47 +1730,198 @@ fn an_adaptive_flood_cannot_evict_a_penalised_victim() {
     for _ in 0..5 {
         let _ = tracker.reserve_as("victim", true, origin, &config);
     }
-    // The attacker pushes invented names to a penalty to fill the table.
-    for index in 0..99 {
+    // The attacker pushes invented names to a penalty, then keeps flooding with new ones.
+    for index in 0..100_000u64 {
+        let at = origin + Duration::from_millis(index);
         for _ in 0..5 {
-            let _ = tracker.reserve_as(&format!("fake-{index}"), false, origin, &config);
+            let _ = tracker.reserve_as(&format!("fake-{index}"), false, at, &config);
         }
     }
-    assert_eq!(tracker.entries.len(), 100);
-
-    // Lockouts expire; the flood keeps coming with new invented names.
-    let later = origin + config.base_lockout + Duration::from_secs(1);
-    for index in 0..5_000u64 {
-        let admitted = tracker.reserve_as(
-            &format!("new-fake-{index}"),
-            false,
-            later + Duration::from_millis(index),
-            &config,
-        );
-        assert!(admitted.is_err(), "a full table turns invented names away");
-        assert!(tracker.entries.len() <= 100);
-    }
+    assert!(
+        tracker.unknown.len() <= 100,
+        "invented names are bounded: {}",
+        tracker.unknown.len()
+    );
     let victim = tracker
-        .entries
-        .get("victim")
+        .entry("victim")
         .expect("the victim's entry is never evicted by the flood");
     assert_eq!(victim.level, 1);
+
+    let later = origin + Duration::from_secs(200);
     assert!(tracker.reserve_as("victim", true, later, &config).is_ok());
     assert!(
         tracker.reserve_as("victim", true, later, &config).is_err(),
         "its count did not restart: one guess, then locked again"
     );
-
-    // A real account that has no entry yet is still admitted (displacing an invented one).
+    // Nothing is ever refused because of table pressure: an existing account is always admitted,
+    // and so is a new invented name (it just pushes an older invented one out).
     assert!(tracker.reserve_as("newcomer", true, later, &config).is_ok());
-    assert!(tracker.entries.contains_key("newcomer"));
-    assert!(tracker.entries.len() <= 100);
-
-    // Entries age out after their retention (a day of inactivity) and the table recovers.
-    let much_later = later + THROTTLE_DAY + Duration::from_secs(5);
     assert!(tracker
-        .reserve_as("fresh-after-a-day", false, much_later, &config)
+        .reserve_as("one-more-fake", false, later, &config)
         .is_ok());
+}
+
+#[tokio::test]
+async fn unknown_and_known_names_stay_indistinguishable_through_a_flood() {
+    let config = AuthnConfig {
+        login_throttle: LoginThrottleConfig {
+            max_tracked: 20,
+            ..LoginThrottleConfig::default()
+        },
+        ..fast_config()
+    };
+    let (service, _clock) = clocked_service(config);
+    service
+        .create_user("victim", "correct horse", Role::viewer())
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        wrong_login(&service, "victim").await;
+    }
+    // A flood of invented usernames, many times the table size.
+    for index in 0..400 {
+        let error = wrong_login(&service, &format!("ghost-{index}")).await;
+        assert!(
+            matches!(error, AuthError::InvalidCredentials),
+            "an invented name is answered exactly like a wrong password: {error:?}"
+        );
+    }
+    // A name that was never seen before, and a known account with a wrong password, look alike.
+    let unknown = wrong_login(&service, "never-seen-before").await;
+    let known = service
+        .login("victim", "also wrong", None)
+        .await
+        .expect_err("wrong password");
+    assert!(matches!(unknown, AuthError::InvalidCredentials));
+    assert!(matches!(known, AuthError::InvalidCredentials));
+    // The victim kept its count (4 + 1 = 5 failures -> locked now), and a legitimate account is
+    // admitted and can log in.
+    assert!(matches!(
+        service.login("victim", "correct horse", None).await,
+        Err(AuthError::TooManyAttempts { .. })
+    ));
+    service
+        .create_user("bystander", "correct horse", Role::viewer())
+        .await
+        .unwrap();
+    service
+        .login("bystander", "correct horse", None)
+        .await
+        .expect("an existing account is always admitted");
+}
+
+#[test]
+fn a_success_ends_the_streak_but_not_the_daily_total() {
+    let config = LoginThrottleConfig::default();
+    let mut now = Instant::now();
+    let mut tracker = AttemptTracker::default();
+    // 20 failures, spread so no short lockout stops them, with a success after every 4th.
+    let mut done = 0;
+    while done < 20 {
+        for _ in 0..4 {
+            assert!(tracker.reserve("target", now, &config).is_ok());
+            done += 1;
+        }
+        tracker.clear("target");
+        now += Duration::from_secs(1);
+    }
+    let entry = tracker.entry("target").unwrap();
+    assert_eq!(
+        (entry.failures, entry.level),
+        (0, 0),
+        "the streak restarted"
+    );
+    // One more failure is over the daily cap: the full lockout, despite the successes.
+    assert!(tracker.reserve("target", now, &config).is_ok());
+    let wait = tracker.reserve("target", now, &config).unwrap_err();
+    assert!(
+        wait >= config.max_lockout - Duration::from_secs(1),
+        "{wait:?}"
+    );
+}
+
+#[test]
+fn the_daily_window_slides_in_half_day_steps() {
+    let config = LoginThrottleConfig::default();
+    let origin = Instant::now();
+    let mut tracker = AttemptTracker::default();
+    let mut now = origin;
+    for _ in 0..20 {
+        let _ = tracker.reserve("k", now, &config);
+        tracker.clear("k"); // keep the short-term streak out of the way
+    }
+    // 13 hours on, the 20 failures are still counted (previous bucket): the next one is over.
+    now = origin + Duration::from_secs(13 * 3600);
+    let _ = tracker.reserve("k", now, &config);
+    assert!(
+        tracker.reserve("k", now, &config).is_err(),
+        "still over the cap"
+    );
+    // 25 hours on they have aged out completely.
+    let mut fresh = AttemptTracker::default();
+    for _ in 0..20 {
+        let _ = fresh.reserve("k", origin, &config);
+        fresh.clear("k");
+    }
+    let later = origin + Duration::from_secs(25 * 3600);
+    assert!(fresh.reserve("k", later, &config).is_ok());
+    assert!(
+        fresh.reserve("k", later, &config).is_ok(),
+        "a fresh window has its budget back"
+    );
+}
+
+#[tokio::test]
+async fn a_login_racing_a_user_deletion_gets_no_token() {
+    let (service, store) = interleave_service();
+    let alice = service
+        .create_user("alice", "correct horse", Role::editor())
+        .await
+        .unwrap();
+    *store.hook.lock().unwrap() = Some(Interleave::DeleteOnLookup(alice.id));
+    let result = service.login("alice", "correct horse", None).await;
+    assert!(result.is_err(), "no session for a deleted account");
+}
+
+#[test]
+fn totp_secrets_below_128_bits_are_refused() {
+    // 80 bits (16 base32 characters) is below the RFC 4226 minimum.
+    assert!(matches!(
+        normalize_totp_secret("JBSWY3DPEHPK3PXP"),
+        Err(AuthError::InvalidTotpSecret)
+    ));
+    // 128 bits (26 characters) is accepted, as is 160 bits.
+    assert!(normalize_totp_secret("jbswy3dpehpk3pxpjbswy3dpeh").is_ok());
+    assert_eq!(
+        normalize_totp_secret("JBSWY3DPEHPK3PXP JBSWY3DPEHPK3PXP==").unwrap(),
+        "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+    );
+}
+
+#[tokio::test]
+async fn an_active_secret_survives_without_a_code_and_gates_login() {
+    let store = MemoryUserStore::new();
+    let service = AuthnService::new(store.clone(), fast_config()).unwrap();
+    let user = service
+        .create_user("root", "correct horse", Role::admin())
+        .await
+        .unwrap();
+    service
+        .totp_activate_with_secret(user.id, "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP")
+        .await
+        .unwrap();
+    let stored = store.get_user(user.id).await.unwrap().unwrap();
+    assert!(stored.has_totp() && !stored.totp_pending);
+    assert!(matches!(
+        service.login("root", "correct horse", None).await,
+        Err(AuthError::InvalidTotpCode)
+    ));
+    assert!(matches!(
+        service
+            .totp_activate_with_secret(user.id, "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP")
+            .await,
+        Err(AuthError::TotpAlreadyEnabled)
+    ));
 }
 
 fn guesses_in_a_day(wait_out_the_idle_period: bool) -> u32 {
@@ -1855,17 +2017,20 @@ async fn an_operator_chosen_totp_secret_is_validated_and_enrols_like_setup() {
 
     // Spaces, padding and lowercase are tolerated; the stored form is canonical.
     service
-        .totp_setup_with_secret(user.id, "jbsw y3dp ehpk 3pxp====")
+        .totp_setup_with_secret(user.id, "jbsw y3dp ehpk 3pxp jbsw y3dp ehpk 3pxp====")
         .await
         .expect("a valid secret");
     let pending = store.get_user(user.id).await.unwrap().unwrap();
-    assert_eq!(pending.totp_secret.as_deref(), Some("JBSWY3DPEHPK3PXP"));
+    assert_eq!(
+        pending.totp_secret.as_deref(),
+        Some("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP")
+    );
     assert!(
         pending.totp_pending && !pending.has_totp(),
         "pending until confirmed"
     );
 
-    let code = totp_code(&decode("JBSWY3DPEHPK3PXP"), STEP);
+    let code = totp_code(&decode("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"), STEP);
     service
         .totp_confirm(user.id, &code)
         .await
@@ -1873,7 +2038,7 @@ async fn an_operator_chosen_totp_secret_is_validated_and_enrols_like_setup() {
     assert!(store.get_user(user.id).await.unwrap().unwrap().has_totp());
     assert!(matches!(
         service
-            .totp_setup_with_secret(user.id, "JBSWY3DPEHPK3PXP")
+            .totp_setup_with_secret(user.id, "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP")
             .await,
         Err(AuthError::TotpAlreadyEnabled)
     ));

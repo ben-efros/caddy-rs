@@ -29,7 +29,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -603,6 +603,9 @@ pub enum AuthError {
     /// The service configuration is unusable (weak or inconsistent parameters).
     #[error("invalid authentication configuration: {0}")]
     InvalidConfig(String),
+    /// An operator-supplied TOTP secret is not base32 of 16 to 64 bytes (128 bits minimum).
+    #[error("TOTP secret must be base32 (A-Z, 2-7) encoding at least 16 bytes (128 bits)")]
+    InvalidTotpSecret,
     /// A new password consists only of whitespace.
     #[error("password must not be blank")]
     PasswordBlank,
@@ -1305,8 +1308,11 @@ pub struct LoginThrottleConfig {
     pub base_lockout: Duration,
     /// Upper bound for the doubling lockout. Must be at least [`base_lockout`](Self::base_lockout).
     pub max_lockout: Duration,
-    /// Maximum number of usernames tracked at once. At the cap the least recently active entry is
-    /// evicted, so submitting made-up usernames cannot grow memory without bound.
+    /// Maximum number of **unknown** usernames (names with no account) tracked at once. Beyond it
+    /// the oldest unknown entry is dropped, so submitting made-up usernames cannot grow memory
+    /// without bound. Entries of existing accounts are held in a separate map that is bounded by
+    /// the number of accounts and is never evicted, so no flood of invented names can displace or
+    /// reset a real account's penalty, and nothing is ever refused merely because the table is full.
     pub max_tracked: usize,
 }
 
@@ -1358,14 +1364,14 @@ impl LoginThrottleConfig {
 /// `Instant` stops being meaningful and a lockout that long is an outage, not a throttle.
 const MAX_LOCKOUT_CEILING: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Rolling window over which failures are totalled, and how long an entry is retained after its
-/// last activity. Retention this long is what stops "wait for the entry to age out" from being a
-/// way to get a fresh budget.
+/// Length of the rolling window over which failures are totalled. It is tracked as two half-day
+/// buckets, so the failures counted are those of the last 12 to 24 hours.
 const THROTTLE_DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Failures tolerated per rolling [`THROTTLE_DAY`]; past this every further failure earns the full
-/// `max_lockout`, however long the key was idle in between. Bounds the guesses per key per day to
-/// roughly `THROTTLE_DAY_FAILURE_CAP + 24 h / max_lockout` (116 with the defaults).
+/// `max_lockout`, however long the key was idle in between and whether or not a success intervened.
+/// Bounds the guesses per key to roughly `THROTTLE_DAY_FAILURE_CAP + 24 h / max_lockout` a day (116
+/// with the defaults; up to twice the cap right at a bucket boundary).
 const THROTTLE_DAY_FAILURE_CAP: u32 = 20;
 
 /// Failure state for one throttle key.
@@ -1379,19 +1385,41 @@ struct AttemptEntry {
     level: u32,
     locked_until: Option<Instant>,
     last_activity: Instant,
-    /// Whether the key belongs to an account that exists. Only known keys may displace others.
-    known: bool,
-    /// Start of the rolling day this entry totals failures over.
-    day_start: Instant,
-    /// Failures reserved since `day_start`.
-    day_failures: u32,
+    /// Start of the current half-day bucket.
+    bucket_start: Instant,
+    /// Failures reserved in the current half-day bucket.
+    current_bucket: u32,
+    /// Failures reserved in the half-day bucket before it.
+    previous_bucket: u32,
 }
 
-/// Bounded map of failure counters shared by every clone of an [`AuthnService`].
+impl AttemptEntry {
+    fn new(now: Instant) -> Self {
+        Self {
+            failures: 0,
+            level: 0,
+            locked_until: None,
+            last_activity: now,
+            bucket_start: now,
+            current_bucket: 0,
+            previous_bucket: 0,
+        }
+    }
+}
+
+/// Failure counters shared by every clone of an [`AuthnService`].
+///
+/// Two maps, so that invented names can never touch real accounts: `known` holds keys of accounts
+/// that exist (bounded by the number of accounts, never evicted, never refused), `unknown` holds
+/// keys of names with no account and is capped at `max_tracked` with oldest-first eviction. Unknown
+/// names are still counted and locked exactly like known ones, which is what keeps the two
+/// externally indistinguishable.
 #[derive(Debug, Default)]
 struct AttemptTracker {
-    entries: HashMap<String, AttemptEntry>,
-    last_sweep: Option<Instant>,
+    known: HashMap<String, AttemptEntry>,
+    unknown: HashMap<String, AttemptEntry>,
+    /// Insertion order of `unknown`, for oldest-first eviction (may hold stale keys).
+    unknown_order: VecDeque<String>,
 }
 
 impl AttemptTracker {
@@ -1406,19 +1434,25 @@ impl AttemptTracker {
         self.reserve_as(key, true, now, config)
     }
 
-    /// Reserve one attempt for `key`, or report how long to wait.
+    /// The entry for `key`, whichever map holds it.
+    #[cfg(test)]
+    fn entry(&self, key: &str) -> Option<&AttemptEntry> {
+        self.known.get(key).or_else(|| self.unknown.get(key))
+    }
+
+    /// Number of tracked keys.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.known.len() + self.unknown.len()
+    }
+
+    /// Reserve one attempt for `key`, or report how long it stays locked.
     ///
     /// The attempt is counted *before* the credential is checked and stays counted unless the
     /// caller reports a success via [`clear`](Self::clear). Counting up front, under one lock, is
     /// what makes the budget hold under concurrency: parallel guesses cannot all observe "still
-    /// under the limit" and then each get a free verification.
-    ///
-    /// `known` says the key belongs to an account that exists. When the table is full a new key
-    /// is **never** admitted by evicting a penalised entry: an unknown key is turned away for
-    /// `base_lockout` (the table is under a flood of invented names), a known key may displace an
-    /// *unknown* entry, and when only known entries remain it is turned away too. Evicting would
-    /// let an adaptive attacker push thousands of invented names to a penalty, then evict the
-    /// victim's entry and restart its count.
+    /// under the limit" and then each get a free verification. `known` says the key belongs to an
+    /// account that exists; this never fails because of table pressure.
     fn reserve_as(
         &mut self,
         key: &str,
@@ -1430,50 +1464,65 @@ impl AttemptTracker {
         // failure count restarts, but the backoff level only decays by one per idle period, and an
         // entry that still has a level re-locks on its next failure.
         let idle_reset = config.max_lockout.saturating_mul(2);
-        if let Some(entry) = self.entries.get_mut(key) {
-            match entry.locked_until {
-                Some(until) if until > now => return Err(until - now),
-                Some(_) => entry.locked_until = None,
-                None => {}
-            }
-            let idle = now.saturating_duration_since(entry.last_activity);
-            if !idle_reset.is_zero() && idle >= idle_reset {
-                let periods = u32::try_from(idle.as_nanos() / idle_reset.as_nanos().max(1))
-                    .unwrap_or(u32::MAX);
-                entry.level = entry.level.saturating_sub(periods);
-                entry.failures = if entry.level > 0 {
-                    config.max_failures.saturating_sub(1)
-                } else {
-                    0
-                };
-            }
-            entry.known |= known;
+        let map = if known {
+            &mut self.known
         } else {
-            self.admit(known, now, config)?;
-            self.entries.insert(
-                key.to_string(),
-                AttemptEntry {
-                    failures: 0,
-                    level: 0,
-                    locked_until: None,
-                    last_activity: now,
-                    known,
-                    day_start: now,
-                    day_failures: 0,
-                },
-            );
+            &mut self.unknown
+        };
+        let mut inserted = false;
+        match map.get_mut(key) {
+            Some(entry) => {
+                match entry.locked_until {
+                    Some(until) if until > now => return Err(until - now),
+                    Some(_) => entry.locked_until = None,
+                    None => {}
+                }
+                let idle = now.saturating_duration_since(entry.last_activity);
+                if !idle_reset.is_zero() && idle >= idle_reset {
+                    let periods = u32::try_from(idle.as_nanos() / idle_reset.as_nanos().max(1))
+                        .unwrap_or(u32::MAX);
+                    entry.level = entry.level.saturating_sub(periods);
+                    entry.failures = if entry.level > 0 {
+                        config.max_failures.saturating_sub(1)
+                    } else {
+                        0
+                    };
+                }
+            }
+            None => {
+                map.insert(key.to_string(), AttemptEntry::new(now));
+                inserted = true;
+            }
         }
-        let Some(entry) = self.entries.get_mut(key) else {
+        if inserted && !known {
+            self.unknown_order.push_back(key.to_string());
+            self.trim_unknown(config.max_tracked);
+        }
+        let map = if known {
+            &mut self.known
+        } else {
+            &mut self.unknown
+        };
+        let Some(entry) = map.get_mut(key) else {
             return Ok(());
         };
         entry.last_activity = now;
-        if now.saturating_duration_since(entry.day_start) >= THROTTLE_DAY {
-            entry.day_start = now;
-            entry.day_failures = 0;
+        // Two half-day buckets make the 24 h total slide instead of resetting all at once.
+        let half = THROTTLE_DAY / 2;
+        let elapsed = now.saturating_duration_since(entry.bucket_start);
+        if elapsed >= THROTTLE_DAY {
+            entry.previous_bucket = 0;
+            entry.current_bucket = 0;
+            entry.bucket_start = now;
+        } else if elapsed >= half {
+            entry.previous_bucket = entry.current_bucket;
+            entry.current_bucket = 0;
+            entry.bucket_start = entry.bucket_start.checked_add(half).unwrap_or(now);
         }
-        entry.day_failures = entry.day_failures.saturating_add(1);
+        entry.current_bucket = entry.current_bucket.saturating_add(1);
         entry.failures = entry.failures.saturating_add(1);
-        let over_daily_cap = entry.day_failures > THROTTLE_DAY_FAILURE_CAP;
+        let over_daily_cap =
+            entry.previous_bucket.saturating_add(entry.current_bucket) > THROTTLE_DAY_FAILURE_CAP;
         if entry.failures >= config.max_failures || over_daily_cap {
             let lockout = if over_daily_cap {
                 config.max_lockout
@@ -1495,65 +1544,32 @@ impl AttemptTracker {
         Ok(())
     }
 
-    /// Make room for a new key, or say how long to turn it away. Never evicts a known entry and
-    /// never evicts an entry to admit an unknown key.
-    fn admit(
-        &mut self,
-        known: bool,
-        now: Instant,
-        config: &LoginThrottleConfig,
-    ) -> Result<(), Duration> {
-        if self.entries.len() < config.max_tracked {
-            return Ok(());
-        }
-        self.sweep(now);
-        if self.entries.len() < config.max_tracked {
-            return Ok(());
-        }
-        if known {
-            // Displace the least penalised *unknown* entry: invented names must not be able to
-            // keep real accounts from being tracked.
-            let victim = self
-                .entries
-                .iter()
-                .filter(|(_, entry)| !entry.known)
-                .min_by_key(|(_, entry)| {
-                    (
-                        entry.locked_until.is_some_and(|until| until > now),
-                        entry.level,
-                        entry.failures,
-                        entry.last_activity,
-                    )
-                })
-                .map(|(key, _)| key.clone());
-            if let Some(victim) = victim {
-                self.entries.remove(&victim);
-                return Ok(());
+    /// Drop the oldest unknown entries beyond `cap`.
+    fn trim_unknown(&mut self, cap: usize) {
+        while self.unknown.len() > cap {
+            match self.unknown_order.pop_front() {
+                Some(oldest) => {
+                    self.unknown.remove(&oldest);
+                }
+                None => break,
             }
         }
-        Err(config.base_lockout)
-    }
-
-    /// Drop entries whose retention (a full rolling day since their last activity, no lockout
-    /// running) has elapsed. At most once a second: a full table must not make every request an
-    /// O(n) scan.
-    fn sweep(&mut self, now: Instant) {
-        if self
-            .last_sweep
-            .is_some_and(|last| now.saturating_duration_since(last) < Duration::from_secs(1))
-        {
-            return;
+        if self.unknown_order.len() > cap.saturating_mul(2).saturating_add(16) {
+            let live = &self.unknown;
+            self.unknown_order.retain(|key| live.contains_key(key));
         }
-        self.last_sweep = Some(now);
-        self.entries.retain(|_, entry| {
-            entry.locked_until.is_some_and(|until| until > now)
-                || now.saturating_duration_since(entry.last_activity) < THROTTLE_DAY
-        });
     }
 
-    /// Forget `key`: a successful authentication ends the failure streak.
+    /// A successful authentication ends the *streak*: the failure count, the backoff level and any
+    /// lockout restart. The rolling 24 h total is deliberately kept, otherwise every legitimate
+    /// login would refund a paced guesser's budget.
     fn clear(&mut self, key: &str) {
-        self.entries.remove(key);
+        if let Some(entry) = self.known.get_mut(key) {
+            entry.failures = 0;
+            entry.level = 0;
+            entry.locked_until = None;
+        }
+        self.unknown.remove(key);
     }
 }
 
@@ -1829,11 +1845,11 @@ impl UserStore for MemoryUserStore {
         // Lock order users -> refresh_tokens. Holding the users guard across the insert makes the
         // epoch comparison and the insert one step with respect to `modify_user`.
         let users = self.users.read().await;
-        if users
-            .get(&record.user_id)
-            .is_some_and(|user| user.auth_epoch != record.epoch)
-        {
-            return Err(AuthError::RefreshTokenRevoked);
+        // A user that no longer exists (deleted while a login or refresh was in flight) gets no
+        // token either.
+        match users.get(&record.user_id) {
+            Some(user) if user.auth_epoch == record.epoch => {}
+            _ => return Err(AuthError::RefreshTokenRevoked),
         }
         let token_hash = record.token_hash.clone();
         self.refresh_tokens.write().await.insert(token_hash, record);
@@ -2078,6 +2094,23 @@ pub fn decode_totp_secret(secret: &str) -> Option<Vec<u8>> {
 /// replay rule.
 pub fn totp_code_for_step(secret: &str, step: u64) -> Option<String> {
     decode_totp_secret(secret).map(|bytes| totp_code(&bytes, step))
+}
+
+/// Canonical form of an operator-supplied base32 TOTP secret.
+///
+/// Whitespace and `=` padding are ignored and case is folded. The secret must decode to at least 16
+/// bytes (128 bits, the RFC 4226 minimum; 160 bits is recommended) and at most 64. The error never
+/// contains the secret.
+pub fn normalize_totp_secret(secret: &str) -> AuthResult<String> {
+    let normalized: String = secret
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '=')
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    match base32::decode(Alphabet::Rfc4648 { padding: false }, &normalized) {
+        Some(bytes) if (16..=64).contains(&bytes.len()) => Ok(normalized),
+        _ => Err(AuthError::InvalidTotpSecret),
+    }
 }
 
 /// The current TOTP time step for a Unix timestamp in seconds.
@@ -2433,30 +2466,46 @@ impl<S: UserStore> AuthnService<S> {
         )
     }
 
+    /// Enrol an operator-chosen secret as an *active* factor, with no code check.
+    ///
+    /// For unattended provisioning of a brand-new account only: the operator generated the secret
+    /// and added it to their authenticator, and supplying it is the proof of possession (it is
+    /// exactly as secret as the factor itself). Unlike [`totp_setup_with_secret`] it does not
+    /// leave the factor pending, so it can be applied on every start of a daemon whose user store
+    /// is rebuilt from the environment. Refused over an active factor.
+    ///
+    /// [`totp_setup_with_secret`]: Self::totp_setup_with_secret
+    pub async fn totp_activate_with_secret(&self, user_id: UserId, secret: &str) -> AuthResult<()> {
+        let normalized = normalize_totp_secret(secret)?;
+        self.store
+            .modify_user(
+                user_id,
+                Box::new(move |user| {
+                    if user.has_totp() {
+                        return Err(AuthError::TotpAlreadyEnabled);
+                    }
+                    user.totp_secret = Some(normalized);
+                    user.totp_pending = false;
+                    user.totp_pending_secret = None;
+                    user.totp_last_step = None;
+                    user.updated_at = Timestamp::now();
+                    Ok(())
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Begin first-time TOTP enrolment with an operator-chosen secret (base32, RFC 4648).
     ///
     /// For unattended provisioning only: the operator added the secret to their authenticator
     /// beforehand and proves it with [`totp_confirm`](Self::totp_confirm). Behaves like
     /// [`totp_setup`](Self::totp_setup) (pending until confirmed, refused over an active factor)
     /// except for where the secret comes from. The secret is validated (spaces and `=` padding are
-    /// ignored, case is folded, at least 80 bits and at most 512) and is never included in an
+    /// ignored, case is folded, at least 128 bits and at most 512) and is never included in an
     /// error or a log line.
     pub async fn totp_setup_with_secret(&self, user_id: UserId, secret: &str) -> AuthResult<()> {
-        let normalized: String = secret
-            .chars()
-            .filter(|c| !c.is_whitespace() && *c != '=')
-            .map(|c| c.to_ascii_uppercase())
-            .collect();
-        let decoded = base32::decode(Alphabet::Rfc4648 { padding: false }, &normalized);
-        match decoded {
-            Some(bytes) if (10..=64).contains(&bytes.len()) => {}
-            _ => {
-                return Err(AuthError::InvalidConfig(
-                    "TOTP secret must be base32 (A-Z, 2-7) encoding between 10 and 64 bytes"
-                        .to_string(),
-                ));
-            }
-        }
+        let normalized = normalize_totp_secret(secret)?;
         self.store
             .modify_user(
                 user_id,
