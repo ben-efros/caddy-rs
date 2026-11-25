@@ -1141,6 +1141,13 @@ struct TaggedCertificate {
 impl ResolverState {
     fn insert(&mut self, certificate: TlsCertificate) -> Result<()> {
         let certified = Arc::new(certificate.certified_key()?);
+        self.record(certificate, certified);
+        Ok(())
+    }
+
+    /// Register an already-built `certified` entry for `certificate`: default, tags, sources,
+    /// expiries and the names it covers.
+    fn record(&mut self, certificate: TlsCertificate, certified: Arc<CertifiedKey>) {
         // Entries that are no longer referenced by any name map are dropped from the expiry list.
         self.expiries
             .retain(|(candidate, _)| Arc::strong_count(candidate) > 1);
@@ -1175,10 +1182,7 @@ impl ResolverState {
         for name in certificate.names() {
             let key = normalize_server_name(name);
             if key.is_empty() {
-                return Err(Error::TlsConfig {
-                    path: "certificates".to_string(),
-                    message: "certificate contains an empty name".to_string(),
-                });
+                continue;
             }
             self.certificates
                 .insert(key.clone(), Arc::clone(&certified));
@@ -1186,7 +1190,6 @@ impl ResolverState {
                 self.names.push(key);
             }
         }
-        Ok(())
     }
 }
 
@@ -1361,29 +1364,47 @@ impl CertificateResolver {
         state.default.clone().map(|key| state.serve(key))
     }
 
-    /// Re-insert `certificate` (typically the same certificate with a fresh OCSP staple) only if
-    /// it is still what this resolver serves for every one of its names: a compare-and-swap on
-    /// the leaf. The OCSP refresh snapshots an entry, awaits a network fetch and then re-inserts;
-    /// a renewal that landed in between must not be undone by the stale snapshot. Returns whether
-    /// the certificate was installed.
+    /// Re-insert `certificate` (typically the same certificate with a fresh OCSP staple) for the
+    /// names that still resolve to the snapshotted leaf, leaving names already assigned to a
+    /// different certificate untouched. The OCSP refresh snapshots an entry, awaits a network
+    /// fetch and then re-inserts; a renewal (or a later certificate covering one of the names)
+    /// that landed in between must not be undone by the stale snapshot. Names that were removed
+    /// from the resolver in the meantime are not resurrected. Returns whether any name was
+    /// updated.
     pub fn replace_if_current(&self, certificate: TlsCertificate) -> Result<bool> {
         let mut state = self
             .state
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(leaf) = certificate.chain().first() else {
+        let Some(leaf) = certificate.chain().first().cloned() else {
             return Ok(false);
         };
-        let current = certificate.names().iter().all(|name| {
-            state
-                .certificates
-                .get(&normalize_server_name(name))
-                .is_some_and(|served| served.cert.first() == Some(leaf))
-        });
-        if !current {
+        // Names the stale snapshot may still claim: those still pointing at the same leaf.
+        let covered: Vec<String> = certificate
+            .names()
+            .iter()
+            .map(|name| normalize_server_name(name))
+            .filter(|name| {
+                state
+                    .certificates
+                    .get(name)
+                    .is_some_and(|served| served.cert.first() == Some(&leaf))
+            })
+            .collect();
+        if covered.is_empty() {
             return Ok(false);
         }
-        state.insert(certificate)?;
+        // Re-insert only the names still owned by the snapshot; every other name keeps the
+        // certificate it is currently assigned to.
+        let certified = Arc::new(certificate.certified_key()?);
+        for name in &covered {
+            state
+                .certificates
+                .insert(name.clone(), Arc::clone(&certified));
+        }
+        let mut kept = certificate;
+        kept.names = covered;
+        state.record(kept, certified);
         Ok(true)
     }
 }
@@ -5867,6 +5888,41 @@ mod tests {
     }
 
     #[test]
+    fn stale_staple_snapshot_updates_only_names_it_still_serves() {
+        // Certificate A covers a.example and b.example; a later certificate B takes over
+        // b.example only, so A stays the certificate served for a.example.
+        let a = example();
+        let b = other();
+        let a_names = vec!["a.example".to_string(), "b.example".to_string()];
+        let mut stapled_a = a.clone();
+        stapled_a.names = a_names.clone();
+        let mut stapled_b = b.clone();
+        stapled_b.names = vec!["b.example".to_string()];
+        let resolver = CertificateResolver::new();
+        resolver.insert(stapled_a).unwrap();
+        resolver.insert(stapled_b).unwrap();
+        assert_eq!(
+            resolver.select(Some("b.example")).unwrap().cert[0].as_ref(),
+            b.chain()[0].as_ref()
+        );
+        // The OCSP refresh snapshotted A before B was loaded; no renewal happened during the
+        // fetch, so A's staple must still be installed for the name it still serves.
+        let mut refreshed = a.clone();
+        refreshed.names = a_names;
+        let installed = resolver
+            .replace_if_current(refreshed.with_ocsp_staple(Some(vec![0x30, 0x00])))
+            .unwrap();
+        assert!(installed, "A must still receive its staple");
+        let served_a = resolver.select(Some("a.example")).expect("a.example");
+        assert_eq!(served_a.cert[0].as_ref(), a.chain()[0].as_ref());
+        assert_eq!(served_a.ocsp.as_deref(), Some(&[0x30, 0x00][..]));
+        // b.example keeps pointing at B, untouched by the stale snapshot.
+        let served_b = resolver.select(Some("b.example")).expect("b.example");
+        assert_eq!(served_b.cert[0].as_ref(), b.chain()[0].as_ref());
+        assert!(served_b.ocsp.is_none());
+        assert!(resolver.covers("a.example") && resolver.covers("b.example"));
+    }
+
     fn resolver_exposes_stapled_certificates() {
         let certificate = TlsCertificate::from_pem(
             include_str!("../testdata/https/example.com.pem"),
