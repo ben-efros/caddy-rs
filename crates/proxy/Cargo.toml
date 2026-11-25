@@ -11,6 +11,7 @@ repository.workspace = true
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
+caddy-rs-core = { workspace = true, default-features = false }
 caddy-rs-http = { workspace = true, default-features = false }
 http = { workspace = true }
 http-body-util = { workspace = true }

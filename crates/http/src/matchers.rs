@@ -987,29 +987,7 @@ impl IpRange {
     /// dual-stack) is also tried in its IPv4 form, so `203.0.113.0/24` matches
     /// `::ffff:203.0.113.5` (SEC-MEDIUM-PROXY review).
     pub fn contains(&self, address: IpAddr) -> bool {
-        self.contains_exact(address) || self.contains_exact(address.to_canonical())
-    }
-
-    fn contains_exact(&self, address: IpAddr) -> bool {
-        match (self.base, address) {
-            (IpAddr::V4(base), IpAddr::V4(address)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u32::MAX << (32 - self.prefix)
-                };
-                (u32::from(base) & mask) == (u32::from(address) & mask)
-            }
-            (IpAddr::V6(base), IpAddr::V6(address)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u128::MAX << (128 - self.prefix)
-                };
-                (u128::from(base) & mask) == (u128::from(address) & mask)
-            }
-            _ => false,
-        }
+        caddy_rs_core::net::ip_in_net(self.base, self.prefix, address)
     }
 }
 
@@ -3335,15 +3313,18 @@ mod matcher_network_tls_tests {
             request.remote_addr = Some("[::ffff:203.0.113.5]:1234".parse().unwrap());
             assert!(built.matches(&request), "{matcher}");
         }
-        let negated = build(
-            "not",
-            serde_json::json!([{"remote_ip": {"ranges": ["203.0.113.0/24"]}}]),
-        );
-        if let Ok(negated) = negated {
-            let mut request = make_request("/");
-            request.remote_addr = Some("[::ffff:203.0.113.5]:1234".parse().unwrap());
-            assert!(!negated.matches(&request), "deny must not be bypassed");
-        }
+        // The deny shape: `not remote_ip` must see the mapped IPv4 client as inside the range.
+        let negated = build_matcher_set(&serde_json::json!({
+            "not": [{"remote_ip": {"ranges": ["203.0.113.0/24"]}}]
+        }))
+        .expect("`not` matcher set builds");
+        assert_eq!(negated.len(), 1);
+        let mut request = make_request("/");
+        request.remote_addr = Some("[::ffff:203.0.113.5]:1234".parse().unwrap());
+        assert!(!negated[0].matches(&request), "deny must not be bypassed");
+        let mut outside = make_request("/");
+        outside.remote_addr = Some("[::ffff:198.51.100.5]:1234".parse().unwrap());
+        assert!(negated[0].matches(&outside));
     }
 
     #[test]

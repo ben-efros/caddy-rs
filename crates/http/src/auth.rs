@@ -190,29 +190,7 @@ impl Cidr {
     /// Whether `address` is in the range, also trying the IPv4-canonical form of an IPv4-mapped
     /// IPv6 peer (the default listener is dual-stack; SEC-MEDIUM-PROXY review).
     fn contains(&self, address: IpAddr) -> bool {
-        self.contains_exact(address) || self.contains_exact(address.to_canonical())
-    }
-
-    fn contains_exact(&self, address: IpAddr) -> bool {
-        match (self.base, address) {
-            (IpAddr::V4(base), IpAddr::V4(address)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u32::MAX << (32 - self.prefix)
-                };
-                (u32::from(base) & mask) == (u32::from(address) & mask)
-            }
-            (IpAddr::V6(base), IpAddr::V6(address)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u128::MAX << (128 - self.prefix)
-                };
-                (u128::from(base) & mask) == (u128::from(address) & mask)
-            }
-            _ => false,
-        }
+        caddy_rs_core::net::ip_in_net(self.base, self.prefix, address)
     }
 }
 

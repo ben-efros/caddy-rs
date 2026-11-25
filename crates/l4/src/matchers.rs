@@ -674,29 +674,7 @@ impl IpRange {
     /// `netip.Addr.Unmap()` (SEC-MEDIUM-PROXY C2). The raw spelling is still compared first, so a
     /// range that genuinely covers the mapped block (`::/0`) keeps matching.
     pub fn contains(&self, addr: IpAddr) -> bool {
-        self.contains_exact(addr) || self.contains_exact(addr.to_canonical())
-    }
-
-    fn contains_exact(&self, addr: IpAddr) -> bool {
-        match (self.network, addr) {
-            (IpAddr::V4(network), IpAddr::V4(addr)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u32::MAX << (32 - u32::from(self.prefix))
-                };
-                (u32::from(network) & mask) == (u32::from(addr) & mask)
-            }
-            (IpAddr::V6(network), IpAddr::V6(addr)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u128::MAX << (128 - u32::from(self.prefix))
-                };
-                (u128::from(network) & mask) == (u128::from(addr) & mask)
-            }
-            _ => false,
-        }
+        caddy_rs_core::net::ip_in_net(self.network, self.prefix, addr)
     }
 }
 

@@ -86,29 +86,7 @@ impl IpNet {
     /// (SEC-MEDIUM-PROXY C2). The raw spelling is compared first so a range that genuinely covers the
     /// mapped block (`::/0`) keeps matching.
     pub fn contains(&self, address: IpAddr) -> bool {
-        self.contains_exact(address) || self.contains_exact(address.to_canonical())
-    }
-
-    fn contains_exact(&self, address: IpAddr) -> bool {
-        match (self.network, address) {
-            (IpAddr::V4(network), IpAddr::V4(address)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u32::MAX << (32 - u32::from(self.prefix))
-                };
-                (u32::from(network) & mask) == (u32::from(address) & mask)
-            }
-            (IpAddr::V6(network), IpAddr::V6(address)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u128::MAX << (128 - u32::from(self.prefix))
-                };
-                (u128::from(network) & mask) == (u128::from(address) & mask)
-            }
-            _ => false,
-        }
+        caddy_rs_core::net::ip_in_net(self.network, self.prefix, address)
     }
 }
 

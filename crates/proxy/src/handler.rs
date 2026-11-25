@@ -320,25 +320,7 @@ impl IpNet {
     }
 
     fn contains(&self, address: IpAddr) -> bool {
-        match (self.address, address) {
-            (IpAddr::V4(network), IpAddr::V4(candidate)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u32::MAX << (32 - u32::from(self.prefix))
-                };
-                (u32::from(network) & mask) == (u32::from(candidate) & mask)
-            }
-            (IpAddr::V6(network), IpAddr::V6(candidate)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u128::MAX << (128 - u32::from(self.prefix))
-                };
-                (u128::from(network) & mask) == (u128::from(candidate) & mask)
-            }
-            _ => false,
-        }
+        caddy_rs_core::net::ip_in_net(self.address, self.prefix, address)
     }
 }
 
@@ -4309,6 +4291,18 @@ mod tests {
         assert_eq!(status_for(&stock, &echo).await, StatusCode::OK);
     }
 
+    /// Handler-level trusted-proxy ranges follow the shared mapped-address semantics.
+    #[test]
+    fn handler_ip_nets_match_mapped_spellings_both_ways() {
+        let plain = IpNet::parse("10.0.0.0/8").unwrap();
+        assert!(plain.contains("::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!plain.contains("::ffff:11.1.2.3".parse().unwrap()));
+        let mapped = IpNet::parse("::ffff:10.0.0.0/104").unwrap();
+        assert!(mapped.contains("10.1.2.3".parse().unwrap()));
+        assert!(mapped.contains("::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!mapped.contains("11.1.2.3".parse().unwrap()));
+    }
+
     /// `bad_gateway_body` runs once per failing request and the detail is client-influenced, so it
     /// must not write synchronously to stderr (log flood, blocking on a backpressured pipe).
     #[test]
@@ -4389,8 +4383,16 @@ mod tests {
     async fn placeholder_dials_are_guarded_only_when_request_derived() {
         let (broken, counter) = spawn_broken_upstream().await;
         let port = broken.rsplit_once(':').unwrap().1.to_string();
-        std::env::set_var("CADDY_RS_C3_BACKEND", &broken);
-        std::env::set_var("CADDY_RS_C3_PORT", &port);
+        {
+            // Serialise the process-environment writes (they race other readers otherwise); the
+            // variables are unique to this test and set before any request runs.
+            static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _guard = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::env::set_var("CADDY_RS_C3_BACKEND", &broken);
+            std::env::set_var("CADDY_RS_C3_PORT", &port);
+        }
         for (dial, request_derived) in [
             ("{env.CADDY_RS_C3_BACKEND}", false),
             ("127.0.0.1:{env.CADDY_RS_C3_PORT}", false),
@@ -4417,6 +4419,43 @@ mod tests {
                 usize::from(!request_derived),
                 "`{dial}` request_derived={request_derived}"
             );
+        }
+    }
+
+    /// `Replacer::get` only resolves `env.*` itself; `system.*`, `time.*` and `$VAR` fall through to
+    /// request variables, and a `vars` handler expands its KEYS from the request. So a client can
+    /// create a variable with one of those names (second-round review): only `env.*` may be treated
+    /// as operator-controlled.
+    #[tokio::test]
+    async fn vars_handler_cannot_smuggle_request_data_into_system_placeholders() {
+        use caddy_rs_http::Handler as _;
+        let vars = caddy_rs_http::VarsHandler::from_json(
+            &serde_json::json!({
+                "handler": "vars",
+                "{http.request.header.K}": "{http.request.header.V}"
+            }),
+            "vars",
+        )
+        .unwrap();
+        for (dial, name) in [
+            ("{system.hostname}", "system.hostname"),
+            ("{time.now.unix}", "time.now.unix"),
+            ("{$SMUGGLED}", "$SMUGGLED"),
+        ] {
+            let (broken, counter) = spawn_broken_upstream().await;
+            let handler = build_handler(serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": dial}]
+            }))
+            .with_dial_guard(true);
+            let mut request = get_request("/v", Some("203.0.113.7:5555"));
+            request.headers.insert("k", name.parse().unwrap());
+            request.headers.insert("v", broken.parse().unwrap());
+            let Outcome::Continue(request) = vars.handle(request).await.unwrap() else {
+                panic!("vars continues");
+            };
+            let _ = handler.handle(request).await;
+            assert_eq!(connections(&counter), 0, "`{dial}` reached loopback");
         }
     }
 

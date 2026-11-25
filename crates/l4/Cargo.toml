@@ -12,6 +12,7 @@ arc-swap = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 caddy-rs-admin = { workspace = true, default-features = false }
+caddy-rs-core = { workspace = true, default-features = false }
 caddy-rs-tls = { workspace = true, default-features = false }
 # The termination stage drives the acceptor the TLS layer builds; same crate/features as
 # caddy-rs-tls, so no second crypto backend is added.
