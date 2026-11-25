@@ -97,20 +97,21 @@ handler needs it buffered (item 1). The QUIC request stream is split; a reader t
 4-chunk bounded channel, so a slow handler applies QUIC flow-control backpressure and memory per
 upload is a few chunks regardless of size. `max_request_body_size` is enforced lazily as the body is
 read, and a declared `Content-Length` over it is refused up front. Closing the request stops the
-reader and asks the client to stop sending (`STOP_SENDING`, `H3_NO_ERROR`).
+reader and drops the stream, which makes quinn tell the client to stop sending (see the
+STOP_SENDING note below).
 
 **Request-body integrity and timeouts on HTTP/3 (aligned with stock).**
 
 - *Content-Length.* quic-go's request body enforces the declared length and resets the stream with
   `H3_MESSAGE_ERROR` when more data arrives than declared (`http3/body.go:44-57`). The h3 crate used
   here does not, so caddy-rs now counts the bytes: more than declared, or a stream that ends short
-  of the declared length, fails the body, resets the stream with `H3_MESSAGE_ERROR`, and the client
-  receives `400` (buffered path and streaming path alike).
+  of the declared length, fails the body and the client receives `400` (buffered path and streaming
+  path alike). Unlike quic-go, the stream is not reset with `H3_MESSAGE_ERROR` (see STOP_SENDING).
 - *Stalled uploads.* Stock Caddy aborts a request-body read that stalls for `read_idle_timeout`
   (default 1 minute, negative disables; `modules/caddyhttp/server.go:80`, enforced at `:593`). caddy-rs
   validated that field but never enforced it. It is now parsed into `ServerLimits.read_idle_timeout`
   with the same semantics and applied to HTTP/3 request bodies (together with `read_timeout`; the
-  shorter wins). On expiry the stream is told `H3_REQUEST_CANCELLED` and the client gets `408`.
+  shorter wins). On expiry the client gets `408`.
   HTTP/1.1 and HTTP/2 request bodies still rely on `read_timeout` only (existing `DIV-0029`); making
   `read_idle_timeout` effective there is not done here.
 - *Client is never told success for a failed upload.* If the body fails mid-stream (stall, length
@@ -126,25 +127,43 @@ reader and asks the client to stop sending (`STOP_SENDING`, `H3_NO_ERROR`).
   with `400` before any body is read (RFC 9114 section 4.1.2); equal repeated values count as one.
   The length check only sees data that arrives while the handler is still reading: a handler that
   finishes after exactly the declared number of bytes never observes surplus data sent later.
-- *STOP_SENDING.* When the handler drops an upload it is still being sent, the client is told
-  `H3_NO_ERROR` (RFC 9114 section 4.1). When the request ends, or a read times out, while a read is
-  pending the stream is only dropped, which makes quinn send code `0`: the h3-quinn glue panics if
-  `stop_sending` is called while a read is in flight (it holds the QUIC stream inside the pending
-  read future), and with the `panic = "abort"` release profile that would let any client kill the
-  process. A regression test records panics from spawned tasks because they do not fail the test that
-  provoked them.
+- *STOP_SENDING / reset codes (divergence).* When a request ends before its upload does, the stream
+  is dropped and quinn tells the client to stop sending with application error code `0`. quic-go
+  uses specific codes (`H3_MESSAGE_ERROR` on a length violation; RFC 9114 section 4.1 says
+  `H3_NO_ERROR` SHOULD be used for an early answer). caddy-rs cannot send them: h3-quinn's
+  `RecvStream::stop_sending` (and `recv_id`) `unwrap()` an `Option` that is `None` whenever a read is
+  in flight, and h3 also reads ahead after a data frame, so calling them panics intermittently — a
+  first version did, and with the `panic = "abort"` release profile that would let any client kill
+  the process. Reproduced as an intermittent panic in a full parallel test run, with a backtrace
+  into the body reader. The HTTP status the client sees (`400`/`408`) is unaffected. A unit test
+  asserts no code in `listeners.rs` calls those methods (the crash is timing dependent and a
+  regression test for it would be flaky), and a panic recorder fails the HTTP/3 tests if a spawned
+  task panics. Sending the right codes needs an h3-quinn fix or a wrapper around the receive stream.
 - *Late failures.* The "never tell the client success" replacement happens once, when the response
   headers are produced. A handler or upstream that sends response headers before the upload fails
   (full-duplex, or an early answer while the client keeps uploading) keeps its status; a later
   stall is not reported to the client. Trailers on a request body are discarded (as before).
 
+**Concurrency and shutdown on HTTP/3 (aligned with stock).** Requests on one QUIC connection used
+to be handled inline, one at a time, in the connection loop; a long or stalled request delayed every
+other request on that connection and the loop did not observe shutdown or force signals while a
+request ran. Each request stream now runs in its own task (quic-go: `wg.Go(HandleRequestStream)`).
+Graceful shutdown now drains. Each connection sends GOAWAY (`max_requests = 0`) and keeps polling
+`accept()` so a stream the client opened past it is rejected rather than left hanging, then waits
+for its in-flight requests; a force signal (second signal, or the grace period ending) aborts them.
+The listener keeps its endpoint open in a **detached** task that refuses new connections outright
+(clients fail fast instead of timing out on the handshake) until every connection has finished, then
+closes it. The UDP listener used to close the whole endpoint the moment a graceful shutdown began,
+which cut off every in-flight upload and download (HTTP/1 and HTTP/2 already drained). Because the
+drain is detached, a reload that removes a UDP listener applies immediately and does not wait for
+requests still in flight on it (a first version joined the drain and blocked the reload, and the
+shutdown/force signals, behind one stalled upload). The removed listener's UDP socket stays bound
+until its drain ends; a replacement listener on the same UDP port during that window would conflict
+(new listeners bind before old ones are removed, so this already applied to an address spelled
+differently).
+
 **Remaining divergences in the HTTP/3 request path.**
 
-- **Requests on one QUIC connection are handled one at a time** inside the connection loop, where
-  quic-go runs them concurrently (above). A long upload or download delays every other request on
-  the same QUIC connection, and the connection loop does not observe the shutdown/force signals
-  while a request is in progress. Pre-existing for responses; streaming makes it more visible for
-  uploads. Not changed here.
 - Protocol upgrades (WebSocket, extended CONNECT) are answered `501` instead of being tunnelled
   (existing `DIV-0004`).
 
@@ -155,13 +174,22 @@ checked, peak memory growth bounded), `http3_early_response_does_not_wait_for_th
 `http3_buffering_route_keeps_the_buffered_ceiling`,
 `http3_stalled_upload_is_cut_off_and_frees_the_connection`,
 `http3_content_length_mismatch_is_not_a_success`, `http3_malformed_content_length_is_a_400`,
-`http3_early_answer_with_the_upload_still_open_does_not_panic`, `listeners.rs`
+`http3_early_answer_with_the_upload_still_open_does_not_panic`,
+`http3_stalled_request_does_not_block_other_requests_on_the_connection`,
+`http3_graceful_shutdown_lets_an_in_flight_upload_finish`,
+`http3_forced_shutdown_aborts_an_in_flight_upload`,
+`http3_reload_removing_the_listener_does_not_wait_for_in_flight_requests`,
+`http3_draining_listener_refuses_new_streams_and_connections`,
+`http3_body_reader_survives_repeated_early_cancellation`, `listeners.rs`
+(`h3_stream_hazard_tests`),
 (`h3_declared_length_tests`), and `crates/server/src/limits.rs`
 (`read_idle_timeout_follows_caddys_semantics`).
 
-**Proposed register entry.** *HTTP/3 request bodies stream like HTTP/1.1/2 and stock Caddy; requests
-on one QUIC connection are not served concurrently (stock Caddy serves each stream in its own
-goroutine).* The second clause is the residual divergence and should be tracked for removal.
+**Proposed register entry.** *HTTP/3 request bodies stream like HTTP/1.1/2 and stock Caddy, each
+request stream is served concurrently, and graceful shutdown drains in-flight requests.* The only
+residual HTTP/3 request-path divergences are the `501` for protocol upgrades (`DIV-0004`), the
+read-idle timeout being per read rather than a total deadline, and request-body trailers being
+discarded.
 
 ## 3. `file_server` refuses Windows-only path forms
 
