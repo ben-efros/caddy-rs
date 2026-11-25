@@ -988,6 +988,21 @@ async fn enrol_and_confirm_bootstrap_totp(
     Ok(uri)
 }
 
+/// The one-time token `POST /auth/setup` must present, or `None` when an administrator already
+/// exists (setup then answers `409` and needs no token).
+///
+/// Called after [`bootstrap_admin`], so an installation bootstrapped from the environment gets no
+/// token. A store that cannot be read counts as "no administrator": requiring the token is the
+/// safe default, never skipping it.
+async fn issue_setup_token(store: &MemoryUserStore) -> Option<String> {
+    let has_administrator = store
+        .list_users()
+        .await
+        .map(|users| !users.is_empty())
+        .unwrap_or(false);
+    (!has_administrator).then(caddy_rs_authn::generate_setup_token)
+}
+
 async fn bootstrap_admin(
     authn: &AuthnService<MemoryUserStore>,
     store: &MemoryUserStore,
@@ -1111,9 +1126,22 @@ async fn serve(global: GlobalArgs, args: ServeArgs) -> Result<(), CliError> {
     // `ApiState::new` leaves the mutation gate fail-closed: after a restart, mutations answer 401
     // until `POST /auth/setup` (loopback-only) or the bootstrap environment variables recreate an
     // administrator. The loopback peer guard stays in place as defense in depth.
-    let state = ApiState::new(runtime, authn)
+    //
+    // With no administrator, first-run setup additionally requires a one-time token (printed once
+    // below). Without it, every restart (the user store is in memory) would let the first local
+    // caller, or a same-host reverse proxy sending `Host: localhost`, become administrator.
+    let mut state = ApiState::new(runtime, authn)
         .with_applier(applier)
         .with_inventory(inventory);
+    if let Some(setup_token) = issue_setup_token(&authn_store).await {
+        warn!(
+            setup_token = %setup_token,
+            "no administrator exists: POST /api/v1/auth/setup requires this token in the \
+             X-Setup-Token header (valid until the first administrator is created or the daemon \
+             restarts)"
+        );
+        state = state.with_setup_token(setup_token);
+    }
 
     // Build the router.
     let app = create_router(state);
@@ -2266,6 +2294,34 @@ mod tests {
         assert!(
             message.contains("0o640"),
             "the error names the observed mode: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_requires_a_token_only_while_no_administrator_exists() {
+        let dir = tempfile::tempdir().expect("create the test directory");
+        let store = MemoryUserStore::new();
+        let authn = boot_authn(&dir.path().join("data"), store.clone()).await;
+
+        // A fresh (or restarted) daemon has no administrator: setup is gated by a fresh token.
+        let first = issue_setup_token(&store).await.expect("a token is issued");
+        let second = issue_setup_token(&store).await.expect("a token is issued");
+        assert_eq!(first.len(), 52, "256 random bits, base32 encoded");
+        assert_ne!(first, second, "every start issues a new token");
+
+        // An environment-bootstrapped installation already has its administrator: no token.
+        bootstrap_admin(
+            &authn,
+            &store,
+            Some("admin@example.com"),
+            Some("correct horse battery staple"),
+            None,
+        )
+        .await
+        .expect("create the bootstrap admin");
+        assert!(
+            issue_setup_token(&store).await.is_none(),
+            "once an administrator exists setup needs no token (it answers 409)"
         );
     }
 
