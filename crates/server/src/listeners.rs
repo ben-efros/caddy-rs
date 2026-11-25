@@ -2666,7 +2666,7 @@ async fn serve_connection<I, S>(
 
     let mut io = TimedIo::new(io, limits.read_timeout, limits.write_timeout);
     if limits.read_timeout_scope == crate::limits::ReadTimeoutScope::BodyReads {
-        io = io.with_read_gate(Arc::clone(&activity));
+        io = io.with_read_gate(Arc::clone(&activity), limits.read_header_timeout);
     }
     let connection = builder.serve_connection_with_upgrades(TokioIo::new(io), service);
     tokio::pin!(connection);
@@ -2715,6 +2715,9 @@ struct ConnectionActivity {
     /// Request bodies currently being read. With [`ReadTimeoutScope::BodyReads`] the per-read
     /// timer runs only while this is non-zero.
     body_reads: AtomicUsize,
+    /// Requests started so far; lets the transport tell "the request this header timer was armed
+    /// for has begun" without racing a request that starts and ends between two polls.
+    started: std::sync::atomic::AtomicU64,
     notify: tokio::sync::Notify,
 }
 
@@ -2740,6 +2743,7 @@ impl ConnectionActivity {
 
     /// Mark the start of one request. The returned guard marks the end when dropped.
     fn begin(self: &Arc<Self>) -> InFlightGuard {
+        self.started.fetch_add(1, Ordering::AcqRel);
         self.in_flight.fetch_add(1, Ordering::AcqRel);
         self.notify.notify_one();
         InFlightGuard(Arc::clone(self))
@@ -2821,8 +2825,14 @@ struct TimedIo<I> {
     write_timeout: Option<Duration>,
     read_timer: Option<Pin<Box<tokio::time::Sleep>>>,
     write_timer: Option<Pin<Box<tokio::time::Sleep>>>,
-    /// When set, the read timer runs only while this connection is reading a request body.
+    /// When set, request-scoped read timers (see [`crate::limits::ReadTimeoutScope::BodyReads`]):
+    /// the per-read timer runs only while a request body is read, and a request whose first byte
+    /// arrived on an otherwise idle connection must deliver its headers within `head_budget`
+    /// in total (Go's `ReadHeaderTimeout`), however slowly the bytes trickle.
     read_gate: Option<Arc<ConnectionActivity>>,
+    head_budget: Option<Duration>,
+    /// The armed header timer and the `started` count it was armed at.
+    head_timer: Option<(Pin<Box<tokio::time::Sleep>>, u64)>,
 }
 
 impl<I> TimedIo<I> {
@@ -2834,11 +2844,14 @@ impl<I> TimedIo<I> {
             read_timer: None,
             write_timer: None,
             read_gate: None,
+            head_budget: None,
+            head_timer: None,
         }
     }
 
-    fn with_read_gate(mut self, gate: Arc<ConnectionActivity>) -> Self {
+    fn with_read_gate(mut self, gate: Arc<ConnectionActivity>, head_budget: Duration) -> Self {
         self.read_gate = Some(gate);
+        self.head_budget = Some(head_budget);
         self
     }
 }
@@ -2850,15 +2863,52 @@ impl<I: AsyncRead + Unpin> AsyncRead for TimedIo<I> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        let before = buf.filled().len();
         let result = Pin::new(&mut this.inner).poll_read(cx, buf);
-        let timeout = match &this.read_gate {
-            Some(gate) if !gate.reading_body() => {
-                this.read_timer = None;
-                None
-            }
-            _ => this.read_timeout,
+        let Some(gate) = this.read_gate.clone() else {
+            return apply_io_timeout(&mut this.read_timer, this.read_timeout, cx, result);
         };
-        apply_io_timeout(&mut this.read_timer, timeout, cx, result)
+        let started = gate.started.load(Ordering::Acquire);
+        // A request began since the header timer was armed (or one is running): its headers
+        // arrived, the timer has done its job.
+        if this
+            .head_timer
+            .as_ref()
+            .is_some_and(|(_, armed_at)| *armed_at != started)
+        {
+            this.head_timer = None;
+        }
+        // First byte of a new HTTP/1 request on an idle connection (a request method starts
+        // with a letter; HTTP/2 frames after the preface do not): start the header budget.
+        if let (Poll::Ready(Ok(())), Some(budget)) = (&result, this.head_budget) {
+            let first = buf.filled().get(before).copied();
+            if this.head_timer.is_none()
+                && gate.in_flight.load(Ordering::Acquire) == 0
+                && !gate.reading_body()
+                && first.is_some_and(|byte| byte.is_ascii_alphabetic())
+            {
+                this.head_timer = Some((Box::pin(tokio::time::sleep(budget)), started));
+            }
+        }
+        let timeout = if gate.reading_body() {
+            this.read_timeout
+        } else {
+            this.read_timer = None;
+            None
+        };
+        let mut result = apply_io_timeout(&mut this.read_timer, timeout, cx, result);
+        if result.is_pending() {
+            if let Some((timer, _)) = this.head_timer.as_mut() {
+                if timer.as_mut().poll(cx).is_ready() {
+                    this.head_timer = None;
+                    result = Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "request headers did not arrive within the header timeout",
+                    )));
+                }
+            }
+        }
+        result
     }
 }
 
@@ -2935,6 +2985,7 @@ struct AdminService {
 struct AdminBodySlots {
     total: Arc<tokio::sync::Semaphore>,
     per_peer: std::sync::Mutex<HashMap<String, usize>>,
+    per_peer_limit: usize,
 }
 
 /// One claimed upload slot; released on drop.
@@ -2945,10 +2996,21 @@ struct BodySlot {
 }
 
 impl AdminBodySlots {
+    /// Upload slots: [`ADMIN_MAX_CONCURRENT_BODIES`] / [`ADMIN_MAX_BODIES_PER_PEER`].
     fn new() -> Arc<Self> {
+        Self::with_limits(ADMIN_MAX_CONCURRENT_BODIES, ADMIN_MAX_BODIES_PER_PEER)
+    }
+
+    /// Connection slots: [`ADMIN_MAX_CONNECTIONS`] / [`ADMIN_MAX_CONNECTIONS_PER_PEER`].
+    fn for_connections() -> Arc<Self> {
+        Self::with_limits(ADMIN_MAX_CONNECTIONS, ADMIN_MAX_CONNECTIONS_PER_PEER)
+    }
+
+    fn with_limits(total: usize, per_peer_limit: usize) -> Arc<Self> {
         Arc::new(Self {
-            total: Arc::new(tokio::sync::Semaphore::new(ADMIN_MAX_CONCURRENT_BODIES)),
+            total: Arc::new(tokio::sync::Semaphore::new(total)),
             per_peer: std::sync::Mutex::new(HashMap::new()),
+            per_peer_limit,
         })
     }
 
@@ -2957,7 +3019,7 @@ impl AdminBodySlots {
         {
             let mut per_peer = self.per_peer.lock().unwrap_or_else(|e| e.into_inner());
             let held = per_peer.entry(peer.to_string()).or_insert(0);
-            if *held >= ADMIN_MAX_BODIES_PER_PEER {
+            if *held >= self.per_peer_limit {
                 return None;
             }
             *held += 1;
@@ -3046,6 +3108,23 @@ pub(crate) const ADMIN_MAX_CONCURRENT_BODIES: usize = 4;
 /// Of those, the most one peer (remote address, or certificate for the mTLS listener) may hold, so
 /// a client that stalls its uploads cannot take every slot and starve authorised callers.
 pub(crate) const ADMIN_MAX_BODIES_PER_PEER: usize = 2;
+
+/// Connections one admin listener keeps open at once (stock Caddy has no cap). File descriptors
+/// are process-wide, so unbounded admin connections could starve the public listeners.
+pub(crate) const ADMIN_MAX_CONNECTIONS: usize = 128;
+
+/// Of those, the most one peer may hold.
+pub(crate) const ADMIN_MAX_CONNECTIONS_PER_PEER: usize = 32;
+
+/// The fairness key of a TCP peer. Every loopback address is one principal: 127.0.0.0/8 is all
+/// local, so a per-address limit would be moot (a local process can bind any 127.x source).
+fn admin_peer_key(ip: std::net::IpAddr) -> String {
+    if ip.is_loopback() {
+        "loopback".to_string()
+    } else {
+        format!("addr:{ip}")
+    }
+}
 
 /// The body cap for the next admin request: [`ADMIN_MAX_BODY_BYTES`], or none when the active
 /// generation sets `stock_compat true`.
@@ -3689,6 +3768,7 @@ async fn bind_admin_unix(
         identity,
     };
     let body_slots = AdminBodySlots::new();
+    let conn_slots = AdminBodySlots::for_connections();
     let task = tokio::spawn(async move {
         let _cleanup = cleanup;
         loop {
@@ -3705,6 +3785,9 @@ async fn bind_admin_unix(
                 }
                 accepted = listener.accept() => {
                     let Ok((stream, _peer)) = accepted else { continue };
+                    // Past the per-listener (or per-peer) connection cap the connection is
+                    // refused by dropping it.
+                    let Some(conn_slot) = conn_slots.try_acquire("unix") else { continue };
                     let mut connection_shutdown = receiver.clone();
                     let mut connection_force = force_receiver.clone();
                     let tracked = loop_tracker.guard();
@@ -3717,6 +3800,7 @@ async fn bind_admin_unix(
                     };
                     tokio::spawn(async move {
                         let _tracked = tracked;
+                        let _conn_slot = conn_slot;
                         let limits = Arc::new(ServerLimits::admin());
                         // Go's ReadHeaderTimeout runs from accept; hyper's protocol sniffing does
                         // not start it until the first byte, so bound a silent connection here.
@@ -3803,6 +3887,7 @@ pub(crate) async fn bind_admin_with(
     let tracker = Arc::new(ConnectionTracker::default());
     let loop_tracker = Arc::clone(&tracker);
     let body_slots = AdminBodySlots::new();
+    let conn_slots = AdminBodySlots::for_connections();
     let task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -3818,6 +3903,8 @@ pub(crate) async fn bind_admin_with(
                 }
                 accepted = listener.accept() => {
                     let Ok((stream, peer_addr)) = accepted else { continue };
+                    let peer = admin_peer_key(peer_addr.ip());
+                    let Some(conn_slot) = conn_slots.try_acquire(&peer) else { continue };
                     let api = api.clone();
                     let mut connection_shutdown = receiver.clone();
                     let mut connection_force = force_receiver.clone();
@@ -3826,10 +3913,11 @@ pub(crate) async fn bind_admin_with(
                         api,
                         body_slots: Arc::clone(&body_slots),
                         activity: Arc::new(ConnectionActivity::default()),
-                        peer: format!("addr:{}", peer_addr.ip()),
+                        peer,
                     };
                     tokio::spawn(async move {
                         let _tracked = tracked;
+                        let _conn_slot = conn_slot;
                         let limits = Arc::new(ServerLimits::admin());
                         // See the Unix listener: bound a connection that never sends a byte.
                         let Some(stream) = admit_first_byte(
@@ -4003,6 +4091,7 @@ pub(crate) async fn bind_admin_remote(
     let tracker = Arc::new(ConnectionTracker::default());
     let loop_tracker = Arc::clone(&tracker);
     let body_slots = AdminBodySlots::new();
+    let conn_slots = AdminBodySlots::for_connections();
     let task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -4018,6 +4107,8 @@ pub(crate) async fn bind_admin_remote(
                 }
                 accepted = listener.accept() => {
                     let Ok((stream, peer_addr)) = accepted else { continue };
+                    let Some(conn_slot) =
+                        conn_slots.try_acquire(&admin_peer_key(peer_addr.ip())) else { continue };
                     let api = api.clone();
                     let acceptor = acceptor.clone();
                     let mut connection_shutdown = receiver.clone();
@@ -4026,6 +4117,7 @@ pub(crate) async fn bind_admin_remote(
                     let body_slots = Arc::clone(&body_slots);
                     tokio::spawn(async move {
                         let _tracked = tracked;
+                        let _conn_slot = conn_slot;
                         let limits = Arc::new(ServerLimits::admin());
                         // Mandatory mutual TLS: a missing or untrusted client certificate fails
                         // here and the connection is dropped before any admin request is parsed.
@@ -4058,7 +4150,7 @@ pub(crate) async fn bind_admin_remote(
                             caddy_rs_admin::ClientIdentity::Verified(client) => {
                                 format!("cert:{}:{}", client.issuer, client.serial)
                             }
-                            _ => format!("addr:{}", peer_addr.ip()),
+                            _ => admin_peer_key(peer_addr.ip()),
                         };
                         let activity = Arc::new(ConnectionActivity::default());
                         let service = {
@@ -5201,27 +5293,94 @@ mod admin_limits_tests {
             eventually_503("127.0.0.1", address).await,
             "a third upload from the same peer must be refused"
         );
-        // ... leave the other peers' share alone.
-        assert_ne!(
-            probe_status("127.0.0.2", address).await,
-            503,
-            "another peer is not starved by the first"
+        // 127.0.0.0/8 is all local: every loopback source is the same principal, so another
+        // loopback address does not get a fresh share (a per-address limit would be moot).
+        assert!(
+            eventually_503("127.0.0.2", address).await,
+            "loopback aliases share one principal's limit"
         );
         handle.stop().await;
     }
 
+    #[test]
+    fn loopback_peers_are_one_principal_and_other_addresses_are_distinct() {
+        use super::admin_peer_key;
+        let key = |text: &str| admin_peer_key(text.parse().unwrap());
+        assert_eq!(key("127.0.0.1"), key("127.9.9.9"));
+        assert_eq!(key("127.0.0.1"), key("::1"));
+        assert_ne!(key("192.0.2.1"), key("192.0.2.2"));
+        assert_ne!(key("192.0.2.1"), key("127.0.0.1"));
+    }
+
+    /// Connections are capped per peer (and per listener): fd exhaustion is process-wide, so
+    /// unbounded admin connections could starve the public listeners. Silent connections hold
+    /// their slot through the 5 s first-byte gate, so over-cap ones are visibly refused at once.
     #[tokio::test]
-    async fn the_global_upload_budget_still_applies_across_peers() {
+    async fn connections_beyond_the_per_peer_cap_are_refused_at_once() {
         let (handle, address) = listener().await;
-        let _holders = [
-            hold_slot("127.0.0.1", address).await,
-            hold_slot("127.0.0.1", address).await,
-            hold_slot("127.0.0.2", address).await,
-            hold_slot("127.0.0.2", address).await,
-        ];
+        let mut held = Vec::new();
+        for _ in 0..super::ADMIN_MAX_CONNECTIONS_PER_PEER {
+            held.push(TcpStream::connect(address).await.expect("connect"));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut extra = TcpStream::connect(address).await.expect("connect");
+        let mut buffer = [0_u8; 8];
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), extra.read(&mut buffer)).await;
         assert!(
-            eventually_503("127.0.0.3", address).await,
-            "with every slot busy a new peer is refused too"
+            matches!(outcome, Ok(Ok(0)) | Ok(Err(_))),
+            "the connection past the cap must be dropped immediately, not after the 5 s gate \
+             ({:?}, {outcome:?})",
+            started.elapsed()
+        );
+        drop(held);
+        handle.stop().await;
+    }
+
+    #[test]
+    fn the_listener_wide_cap_applies_across_peers() {
+        let slots = super::AdminBodySlots::with_limits(3, 2);
+        let _a = [slots.try_acquire("a").unwrap(), slots.try_acquire("a").unwrap()];
+        let _b = slots.try_acquire("b").unwrap();
+        assert!(slots.try_acquire("c").is_none(), "listener-wide cap");
+        assert!(slots.try_acquire("a").is_none(), "per-peer cap");
+    }
+
+    /// A request whose headers trickle in must finish them within the 5 s header budget in total
+    /// (Go's `ReadHeaderTimeout`), even on a keep-alive connection that already served a request:
+    /// the 60 s budget is for the idle wait *between* requests only.
+    #[tokio::test]
+    async fn a_trickled_request_header_is_cut_off_after_the_header_budget() {
+        let (handle, address) = listener().await;
+        let mut stream = TcpStream::connect(address).await.expect("connect");
+        let request = b"GET /config/ HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        stream.write_all(request).await.unwrap();
+        let mut buffer = [0_u8; 4096];
+        let read = stream.read(&mut buffer).await.expect("first response");
+        assert!(buffer[..read].starts_with(b"HTTP/1.1 200"));
+        // The second request: one byte a second, never finishing its headers.
+        let started = Instant::now();
+        let closed = async {
+            for byte in b"GET /config/ HTTP/1.1\r\nHost: loc" {
+                if stream.write_all(&[*byte]).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let mut probe = [0_u8; 64];
+                if let Ok(Ok(0)) | Ok(Err(_)) =
+                    tokio::time::timeout(Duration::from_millis(10), stream.read(&mut probe)).await
+                {
+                    return;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(9), closed)
+            .await
+            .expect("a trickling request must be closed within about 5 s");
+        assert!(
+            started.elapsed() >= Duration::from_secs(4),
+            "not cut off early: {:?}",
+            started.elapsed()
         );
         handle.stop().await;
     }
