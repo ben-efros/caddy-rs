@@ -43,26 +43,35 @@ jobs:
       # upstream advisory added overnight could fail (or clear) this gate with no change here.
       # Refreshing the database is a reviewed commit, not an ambient CI side effect.
       #
-      # `--no-fetch` has one visible side effect that is NOT a failure: cargo-audit still tries to
-      # answer "is this version yanked?" by reading the crates.io index, and with no network that
-      # lookup fails once per dependency, so the log fills with
+      # EXPLICIT, LOAD-BEARING FLAG, not an oversight: `--no-yanked` stops cargo-audit from trying
+      # to answer "is this version yanked?" against the crates.io index. `--no-fetch` leaves it with
+      # no index to read, so that lookup fails once per locked crate -- 440 lines of
       #   error: couldn't check if the package is yanked: not found: No such crate in crates.io
-      # index: <crate>
-      # Those lines are diagnostics, not findings: they do not affect the exit status, and the
-      # advisory verdict below them is computed entirely from the vendored database. They are left
-      # in place rather than silenced, because silencing them (`2>/dev/null`, or dropping
-      # `--deny warnings`) would also hide the real verdict. Read the tail of the log -- the
-      # authoritative output is the RUSTSEC block, and the job fails on the exit status, not on the
-      # yank lines. If a yank check ever becomes load-bearing, the fix is to run this job without
-      # `--no-fetch` in a network-enabled step, not to filter the log.
+      #   index: <crate>
+      # on a 468-crate lockfile, against a gate whose real output is a handful of RUSTSEC lines.
+      # The alternatives were worse. Letting cargo-audit reach the network to restore the check
+      # reintroduces the ambient-CI dependency T-CI-002 removed -- the verdict would depend on
+      # crates.io state nobody reviewed. Passing `--ignore` for each crate silences the message
+      # without silencing the cause, and would need editing on every dependency change.
+      #
+      # WHAT THIS COSTS, stated plainly so nobody later assumes otherwise: **yanked-crate status is
+      # not covered by this gate.** A crate yanked on crates.io will not fail this job. Everything
+      # else cargo-audit checks -- vulnerabilities, unmaintained, unsound -- still gates, because
+      # `--deny warnings` is unchanged. If yanked detection is wanted back, it needs a crates.io
+      # index available offline (a vendored index snapshot, the way .cargo/advisory-db is vendored)
+      # and that is a separate task, not a flag flip.
+      #
+      # Note that the deny-list above still names "yanked" as a gating advisory class; that line
+      # describes cargo-audit's `unmaintained`/`unsound` grouping, and the check it refers to is
+      # the one this flag turns off. Do not read it as evidence that yanks are still covered.
       - name: RustSec advisory check (vendored database, no network)
-        run: cargo audit --file Cargo.lock --deny warnings --db .cargo/advisory-db --no-fetch
+        run: cargo audit --file Cargo.lock --deny warnings --db .cargo/advisory-db --no-fetch --no-yanked
       # A snapshot that silently stopped being loaded would make the gate vacuous, so prove it was
       # read: cargo-audit reports the advisory count from the --db path, and it must be non-zero.
       - name: Vendored advisory database was actually loaded
         run: |
           set -Eeuo pipefail
-          out="$(cargo audit --file Cargo.lock --db .cargo/advisory-db --no-fetch 2>&1)"
+          out="$(cargo audit --file Cargo.lock --db .cargo/advisory-db --no-fetch --no-yanked 2>&1)"
           echo "$out"
           grep -q 'Loaded [1-9][0-9]* security advisories (from .*\.cargo/advisory-db)' <<<"$out" \
             || { echo "::error::the vendored advisory database was not loaded"; exit 1; }
