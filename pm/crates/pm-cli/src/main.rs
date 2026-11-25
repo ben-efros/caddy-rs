@@ -25,6 +25,7 @@ use clap::{Parser, Subcommand};
 use reqwest::Client;
 use sd_notify::NotifyState;
 use serde::Deserialize;
+use std::io::IsTerminal as _;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::signal;
@@ -651,7 +652,10 @@ async fn main() {
         // operator the URI to retry with), and the URI embeds the secret. The structured log gets
         // the redacted text; the full text, URI included, goes only to the operator's stderr.
         error!(err = %redact_totp_secrets(&err.to_string()), "fatal error");
-        eprintln!("error: {err}");
+        eprintln!(
+            "error: {}",
+            fatal_error_text(&err.to_string(), std::io::stderr().is_terminal())
+        );
         std::process::exit(1);
     }
 }
@@ -1001,21 +1005,80 @@ async fn enrol_and_confirm_bootstrap_totp(
     Ok(uri)
 }
 
+/// File (inside the data directory) that receives the bootstrap TOTP enrolment URI when there is
+/// no terminal to show it on.
+const BOOTSTRAP_TOTP_URI_FILE: &str = "bootstrap-totp-uri.txt";
+
 /// Tell the operator the bootstrap TOTP enrolment URI, once.
 ///
-/// The URI embeds the TOTP secret, so it must not travel through the structured log: log lines are
-/// shipped to aggregators, retained, and readable by far more people than the operator who has to
-/// scan the code. It is written to `out` (the process's stderr, i.e. the operator's terminal or
-/// the service manager's capture of it) and only a non-secret line is logged. Under systemd stderr
-/// still reaches the journal, so a deployment that cannot allow that should enrol TOTP through
-/// `POST /auth/totp/setup` instead of `PM_BOOTSTRAP_ADMIN_TOTP`.
-fn announce_bootstrap_totp(out: &mut impl std::io::Write, totp_uri: &str) {
-    warn!("bootstrap admin TOTP enrolled; the enrolment URI was printed to stderr (not logged)");
-    // A failed write to stderr is not worth failing startup over; the factor is already confirmed.
-    let _ = writeln!(
-        out,
-        "bootstrap admin TOTP enrolled; scan this enrolment URI to keep receiving codes:\n{totp_uri}"
+/// The URI embeds the TOTP secret, so it must reach the structured log never, and any captured
+/// output stream only when a human is watching it:
+///
+/// - `out_is_terminal`: the URI is written to `out` (stderr on the operator's terminal).
+/// - otherwise (a service manager: under systemd both stdout and stderr go to the journal, which is
+///   exactly the retained, shared sink to avoid) it is written to an owner-only (0600) file under
+///   `data_dir` and only that path is logged. The operator scans it and deletes the file.
+///
+/// Returns where the URI went. An error means the operator was *not* given the URI (the factor is
+/// already confirmed, so startup must fail loudly rather than leave an unscannable secret).
+fn announce_bootstrap_totp(
+    out: &mut impl std::io::Write,
+    out_is_terminal: bool,
+    data_dir: &Path,
+    totp_uri: &str,
+) -> std::io::Result<Option<PathBuf>> {
+    if out_is_terminal {
+        warn!("bootstrap admin TOTP enrolled; the enrolment URI was printed to the terminal");
+        writeln!(
+            out,
+            "bootstrap admin TOTP enrolled; scan this enrolment URI to keep receiving codes:\n{totp_uri}"
+        )?;
+        return Ok(None);
+    }
+    let path = data_dir.join(BOOTSTRAP_TOTP_URI_FILE);
+    write_owner_only(&path, totp_uri)?;
+    warn!(
+        path = %path.display(),
+        "bootstrap admin TOTP enrolled; the enrolment URI was written to this owner-only file \
+         (not logged): scan it, then delete the file"
     );
+    Ok(Some(path))
+}
+
+/// Write `content` to `path` readable by the owner only, also when the file already existed with
+/// looser permissions.
+fn write_owner_only(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(0o600);
+        let mut file = options.open(path)?;
+        // `mode` only applies when the file is created.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(content.as_bytes())?;
+        file.write_all(b"\n")
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = options.open(path)?;
+        file.write_all(content.as_bytes())?;
+        file.write_all(b"\n")
+    }
+}
+
+/// The text shown to the operator for a fatal error: the full message only on a terminal. A
+/// rejected bootstrap TOTP code puts the enrolment URI in the message, and a non-terminal stderr
+/// (the journal under systemd) must not receive the secret. A fresh start enrols a fresh secret,
+/// so the redacted text loses nothing the operator could use.
+fn fatal_error_text(message: &str, stderr_is_terminal: bool) -> String {
+    if stderr_is_terminal {
+        message.to_owned()
+    } else {
+        redact_totp_secrets(message)
+    }
 }
 
 /// Replace the value of every `secret=` query parameter (as in an `otpauth://` URI) with
@@ -1081,8 +1144,13 @@ async fn bootstrap_admin(
     let user = authn
         .create_user(email.to_owned(), password, caddy_rs_authn::Role::admin())
         .await
-        .map_err(|error| {
-            CliError::InvalidArg(format!("failed to create bootstrap admin: {error}"))
+        .map_err(|error| match error {
+            // Name the setting: the operator only sees this message in the failed unit's log.
+            caddy_rs_authn::AuthError::PasswordTooShort { .. }
+            | caddy_rs_authn::AuthError::PasswordTooLong { .. } => CliError::InvalidArg(format!(
+                "PM_BOOTSTRAP_ADMIN_PASSWORD is not acceptable: {error}"
+            )),
+            other => CliError::InvalidArg(format!("failed to create bootstrap admin: {other}")),
         })?;
 
     let totp_uri = match totp_code {
@@ -1164,7 +1232,9 @@ async fn serve(global: GlobalArgs, args: ServeArgs) -> Result<(), CliError> {
     )
     .await?
     {
-        announce_bootstrap_totp(&mut std::io::stderr(), &totp_uri);
+        let mut stderr = std::io::stderr();
+        let is_terminal = stderr.is_terminal();
+        announce_bootstrap_totp(&mut stderr, is_terminal, &global.data_dir, &totp_uri)?;
     }
 
     info!(
@@ -2606,9 +2676,16 @@ mod tests {
             .with_ansi(false)
             .finish();
         let mut stderr = Vec::new();
+        let dir = tempfile::tempdir().expect("create the test directory");
         tracing::subscriber::with_default(subscriber, || {
-            announce_bootstrap_totp(&mut stderr, SECRET_URI);
+            let placed = announce_bootstrap_totp(&mut stderr, true, dir.path(), SECRET_URI)
+                .expect("announce");
+            assert_eq!(placed, None, "a terminal is shown the URI directly");
         });
+        assert!(
+            !dir.path().join(BOOTSTRAP_TOTP_URI_FILE).exists(),
+            "nothing is left on disk when a terminal showed it"
+        );
 
         let printed = String::from_utf8(stderr).expect("utf-8 output");
         assert!(
@@ -2623,6 +2700,84 @@ mod tests {
         assert!(
             !logged.contains("JBSWY3DPEHPK3PXP") && !logged.contains("otpauth://"),
             "the secret must not reach the log: {logged}"
+        );
+    }
+
+    #[test]
+    fn without_a_terminal_the_uri_goes_to_an_owner_only_file_and_nowhere_else() {
+        let log = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish();
+        let dir = tempfile::tempdir().expect("create the test directory");
+        let mut captured_stderr = Vec::new();
+        let placed = tracing::subscriber::with_default(subscriber, || {
+            announce_bootstrap_totp(&mut captured_stderr, false, dir.path(), SECRET_URI)
+        })
+        .expect("announce")
+        .expect("a path is reported");
+
+        assert!(
+            captured_stderr.is_empty(),
+            "stderr is the journal under systemd; nothing may be written to it"
+        );
+        assert_eq!(placed, dir.path().join(BOOTSTRAP_TOTP_URI_FILE));
+        let content = std::fs::read_to_string(&placed).expect("read the file");
+        assert!(content.contains(SECRET_URI));
+        let logged = log.text();
+        assert!(
+            logged.contains(BOOTSTRAP_TOTP_URI_FILE),
+            "the path is logged: {logged}"
+        );
+        assert!(
+            !logged.contains("JBSWY3DPEHPK3PXP") && !logged.contains("otpauth://"),
+            "the secret must not reach the log: {logged}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&placed).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+            // A leftover world-readable file is tightened, not reused as is.
+            std::fs::set_permissions(&placed, std::fs::Permissions::from_mode(0o644)).unwrap();
+            announce_bootstrap_totp(&mut Vec::new(), false, dir.path(), SECRET_URI).unwrap();
+            let mode = std::fs::metadata(&placed).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn a_failure_to_place_the_uri_is_reported_not_swallowed() {
+        let dir = tempfile::tempdir().expect("create the test directory");
+        let missing = dir.path().join("no-such-dir");
+        assert!(announce_bootstrap_totp(&mut Vec::new(), false, &missing, SECRET_URI).is_err());
+    }
+
+    #[test]
+    fn the_fatal_error_shown_without_a_terminal_carries_no_secret() {
+        let message = format!("bootstrap TOTP code rejected: x; URI: {SECRET_URI}");
+        assert!(fatal_error_text(&message, true).contains("JBSWY3DPEHPK3PXP"));
+        let plain = fatal_error_text(&message, false);
+        assert!(!plain.contains("JBSWY3DPEHPK3PXP"), "{plain}");
+        assert!(plain.contains("bootstrap TOTP code rejected"));
+    }
+
+    #[tokio::test]
+    async fn a_too_short_bootstrap_password_fails_startup_naming_the_setting() {
+        let dir = tempfile::tempdir().expect("create the test directory");
+        let store = MemoryUserStore::new();
+        let authn = boot_authn(&dir.path().join("data"), store.clone()).await;
+
+        let error = bootstrap_admin(&authn, &store, Some("admin@example.com"), Some("a"), None)
+            .await
+            .expect_err("a one-character password must be refused");
+        let message = error.to_string();
+        assert!(message.contains("PM_BOOTSTRAP_ADMIN_PASSWORD"), "{message}");
+        assert!(message.contains("at least 8"), "{message}");
+        assert!(
+            store.list_users().await.unwrap().is_empty(),
+            "nothing was created"
         );
     }
 
