@@ -25,7 +25,6 @@ use clap::{Parser, Subcommand};
 use reqwest::Client;
 use sd_notify::NotifyState;
 use serde::Deserialize;
-use std::io::IsTerminal as _;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::signal;
@@ -259,8 +258,9 @@ fn write_bootstrap_env_file(
     path: &Path,
     password: Option<&str>,
     totp: Option<&str>,
+    totp_secret: Option<&str>,
 ) -> anyhow::Result<()> {
-    if password.is_none() && totp.is_none() {
+    if password.is_none() && totp.is_none() && totp_secret.is_none() {
         if path.exists() {
             std::fs::remove_file(path)
                 .with_context(|| format!("failed to remove {}", path.display()))?;
@@ -281,6 +281,9 @@ fn write_bootstrap_env_file(
     }
     if let Some(totp) = totp {
         content.push_str(&format!("PM_BOOTSTRAP_ADMIN_TOTP={totp}\n"));
+    }
+    if let Some(secret) = totp_secret {
+        content.push_str(&format!("PM_BOOTSTRAP_ADMIN_TOTP_SECRET={secret}\n"));
     }
 
     write_private_file(path, &content)?;
@@ -413,8 +416,18 @@ struct GlobalArgs {
     bootstrap_admin_password: Option<String>,
 
     /// Optional TOTP code for bootstrap admin (if 2FA desired immediately).
+    ///
+    /// A *current code* for the secret in `PM_BOOTSTRAP_ADMIN_TOTP_SECRET`; must be set together
+    /// with it.
     #[arg(long, env = "PM_BOOTSTRAP_ADMIN_TOTP")]
     bootstrap_admin_totp: Option<String>,
+
+    /// Base32 TOTP secret for the bootstrap admin, already added to the operator's authenticator.
+    ///
+    /// Requires `PM_BOOTSTRAP_ADMIN_TOTP`. Without a pre-shared secret, enrol through
+    /// `POST /api/v1/auth/totp/setup` after the first login instead.
+    #[arg(long, env = "PM_BOOTSTRAP_ADMIN_TOTP_SECRET")]
+    bootstrap_admin_totp_secret: Option<String>,
 }
 
 /// Subcommands.
@@ -648,14 +661,8 @@ async fn main() {
     }
 
     if let Err(err) = run(cli).await {
-        // The error text can carry a TOTP enrolment URI (a rejected bootstrap code hands the
-        // operator the URI to retry with), and the URI embeds the secret. The structured log gets
-        // the redacted text; the full text, URI included, goes only to the operator's stderr.
-        error!(err = %redact_totp_secrets(&err.to_string()), "fatal error");
-        eprintln!(
-            "error: {}",
-            fatal_error_text(&err.to_string(), std::io::stderr().is_terminal())
-        );
+        // No error text carries a TOTP secret (enrolment errors name the setting, not the value).
+        error!(%err, "fatal error");
         std::process::exit(1);
     }
 }
@@ -750,7 +757,8 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             });
             let env_file = Path::new(CADDY_RS_PM_ENV_PATH);
             let has_credentials = cli.global.bootstrap_admin_password.is_some()
-                || cli.global.bootstrap_admin_totp.is_some();
+                || cli.global.bootstrap_admin_totp.is_some()
+                || cli.global.bootstrap_admin_totp_secret.is_some();
             // Before the unit is written: a unit that names an account or a writable directory
             // which does not exist fails to start with a generic 217/USER or 226/NAMESPACE that
             // does not mention the missing prerequisite. Creating them here is what makes
@@ -783,6 +791,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 env_file,
                 cli.global.bootstrap_admin_password.as_deref(),
                 cli.global.bootstrap_admin_totp.as_deref(),
+                cli.global.bootstrap_admin_totp_secret.as_deref(),
             )?;
             Ok(())
         }
@@ -797,7 +806,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             });
             uninstall_pm_unit(Path::new(CADDY_RS_PM_UNIT_PATH), &content, force)?;
             // The unit is gone, so its credentials must not outlive it.
-            write_bootstrap_env_file(Path::new(CADDY_RS_PM_ENV_PATH), None, None)?;
+            write_bootstrap_env_file(Path::new(CADDY_RS_PM_ENV_PATH), None, None, None)?;
             Ok(())
         }
     }
@@ -958,37 +967,37 @@ fn ensure_service_prerequisites(
     Ok(())
 }
 
-/// Create the initial administrator from `PM_BOOTSTRAP_ADMIN_*`.
+/// Shown when `PM_BOOTSTRAP_ADMIN_TOTP` and `PM_BOOTSTRAP_ADMIN_TOTP_SECRET` are not set together.
 ///
-/// A no-op unless both the email and the password are configured, and a no-op when any user
-/// already exists (the store is the source of truth, never the environment). The optional TOTP
-/// code enables TOTP on the new account and proves the seed before the daemon starts serving.
-/// Enrol a TOTP secret for the bootstrap admin and prove possession of it.
+/// A TOTP code can only be proven against a secret the operator already holds. The daemon used to
+/// mint a fresh random secret on every start and ask for a code for it in advance, which nobody can
+/// supply (about one chance in a million), so that mode could never succeed.
+const BOOTSTRAP_TOTP_PAIR_HELP: &str =
+    "PM_BOOTSTRAP_ADMIN_TOTP (a current code) and PM_BOOTSTRAP_ADMIN_TOTP_SECRET (the base32 secret \
+     it was generated from, already added to your authenticator) must be set together; a code \
+     cannot be proven against a secret the daemon generates at start. To enrol a second factor \
+     without a pre-shared secret, leave both unset and call POST /api/v1/auth/totp/setup after \
+     the first login";
+
+/// Enrol the operator's TOTP secret for the bootstrap admin and prove possession of it.
 ///
-/// T-AUTH-002: this used to be an inline `totp_verify` call on a user with no enrolled secret, which
-/// can only ever fail with `TotpNotConfigured`, so every deployment that set
-/// `PM_BOOTSTRAP_ADMIN_TOTP` failed to start.
-///
-/// Enrolment comes first because possession cannot be proven against a secret that does not exist
-/// yet. `totp_setup` leaves the secret *pending*, so until `totp_confirm` succeeds the factor does
-/// not gate login: an abandoned bootstrap cannot lock the operator out of an account whose secret
-/// they never scanned.
-///
-/// On a rejected code the admin created by the caller is rolled back rather than left behind with an
-/// unconfirmed factor, and the returned error carries the enrolment URI so the operator can retry
-/// with a fresh code. Returns the enrolment URI on success.
+/// `totp_setup_with_secret` leaves the secret *pending*, so until `totp_confirm` succeeds the factor
+/// does not gate login: an abandoned bootstrap cannot lock the operator out. On any failure the admin
+/// created by the caller is rolled back rather than left behind with an unconfirmed factor. The
+/// secret never appears in an error or a log line.
 async fn enrol_and_confirm_bootstrap_totp(
     authn: &AuthnService<MemoryUserStore>,
     user_id: caddy_rs_authn::UserId,
+    totp_secret: &str,
     totp_code: &str,
-) -> Result<String, CliError> {
-    let (_secret, uri) = authn.totp_setup(user_id).await.map_err(|error| {
-        CliError::InvalidArg(format!("failed to enrol bootstrap TOTP: {error}"))
-    })?;
-    if let Err(error) = authn.totp_confirm(user_id, totp_code).await {
-        // Report which of the two outcomes actually happened rather than assuming the rollback
-        // worked: leaving an administrator with an unconfirmed secret is a security problem the
-        // operator has to act on.
+) -> Result<(), CliError> {
+    let outcome = match authn.totp_setup_with_secret(user_id, totp_secret).await {
+        Ok(()) => authn.totp_confirm(user_id, totp_code).await.map(|_user| ()),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = outcome {
+        // Report which outcome actually happened rather than assuming the rollback worked:
+        // leaving an administrator with an unconfirmed secret is a security problem.
         let rollback = match authn.delete_user(user_id).await {
             Ok(()) => "the bootstrap admin was removed".to_string(),
             Err(delete_error) => format!(
@@ -997,108 +1006,13 @@ async fn enrol_and_confirm_bootstrap_totp(
             ),
         };
         return Err(CliError::InvalidArg(format!(
-            "bootstrap TOTP code rejected: {error}; {rollback}. Re-run with a fresh code from the \
-             authenticator for this enrolment URI: {uri}"
+            "bootstrap TOTP enrolment failed: {error}; {rollback}. Check that \
+             PM_BOOTSTRAP_ADMIN_TOTP_SECRET is the secret in your authenticator and that \
+             PM_BOOTSTRAP_ADMIN_TOTP is a code it currently shows"
         )));
     }
     info!("bootstrap admin TOTP enrolled and confirmed");
-    Ok(uri)
-}
-
-/// File (inside the data directory) that receives the bootstrap TOTP enrolment URI when there is
-/// no terminal to show it on.
-const BOOTSTRAP_TOTP_URI_FILE: &str = "bootstrap-totp-uri.txt";
-
-/// Tell the operator the bootstrap TOTP enrolment URI, once.
-///
-/// The URI embeds the TOTP secret, so it must reach the structured log never, and any captured
-/// output stream only when a human is watching it:
-///
-/// - `out_is_terminal`: the URI is written to `out` (stderr on the operator's terminal).
-/// - otherwise (a service manager: under systemd both stdout and stderr go to the journal, which is
-///   exactly the retained, shared sink to avoid) it is written to an owner-only (0600) file under
-///   `data_dir` and only that path is logged. The operator scans it and deletes the file.
-///
-/// Returns where the URI went. An error means the operator was *not* given the URI (the factor is
-/// already confirmed, so startup must fail loudly rather than leave an unscannable secret).
-fn announce_bootstrap_totp(
-    out: &mut impl std::io::Write,
-    out_is_terminal: bool,
-    data_dir: &Path,
-    totp_uri: &str,
-) -> std::io::Result<Option<PathBuf>> {
-    if out_is_terminal {
-        warn!("bootstrap admin TOTP enrolled; the enrolment URI was printed to the terminal");
-        writeln!(
-            out,
-            "bootstrap admin TOTP enrolled; scan this enrolment URI to keep receiving codes:\n{totp_uri}"
-        )?;
-        return Ok(None);
-    }
-    let path = data_dir.join(BOOTSTRAP_TOTP_URI_FILE);
-    write_owner_only(&path, totp_uri)?;
-    warn!(
-        path = %path.display(),
-        "bootstrap admin TOTP enrolled; the enrolment URI was written to this owner-only file \
-         (not logged): scan it, then delete the file"
-    );
-    Ok(Some(path))
-}
-
-/// Write `content` to `path` readable by the owner only, also when the file already existed with
-/// looser permissions.
-fn write_owner_only(path: &Path, content: &str) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        options.mode(0o600);
-        let mut file = options.open(path)?;
-        // `mode` only applies when the file is created.
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        file.write_all(content.as_bytes())?;
-        file.write_all(b"\n")
-    }
-    #[cfg(not(unix))]
-    {
-        let mut file = options.open(path)?;
-        file.write_all(content.as_bytes())?;
-        file.write_all(b"\n")
-    }
-}
-
-/// The text shown to the operator for a fatal error: the full message only on a terminal. A
-/// rejected bootstrap TOTP code puts the enrolment URI in the message, and a non-terminal stderr
-/// (the journal under systemd) must not receive the secret. A fresh start enrols a fresh secret,
-/// so the redacted text loses nothing the operator could use.
-fn fatal_error_text(message: &str, stderr_is_terminal: bool) -> String {
-    if stderr_is_terminal {
-        message.to_owned()
-    } else {
-        redact_totp_secrets(message)
-    }
-}
-
-/// Replace the value of every `secret=` query parameter (as in an `otpauth://` URI) with
-/// `[redacted]`, so text that may embed an enrolment URI can be logged safely.
-fn redact_totp_secrets(text: &str) -> String {
-    const KEY: &str = "secret=";
-    let mut redacted = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(position) = rest.find(KEY) {
-        let value_start = position + KEY.len();
-        redacted.push_str(&rest[..value_start]);
-        redacted.push_str("[redacted]");
-        let value = &rest[value_start..];
-        let value_len = value
-            .find(|c: char| c == '&' || c.is_whitespace() || c == '"' || c == '\'')
-            .unwrap_or(value.len());
-        rest = &value[value_len..];
-    }
-    redacted.push_str(rest);
-    redacted
+    Ok(())
 }
 
 /// The bootstrap-credential flags present in `args` (flag names only, never values).
@@ -1108,7 +1022,11 @@ fn redact_totp_secrets(text: &str) -> String {
 /// owner-only environment file that `install` writes. The flags still work (removing them would
 /// break existing invocations); `main` warns when one is used.
 fn secret_flags_on_command_line(args: impl IntoIterator<Item = String>) -> Vec<&'static str> {
-    const SECRET_FLAGS: [&str; 2] = ["--bootstrap-admin-password", "--bootstrap-admin-totp"];
+    const SECRET_FLAGS: [&str; 3] = [
+        "--bootstrap-admin-password",
+        "--bootstrap-admin-totp",
+        "--bootstrap-admin-totp-secret",
+    ];
     let mut found = Vec::new();
     for arg in args {
         for flag in SECRET_FLAGS {
@@ -1129,15 +1047,22 @@ async fn bootstrap_admin(
     store: &MemoryUserStore,
     email: Option<&str>,
     password: Option<&str>,
+    totp_secret: Option<&str>,
     totp_code: Option<&str>,
-) -> Result<Option<String>, CliError> {
+) -> Result<(), CliError> {
     let (Some(email), Some(password)) = (email, password) else {
-        return Ok(None);
+        return Ok(());
+    };
+    // Settings that cannot work are refused before anything is created.
+    let totp = match (totp_secret, totp_code) {
+        (None, None) => None,
+        (Some(secret), Some(code)) => Some((secret, code)),
+        _ => return Err(CliError::InvalidArg(BOOTSTRAP_TOTP_PAIR_HELP.to_owned())),
     };
     info!(email = %email, "checking for bootstrap admin setup");
     if !store.list_users().await?.is_empty() {
         info!("users already exist, skipping bootstrap admin creation");
-        return Ok(None);
+        return Ok(());
     }
 
     info!("no users found, creating bootstrap admin user");
@@ -1147,16 +1072,16 @@ async fn bootstrap_admin(
         .map_err(|error| match error {
             // Name the setting: the operator only sees this message in the failed unit's log.
             caddy_rs_authn::AuthError::PasswordTooShort { .. }
+            | caddy_rs_authn::AuthError::PasswordBlank
             | caddy_rs_authn::AuthError::PasswordTooLong { .. } => CliError::InvalidArg(format!(
                 "PM_BOOTSTRAP_ADMIN_PASSWORD is not acceptable: {error}"
             )),
             other => CliError::InvalidArg(format!("failed to create bootstrap admin: {other}")),
         })?;
 
-    let totp_uri = match totp_code {
-        Some(code) => Some(enrol_and_confirm_bootstrap_totp(authn, user.id, code).await?),
-        None => None,
-    };
+    if let Some((secret, code)) = totp {
+        enrol_and_confirm_bootstrap_totp(authn, user.id, secret, code).await?;
+    }
 
     // The session endpoints read this store, so the admin can log in immediately; the store is
     // still in-memory until PM-109, so the environment recreates it on every start.
@@ -1164,7 +1089,7 @@ async fn bootstrap_admin(
         "bootstrap admin created in the in-memory user store; it is recreated from this \
          environment on every start until PM-109 (persistent users) lands"
     );
-    Ok(totp_uri)
+    Ok(())
 }
 
 async fn serve(global: GlobalArgs, args: ServeArgs) -> Result<(), CliError> {
@@ -1223,19 +1148,15 @@ async fn serve(global: GlobalArgs, args: ServeArgs) -> Result<(), CliError> {
     let authn = AuthnService::new(authn_store.clone(), authn_config)?;
 
     // Bootstrap admin user if environment variables are set.
-    if let Some(totp_uri) = bootstrap_admin(
+    bootstrap_admin(
         &authn,
         &authn_store,
         global.bootstrap_admin_email.as_deref(),
         global.bootstrap_admin_password.as_deref(),
+        global.bootstrap_admin_totp_secret.as_deref(),
         global.bootstrap_admin_totp.as_deref(),
     )
-    .await?
-    {
-        let mut stderr = std::io::stderr();
-        let is_terminal = stderr.is_terminal();
-        announce_bootstrap_totp(&mut stderr, is_terminal, &global.data_dir, &totp_uri)?;
-    }
+    .await?;
 
     info!(
         env_override,
@@ -2244,8 +2165,13 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create the test directory");
         let path = dir.join("caddy-rs-pm.env");
 
-        write_bootstrap_env_file(&path, Some("hunter2"), Some("123456"))
-            .expect("write the environment file");
+        write_bootstrap_env_file(
+            &path,
+            Some("hunter2"),
+            Some("123456"),
+            Some("JBSWY3DPEHPK3PXP"),
+        )
+        .expect("write the environment file");
         let mode = std::fs::metadata(&path)
             .expect("the environment file exists")
             .permissions()
@@ -2255,9 +2181,10 @@ mod tests {
         let content = std::fs::read_to_string(&path).expect("read the environment file");
         assert!(content.contains("PM_BOOTSTRAP_ADMIN_PASSWORD=hunter2"));
         assert!(content.contains("PM_BOOTSTRAP_ADMIN_TOTP=123456"));
+        assert!(content.contains("PM_BOOTSTRAP_ADMIN_TOTP_SECRET=JBSWY3DPEHPK3PXP"));
 
         // Installing without credentials must not leave a stale password behind.
-        write_bootstrap_env_file(&path, None, None).expect("remove the environment file");
+        write_bootstrap_env_file(&path, None, None, None).expect("remove the environment file");
         assert!(!path.exists(), "a stale credentials file must be removed");
 
         std::fs::remove_dir_all(&dir).expect("remove the test directory");
@@ -2414,19 +2341,16 @@ mod tests {
         let store = MemoryUserStore::new();
         let authn = boot_authn(&data_dir, store.clone()).await;
 
-        let totp_uri = bootstrap_admin(
+        bootstrap_admin(
             &authn,
             &store,
             Some("admin@example.com"),
             Some("correct horse battery staple"),
             None,
+            None,
         )
         .await
         .expect("create the bootstrap admin");
-        assert!(
-            totp_uri.is_none(),
-            "no TOTP code was supplied, so no enrolment URI is produced"
-        );
 
         let users = authn.list_users().await.expect("list users");
         assert_eq!(users.len(), 1);
@@ -2447,13 +2371,14 @@ mod tests {
             Some("other@example.com"),
             Some("another strong password"),
             None,
+            None,
         )
         .await
         .expect("skip the second bootstrap");
         assert_eq!(authn.list_users().await.expect("list users").len(), 1);
 
         // No credentials configured is a no-op.
-        bootstrap_admin(&authn, &store, None, None, None)
+        bootstrap_admin(&authn, &store, None, None, None, None)
             .await
             .expect("no bootstrap credentials");
         assert_eq!(authn.list_users().await.expect("list users").len(), 1);
@@ -2466,53 +2391,6 @@ mod tests {
             .expect("clock is after the epoch")
             .as_secs();
         caddy_rs_authn::totp_step_at(now)
-    }
-
-    #[tokio::test]
-    async fn enrol_and_confirm_enrols_before_checking_the_code_and_rolls_back_on_rejection() {
-        // T-AUTH-002: the bug was that possession was checked BEFORE a secret existed, so this
-        // success path was unreachable and no deployment could use PM_BOOTSTRAP_ADMIN_TOTP. The
-        // helper is the exact sequence the bootstrap runs, so testing it covers the fixed branch.
-        //
-        // The helper mints its own secret, so a valid code cannot be computed before the call. What
-        // this test pins is the ORDERING that was the bug: enrolment must happen before the code is
-        // checked, and a rejection must roll the admin back. The positive case is the test below.
-        let dir = tempfile::tempdir().expect("create the test directory");
-        let data_dir = dir.path().join("data");
-        let store = MemoryUserStore::new();
-        let authn = boot_authn(&data_dir, store.clone()).await;
-        let user = authn
-            .create_user(
-                "admin@example.com".to_owned(),
-                "correct horse battery staple",
-                caddy_rs_authn::Role::admin(),
-            )
-            .await
-            .expect("create the admin");
-
-        // A valid code requires the helper's own secret, which it does not reveal until it succeeds.
-        // Assert the failure is specifically the CODE (not enrolment), which is what proves the
-        // secret was enrolled before the code was checked.
-        let error = enrol_and_confirm_bootstrap_totp(&authn, user.id, "000000")
-            .await
-            .expect_err("a wrong code cannot prove possession");
-        let message = error.to_string();
-        assert!(
-            !message.contains("failed to enrol"),
-            "enrolment must succeed before the code is checked, got: {message}"
-        );
-        assert!(
-            message.contains("bootstrap TOTP code rejected"),
-            "the failure must be the code check, got: {message}"
-        );
-        assert!(
-            message.contains("otpauth://totp/"),
-            "the error must hand the operator the enrolment URI, got: {message}"
-        );
-        assert!(
-            store.list_users().await.expect("list users").is_empty(),
-            "the rejected admin is rolled back, not left with an unconfirmed factor"
-        );
     }
 
     #[tokio::test]
@@ -2562,36 +2440,79 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn bootstrap_admin_with_a_bad_totp_code_rolls_the_admin_back() {
-        let dir = tempfile::tempdir().expect("create the test directory");
-        let data_dir = dir.path().join("data");
-        let store = MemoryUserStore::new();
-        let authn = boot_authn(&data_dir, store.clone()).await;
+    const OPERATOR_SECRET: &str = "JBSWY3DPEHPK3PXP";
 
-        let error = bootstrap_admin(
+    async fn totp_bootstrap(
+        secret: Option<&str>,
+        code: Option<&str>,
+    ) -> (Result<(), CliError>, MemoryUserStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("create the test directory");
+        let store = MemoryUserStore::new();
+        let authn = boot_authn(&dir.path().join("data"), store.clone()).await;
+        let result = bootstrap_admin(
             &authn,
             &store,
             Some("admin@example.com"),
             Some("correct horse battery staple"),
-            Some("000000"),
+            secret,
+            code,
         )
-        .await
-        .expect_err("a code that cannot be proven must fail the bootstrap");
+        .await;
+        (result, store, dir)
+    }
 
-        let message = error.to_string();
-        assert!(
-            message.contains("bootstrap TOTP code rejected"),
-            "the error must name the TOTP rejection, got: {message}"
-        );
-        assert!(
-            message.contains("otpauth://totp/"),
-            "the error must give the operator the enrolment URI to retry with, got: {message}"
-        );
-        assert!(
-            store.list_users().await.expect("list users").is_empty(),
-            "a rejected bootstrap must remove the admin it created, not leave a pending factor"
-        );
+    #[tokio::test]
+    async fn a_secret_and_a_matching_code_enrol_the_bootstrap_factor() {
+        let code = caddy_rs_authn::totp_code_for_step(OPERATOR_SECRET, current_totp_step())
+            .expect("a real code");
+        let (result, store, _dir) = totp_bootstrap(Some(OPERATOR_SECRET), Some(&code)).await;
+        result.expect("the operator's secret and a current code succeed");
+        let users = store.list_users().await.expect("list users");
+        assert_eq!(users.len(), 1);
+        assert!(users[0].has_totp(), "the proven factor gates login");
+    }
+
+    #[tokio::test]
+    async fn a_code_without_a_secret_or_the_reverse_is_refused_before_creating_anything() {
+        for (secret, code) in [(None, Some("123456")), (Some(OPERATOR_SECRET), None)] {
+            let (result, store, _dir) = totp_bootstrap(secret, code).await;
+            let message = result.expect_err("an unpairable setting").to_string();
+            assert!(
+                message.contains("PM_BOOTSTRAP_ADMIN_TOTP_SECRET"),
+                "{message}"
+            );
+            assert!(
+                message.contains("/auth/totp/setup"),
+                "points at the normal path: {message}"
+            );
+            assert!(
+                store.list_users().await.unwrap().is_empty(),
+                "nothing is created for a configuration that cannot work"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wrong_code_or_a_malformed_secret_rolls_the_admin_back_without_echoing_the_secret() {
+        for (secret, code) in [
+            (OPERATOR_SECRET, "000000"),
+            ("not a base32 secret!!", "000000"),
+        ] {
+            let (result, store, _dir) = totp_bootstrap(Some(secret), Some(code)).await;
+            let message = result.expect_err("enrolment must fail").to_string();
+            assert!(
+                message.contains("bootstrap TOTP enrolment failed"),
+                "{message}"
+            );
+            assert!(
+                !message.contains(secret),
+                "the secret must not be echoed: {message}"
+            );
+            assert!(
+                store.list_users().await.expect("list users").is_empty(),
+                "a failed bootstrap removes the admin it created"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2634,144 +2555,22 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------------------------
-    // E6: secrets must not reach the structured log or hide on the command line unannounced
-    // ---------------------------------------------------------------------------------------
-
-    /// A `MakeWriter` target that collects everything the subscriber writes.
-    #[derive(Clone, Default)]
-    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CapturedLog {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("log buffer").extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
-        type Writer = CapturedLog;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    impl CapturedLog {
-        fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().expect("log buffer")).into_owned()
-        }
-    }
-
-    const SECRET_URI: &str =
-        "otpauth://totp/caddy-rs:admin?secret=JBSWY3DPEHPK3PXP&issuer=caddy-rs";
-
-    #[test]
-    fn the_bootstrap_totp_uri_goes_to_stderr_and_never_to_the_structured_log() {
-        let log = CapturedLog::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(log.clone())
-            .with_ansi(false)
-            .finish();
-        let mut stderr = Vec::new();
-        let dir = tempfile::tempdir().expect("create the test directory");
-        tracing::subscriber::with_default(subscriber, || {
-            let placed = announce_bootstrap_totp(&mut stderr, true, dir.path(), SECRET_URI)
-                .expect("announce");
-            assert_eq!(placed, None, "a terminal is shown the URI directly");
-        });
-        assert!(
-            !dir.path().join(BOOTSTRAP_TOTP_URI_FILE).exists(),
-            "nothing is left on disk when a terminal showed it"
-        );
-
-        let printed = String::from_utf8(stderr).expect("utf-8 output");
-        assert!(
-            printed.contains(SECRET_URI),
-            "the operator must be shown the URI to scan: {printed}"
-        );
-        let logged = log.text();
-        assert!(
-            logged.contains("bootstrap admin TOTP enrolled"),
-            "the enrolment is still logged: {logged}"
-        );
-        assert!(
-            !logged.contains("JBSWY3DPEHPK3PXP") && !logged.contains("otpauth://"),
-            "the secret must not reach the log: {logged}"
-        );
-    }
-
-    #[test]
-    fn without_a_terminal_the_uri_goes_to_an_owner_only_file_and_nowhere_else() {
-        let log = CapturedLog::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(log.clone())
-            .with_ansi(false)
-            .finish();
-        let dir = tempfile::tempdir().expect("create the test directory");
-        let mut captured_stderr = Vec::new();
-        let placed = tracing::subscriber::with_default(subscriber, || {
-            announce_bootstrap_totp(&mut captured_stderr, false, dir.path(), SECRET_URI)
-        })
-        .expect("announce")
-        .expect("a path is reported");
-
-        assert!(
-            captured_stderr.is_empty(),
-            "stderr is the journal under systemd; nothing may be written to it"
-        );
-        assert_eq!(placed, dir.path().join(BOOTSTRAP_TOTP_URI_FILE));
-        let content = std::fs::read_to_string(&placed).expect("read the file");
-        assert!(content.contains(SECRET_URI));
-        let logged = log.text();
-        assert!(
-            logged.contains(BOOTSTRAP_TOTP_URI_FILE),
-            "the path is logged: {logged}"
-        );
-        assert!(
-            !logged.contains("JBSWY3DPEHPK3PXP") && !logged.contains("otpauth://"),
-            "the secret must not reach the log: {logged}"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&placed).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600);
-            // A leftover world-readable file is tightened, not reused as is.
-            std::fs::set_permissions(&placed, std::fs::Permissions::from_mode(0o644)).unwrap();
-            announce_bootstrap_totp(&mut Vec::new(), false, dir.path(), SECRET_URI).unwrap();
-            let mode = std::fs::metadata(&placed).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600);
-        }
-    }
-
-    #[test]
-    fn a_failure_to_place_the_uri_is_reported_not_swallowed() {
-        let dir = tempfile::tempdir().expect("create the test directory");
-        let missing = dir.path().join("no-such-dir");
-        assert!(announce_bootstrap_totp(&mut Vec::new(), false, &missing, SECRET_URI).is_err());
-    }
-
-    #[test]
-    fn the_fatal_error_shown_without_a_terminal_carries_no_secret() {
-        let message = format!("bootstrap TOTP code rejected: x; URI: {SECRET_URI}");
-        assert!(fatal_error_text(&message, true).contains("JBSWY3DPEHPK3PXP"));
-        let plain = fatal_error_text(&message, false);
-        assert!(!plain.contains("JBSWY3DPEHPK3PXP"), "{plain}");
-        assert!(plain.contains("bootstrap TOTP code rejected"));
-    }
-
     #[tokio::test]
     async fn a_too_short_bootstrap_password_fails_startup_naming_the_setting() {
         let dir = tempfile::tempdir().expect("create the test directory");
         let store = MemoryUserStore::new();
         let authn = boot_authn(&dir.path().join("data"), store.clone()).await;
 
-        let error = bootstrap_admin(&authn, &store, Some("admin@example.com"), Some("a"), None)
-            .await
-            .expect_err("a one-character password must be refused");
+        let error = bootstrap_admin(
+            &authn,
+            &store,
+            Some("admin@example.com"),
+            Some("a"),
+            None,
+            None,
+        )
+        .await
+        .expect_err("a one-character password must be refused");
         let message = error.to_string();
         assert!(message.contains("PM_BOOTSTRAP_ADMIN_PASSWORD"), "{message}");
         assert!(message.contains("at least 8"), "{message}");
@@ -2779,26 +2578,6 @@ mod tests {
             store.list_users().await.unwrap().is_empty(),
             "nothing was created"
         );
-    }
-
-    #[test]
-    fn totp_secrets_are_redacted_from_text_that_may_be_logged() {
-        let error = format!("bootstrap TOTP code rejected: x; retry with this URI: {SECRET_URI}");
-        let redacted = redact_totp_secrets(&error);
-        assert!(!redacted.contains("JBSWY3DPEHPK3PXP"), "{redacted}");
-        assert!(
-            redacted.contains("secret=[redacted]&issuer=caddy-rs"),
-            "{redacted}"
-        );
-
-        // Several occurrences, a value at the end of the text, and text without a secret.
-        assert_eq!(
-            redact_totp_secrets("a secret=ONE b secret=TWO"),
-            "a secret=[redacted] b secret=[redacted]"
-        );
-        assert_eq!(redact_totp_secrets("secret=END"), "secret=[redacted]");
-        assert_eq!(redact_totp_secrets("nothing to hide"), "nothing to hide");
-        assert_eq!(redact_totp_secrets(""), "");
     }
 
     #[test]
@@ -2827,6 +2606,10 @@ mod tests {
             ])),
             vec!["--bootstrap-admin-password", "--bootstrap-admin-totp"],
             "each flag is reported once"
+        );
+        assert_eq!(
+            secret_flags_on_command_line(args(&["--bootstrap-admin-totp-secret", "JBSWY3DP"])),
+            vec!["--bootstrap-admin-totp-secret"]
         );
         // The email is not a secret, and a longer flag that merely shares a prefix is not a match.
         assert!(secret_flags_on_command_line(args(&[
