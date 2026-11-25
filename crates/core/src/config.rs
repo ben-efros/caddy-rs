@@ -731,7 +731,7 @@ pub struct ListenerWrapperConfig {
 /// Options of the `proxy_protocol` listener wrapper (`caddy.listeners.proxy_protocol`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProxyProtocolConfig {
-    /// Maximum time to read the PROXY header; absent/zero disables the timeout.
+    /// Maximum time to read the PROXY header; absent/zero uses go-proxyproto's 10 s default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<CaddyDuration>,
 
