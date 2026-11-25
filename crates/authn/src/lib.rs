@@ -603,6 +603,9 @@ pub enum AuthError {
     /// The service configuration is unusable (weak or inconsistent parameters).
     #[error("invalid authentication configuration: {0}")]
     InvalidConfig(String),
+    /// A new password consists only of whitespace.
+    #[error("password must not be blank")]
+    PasswordBlank,
     /// A new password is shorter than [`MIN_PASSWORD_CHARS`].
     #[error("password must be at least {min} characters")]
     PasswordTooShort {
@@ -794,6 +797,9 @@ pub fn check_password_policy(password: &str) -> AuthResult<()> {
         return Err(AuthError::PasswordTooShort {
             min: MIN_PASSWORD_CHARS,
         });
+    }
+    if password.trim().is_empty() {
+        return Err(AuthError::PasswordBlank);
     }
     if password.len() > MAX_PASSWORD_BYTES {
         return Err(AuthError::PasswordTooLong {
@@ -1352,42 +1358,77 @@ impl LoginThrottleConfig {
 /// `Instant` stops being meaningful and a lockout that long is an outage, not a throttle.
 const MAX_LOCKOUT_CEILING: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Rolling window over which failures are totalled, and how long an entry is retained after its
+/// last activity. Retention this long is what stops "wait for the entry to age out" from being a
+/// way to get a fresh budget.
+const THROTTLE_DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Failures tolerated per rolling [`THROTTLE_DAY`]; past this every further failure earns the full
+/// `max_lockout`, however long the key was idle in between. Bounds the guesses per key per day to
+/// roughly `THROTTLE_DAY_FAILURE_CAP + 24 h / max_lockout` (116 with the defaults).
+const THROTTLE_DAY_FAILURE_CAP: u32 = 20;
+
 /// Failure state for one throttle key.
 #[derive(Debug)]
 struct AttemptEntry {
-    /// Attempts reserved since the last success (or idle reset). Stays at or above the threshold
-    /// once reached, so every attempt after an expired lockout re-locks immediately with a longer
-    /// duration: one guess per lockout period.
+    /// Attempts reserved since the last success (or idle decay). Once the threshold is reached
+    /// every attempt after an expired lockout re-locks immediately with a longer duration, so
+    /// while the backoff level is non-zero the key gets one guess per lockout.
     failures: u32,
     /// How many lockouts this entry has served; the next one lasts `base << level`.
     level: u32,
     locked_until: Option<Instant>,
     last_activity: Instant,
+    /// Whether the key belongs to an account that exists. Only known keys may displace others.
+    known: bool,
+    /// Start of the rolling day this entry totals failures over.
+    day_start: Instant,
+    /// Failures reserved since `day_start`.
+    day_failures: u32,
 }
 
 /// Bounded map of failure counters shared by every clone of an [`AuthnService`].
 #[derive(Debug, Default)]
 struct AttemptTracker {
     entries: HashMap<String, AttemptEntry>,
+    last_sweep: Option<Instant>,
 }
 
 impl AttemptTracker {
-    /// Reserve one attempt for `key`, or report how long the key stays locked.
-    ///
-    /// The attempt is counted *before* the credential is checked and stays counted unless the
-    /// caller reports a success via [`clear`](Self::clear). Counting up front, under one lock, is
-    /// what makes the budget hold under concurrency: parallel guesses cannot all observe "still
-    /// under the limit" and then each get a free verification.
+    /// [`reserve_as`](Self::reserve_as) for a key that belongs to an existing account.
+    #[cfg(test)]
     fn reserve(
         &mut self,
         key: &str,
         now: Instant,
         config: &LoginThrottleConfig,
     ) -> Result<(), Duration> {
+        self.reserve_as(key, true, now, config)
+    }
+
+    /// Reserve one attempt for `key`, or report how long to wait.
+    ///
+    /// The attempt is counted *before* the credential is checked and stays counted unless the
+    /// caller reports a success via [`clear`](Self::clear). Counting up front, under one lock, is
+    /// what makes the budget hold under concurrency: parallel guesses cannot all observe "still
+    /// under the limit" and then each get a free verification.
+    ///
+    /// `known` says the key belongs to an account that exists. When the table is full a new key
+    /// is **never** admitted by evicting a penalised entry: an unknown key is turned away for
+    /// `base_lockout` (the table is under a flood of invented names), a known key may displace an
+    /// *unknown* entry, and when only known entries remain it is turned away too. Evicting would
+    /// let an adaptive attacker push thousands of invented names to a penalty, then evict the
+    /// victim's entry and restart its count.
+    fn reserve_as(
+        &mut self,
+        key: &str,
+        known: bool,
+        now: Instant,
+        config: &LoginThrottleConfig,
+    ) -> Result<(), Duration> {
         // A key that has been quiet for twice the longest lockout is forgiven *gradually*: the
         // failure count restarts, but the backoff level only decays by one per idle period, and an
-        // entry that still has a level re-locks on its next failure. Forgetting the level outright
-        // would hand a patient guesser a fresh budget of `max_failures` guesses every idle period.
+        // entry that still has a level re-locks on its next failure.
         let idle_reset = config.max_lockout.saturating_mul(2);
         if let Some(entry) = self.entries.get_mut(key) {
             match entry.locked_until {
@@ -1406,10 +1447,9 @@ impl AttemptTracker {
                     0
                 };
             }
+            entry.known |= known;
         } else {
-            if self.entries.len() >= config.max_tracked {
-                self.evict_one(now);
-            }
+            self.admit(known, now, config)?;
             self.entries.insert(
                 key.to_string(),
                 AttemptEntry {
@@ -1417,6 +1457,9 @@ impl AttemptTracker {
                     level: 0,
                     locked_until: None,
                     last_activity: now,
+                    known,
+                    day_start: now,
+                    day_failures: 0,
                 },
             );
         }
@@ -1424,13 +1467,23 @@ impl AttemptTracker {
             return Ok(());
         };
         entry.last_activity = now;
+        if now.saturating_duration_since(entry.day_start) >= THROTTLE_DAY {
+            entry.day_start = now;
+            entry.day_failures = 0;
+        }
+        entry.day_failures = entry.day_failures.saturating_add(1);
         entry.failures = entry.failures.saturating_add(1);
-        if entry.failures >= config.max_failures {
-            let factor = 1u32.checked_shl(entry.level).unwrap_or(u32::MAX);
-            let lockout = config
-                .base_lockout
-                .saturating_mul(factor)
-                .min(config.max_lockout);
+        let over_daily_cap = entry.day_failures > THROTTLE_DAY_FAILURE_CAP;
+        if entry.failures >= config.max_failures || over_daily_cap {
+            let lockout = if over_daily_cap {
+                config.max_lockout
+            } else {
+                let factor = 1u32.checked_shl(entry.level).unwrap_or(u32::MAX);
+                config
+                    .base_lockout
+                    .saturating_mul(factor)
+                    .min(config.max_lockout)
+            };
             // `max_lockout` is validated, but the arithmetic must not panic whatever it holds.
             entry.locked_until = Some(
                 now.checked_add(lockout)
@@ -1442,32 +1495,65 @@ impl AttemptTracker {
         Ok(())
     }
 
+    /// Make room for a new key, or say how long to turn it away. Never evicts a known entry and
+    /// never evicts an entry to admit an unknown key.
+    fn admit(
+        &mut self,
+        known: bool,
+        now: Instant,
+        config: &LoginThrottleConfig,
+    ) -> Result<(), Duration> {
+        if self.entries.len() < config.max_tracked {
+            return Ok(());
+        }
+        self.sweep(now);
+        if self.entries.len() < config.max_tracked {
+            return Ok(());
+        }
+        if known {
+            // Displace the least penalised *unknown* entry: invented names must not be able to
+            // keep real accounts from being tracked.
+            let victim = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| !entry.known)
+                .min_by_key(|(_, entry)| {
+                    (
+                        entry.locked_until.is_some_and(|until| until > now),
+                        entry.level,
+                        entry.failures,
+                        entry.last_activity,
+                    )
+                })
+                .map(|(key, _)| key.clone());
+            if let Some(victim) = victim {
+                self.entries.remove(&victim);
+                return Ok(());
+            }
+        }
+        Err(config.base_lockout)
+    }
+
+    /// Drop entries whose retention (a full rolling day since their last activity, no lockout
+    /// running) has elapsed. At most once a second: a full table must not make every request an
+    /// O(n) scan.
+    fn sweep(&mut self, now: Instant) {
+        if self
+            .last_sweep
+            .is_some_and(|last| now.saturating_duration_since(last) < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.last_sweep = Some(now);
+        self.entries.retain(|_, entry| {
+            entry.locked_until.is_some_and(|until| until > now)
+                || now.saturating_duration_since(entry.last_activity) < THROTTLE_DAY
+        });
+    }
+
     /// Forget `key`: a successful authentication ends the failure streak.
     fn clear(&mut self, key: &str) {
         self.entries.remove(key);
-    }
-
-    /// Drop one entry to make room. Entries that carry no penalty go first (unlocked, backoff
-    /// level 0, fewest failures, oldest activity); an entry serving a lockout, or one whose
-    /// lockout expired but whose backoff level is still remembered, goes last. Otherwise flooding
-    /// the tracker with made-up usernames would evict a victim's penalised entry and restart its
-    /// count.
-    fn evict_one(&mut self, now: Instant) {
-        let victim = self
-            .entries
-            .iter()
-            .min_by_key(|(_, entry)| {
-                (
-                    entry.locked_until.is_some_and(|until| until > now),
-                    entry.level,
-                    entry.failures,
-                    entry.last_activity,
-                )
-            })
-            .map(|(key, _)| key.clone());
-        if let Some(key) = victim {
-            self.entries.remove(&key);
-        }
     }
 }
 
@@ -1546,8 +1632,11 @@ pub trait UserStore: Send + Sync {
     /// This is what service code uses to change a few fields. A `get_user` + `update_user` pair
     /// writes back the *whole* record it read, so a concurrent change to another field (notably
     /// `totp_last_step`, which makes a consumed TOTP code unusable) would be silently reverted.
-    /// A backend must make the closure and the write one atomic step. Returns the stored result,
-    /// or [`AuthError::UserNotFound`]; an error from `change` aborts without writing.
+    /// A backend must make the closure and the write one atomic step. The closure is `FnOnce` and
+    /// is called exactly once, so **an implementation must hold a row lock (or equivalent) for the
+    /// duration**: it cannot retry optimistically by re-running the closure. The closure must not
+    /// change `id` or `username`; those are restored. Returns the stored result, or
+    /// [`AuthError::UserNotFound`]; an error from `change` aborts without writing.
     async fn modify_user(&self, user_id: UserId, change: UserChange) -> AuthResult<User>;
 
     /// Delete a user.
@@ -1572,6 +1661,13 @@ pub trait UserStore: Send + Sync {
     async fn get_refresh_token(&self, token_hash: &str) -> AuthResult<Option<RefreshTokenRecord>>;
 
     /// Store a new refresh token record.
+    ///
+    /// **The insert must be refused with [`AuthError::RefreshTokenRevoked`] when the owner's
+    /// current `auth_epoch` differs from the record's epoch**, checked atomically with the insert
+    /// (under the same exclusion that `modify_user` takes). Every operation that retires a user's
+    /// sessions bumps the epoch *first* and revokes the stored tokens second; a login or refresh
+    /// that read the user before the bump and stores its token after the revoke would otherwise
+    /// leave a live token that outlives the password change or reuse response.
     async fn store_refresh_token(&self, record: RefreshTokenRecord) -> AuthResult<()>;
 
     /// Atomically consume a refresh token, marking it revoked for `reason`.
@@ -1702,6 +1798,7 @@ impl UserStore for MemoryUserStore {
         let mut edited = user.clone();
         change(&mut edited)?;
         edited.username.clone_from(&user.username);
+        edited.id = user.id;
         *user = edited.clone();
         Ok(edited)
     }
@@ -1729,6 +1826,15 @@ impl UserStore for MemoryUserStore {
     }
 
     async fn store_refresh_token(&self, record: RefreshTokenRecord) -> AuthResult<()> {
+        // Lock order users -> refresh_tokens. Holding the users guard across the insert makes the
+        // epoch comparison and the insert one step with respect to `modify_user`.
+        let users = self.users.read().await;
+        if users
+            .get(&record.user_id)
+            .is_some_and(|user| user.auth_epoch != record.epoch)
+        {
+            return Err(AuthError::RefreshTokenRevoked);
+        }
         let token_hash = record.token_hash.clone();
         self.refresh_tokens.write().await.insert(token_hash, record);
         Ok(())
@@ -2094,14 +2200,14 @@ impl<S: UserStore> AuthnService<S> {
 
     /// Reserve one attempt for `key`, failing with [`AuthError::TooManyAttempts`] while it is
     /// locked out.
-    fn reserve_attempt(&self, key: &str) -> AuthResult<()> {
+    fn reserve_attempt(&self, key: &str, known: bool) -> AuthResult<()> {
         let now = self.throttle_now();
         let mut tracker = self
             .attempts
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         tracker
-            .reserve(key, now, &self.config.login_throttle)
+            .reserve_as(key, known, now, &self.config.login_throttle)
             .map_err(|wait| AuthError::TooManyAttempts {
                 // Round up: telling the client "0 seconds" invites an immediate, refused retry.
                 retry_after: Duration::from_secs(
@@ -2232,7 +2338,7 @@ impl<S: UserStore> AuthnService<S> {
         // Verifying the current password is a password-guessing oracle for anyone holding a
         // session token, so it spends the same per-user budget as `login`.
         let key = username_throttle_key(&user.username);
-        self.reserve_attempt(&key)?;
+        self.reserve_attempt(&key, true)?;
         if !verify_password(old_password, &user.password_hash)? {
             return Err(AuthError::InvalidCredentials);
         }
@@ -2285,7 +2391,8 @@ impl<S: UserStore> AuthnService<S> {
     /// The authentication epoch is incremented so tokens carrying the old role and capabilities
     /// are rejected.
     pub async fn update_role(&self, user_id: UserId, role: Role) -> AuthResult<User> {
-        self.store
+        let user = self
+            .store
             .modify_user(
                 user_id,
                 Box::new(move |user| {
@@ -2295,7 +2402,12 @@ impl<S: UserStore> AuthnService<S> {
                     Ok(())
                 }),
             )
-            .await
+            .await?;
+        // Tokens minted under the old role must not keep refreshing into the new epoch.
+        self.store
+            .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
+            .await?;
+        Ok(user)
     }
 
     /// Generate a fresh TOTP secret and its `otpauth://` URI for `username`.
@@ -2303,9 +2415,14 @@ impl<S: UserStore> AuthnService<S> {
         let mut secret_bytes = [0u8; 20];
         OsRng.fill_bytes(&mut secret_bytes);
         let secret = base32::encode(Alphabet::Rfc4648 { padding: false }, &secret_bytes);
+        let uri = self.totp_uri(username, &secret);
+        (secret, uri)
+    }
 
+    /// The `otpauth://` URI for `secret` (already base32).
+    fn totp_uri(&self, username: &str, secret: &str) -> String {
         let issuer = self.config.issuer.as_deref().unwrap_or("caddy-rs");
-        let uri = format!(
+        format!(
             "otpauth://totp/{}:{}?secret={}&issuer={}&algorithm=SHA1&digits={}&period={}",
             urlencoding::encode(issuer),
             urlencoding::encode(username),
@@ -2313,8 +2430,50 @@ impl<S: UserStore> AuthnService<S> {
             urlencoding::encode(issuer),
             TOTP_DIGITS,
             TOTP_STEP_SECONDS,
-        );
-        (secret, uri)
+        )
+    }
+
+    /// Begin first-time TOTP enrolment with an operator-chosen secret (base32, RFC 4648).
+    ///
+    /// For unattended provisioning only: the operator added the secret to their authenticator
+    /// beforehand and proves it with [`totp_confirm`](Self::totp_confirm). Behaves like
+    /// [`totp_setup`](Self::totp_setup) (pending until confirmed, refused over an active factor)
+    /// except for where the secret comes from. The secret is validated (spaces and `=` padding are
+    /// ignored, case is folded, at least 80 bits and at most 512) and is never included in an
+    /// error or a log line.
+    pub async fn totp_setup_with_secret(&self, user_id: UserId, secret: &str) -> AuthResult<()> {
+        let normalized: String = secret
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '=')
+            .map(|c| c.to_ascii_uppercase())
+            .collect();
+        let decoded = base32::decode(Alphabet::Rfc4648 { padding: false }, &normalized);
+        match decoded {
+            Some(bytes) if (10..=64).contains(&bytes.len()) => {}
+            _ => {
+                return Err(AuthError::InvalidConfig(
+                    "TOTP secret must be base32 (A-Z, 2-7) encoding between 10 and 64 bytes"
+                        .to_string(),
+                ));
+            }
+        }
+        self.store
+            .modify_user(
+                user_id,
+                Box::new(move |user| {
+                    if user.has_totp() {
+                        return Err(AuthError::TotpAlreadyEnabled);
+                    }
+                    user.totp_secret = Some(normalized);
+                    user.totp_pending = true;
+                    user.totp_pending_secret = None;
+                    user.totp_last_step = None;
+                    user.updated_at = Timestamp::now();
+                    Ok(())
+                }),
+            )
+            .await?;
+        Ok(())
     }
 
     /// Begin first-time TOTP enrolment. Returns `(secret, otpauth URI)`.
@@ -2548,11 +2707,23 @@ impl<S: UserStore> AuthnService<S> {
         code: &str,
         slot: TotpSlot,
     ) -> AuthResult<bool> {
+        let user = self
+            .store
+            .get_user(user_id)
+            .await?
+            .ok_or(AuthError::UserNotFound)?;
+        // Two budgets: the per-account TOTP one, and the account's login one. A session holder
+        // guessing codes therefore also spends the budget an online password guesser would use,
+        // instead of getting an independent allowance on top of it.
         let key = totp_throttle_key(user_id);
-        self.reserve_attempt(&key)?;
+        self.reserve_attempt(&key, true)?;
+        let login_key = username_throttle_key(&user.username);
+        self.reserve_attempt(&login_key, true)?;
         let verified = self.totp_verify_unthrottled(user_id, code, slot).await?;
         if verified {
+            // A correct code proves the factor; the failures before it are forgiven on both keys.
             self.clear_attempts(&key);
+            self.clear_attempts(&login_key);
         }
         Ok(verified)
     }
@@ -2671,9 +2842,10 @@ impl<S: UserStore> AuthnService<S> {
         totp_code: Option<&str>,
     ) -> AuthResult<TokenPair> {
         let key = username_throttle_key(username);
-        self.reserve_attempt(&key)?;
+        let found = self.store.get_user_by_username(username).await?;
+        self.reserve_attempt(&key, found.is_some())?;
 
-        let Some(user) = self.store.get_user_by_username(username).await? else {
+        let Some(user) = found else {
             // Spend the same password-verification work as the hit path before failing, so the
             // response time does not reveal whether the username exists.
             let _verified = verify_password(password, &self.dummy_password_hash)?;
@@ -2700,7 +2872,14 @@ impl<S: UserStore> AuthnService<S> {
             }
         }
 
-        let tokens = self.issue_token_pair(&user).await?;
+        let tokens = self
+            .issue_token_pair(&user)
+            .await
+            .map_err(|error| match error {
+                // The account's sessions were reset while this login was in flight.
+                AuthError::RefreshTokenRevoked => AuthError::InvalidCredentials,
+                other => other,
+            })?;
         self.clear_attempts(&key);
         Ok(tokens)
     }
@@ -2744,6 +2923,13 @@ impl<S: UserStore> AuthnService<S> {
             .get_user(record.user_id)
             .await?
             .ok_or(AuthError::UserNotFound)?;
+        // A token issued under an earlier epoch belongs to a session that a password, factor or
+        // role change (or a reuse response) already retired. Refusing it here is what stops a
+        // descendant minted by a thief from carrying on after the epoch moved; tokens stored before
+        // epochs were recorded (epoch 0) of an account that has since moved on must log in again.
+        if record.epoch != user.auth_epoch {
+            return Err(AuthError::RefreshTokenRevoked);
+        }
         self.issue_token_pair(&user).await
     }
 

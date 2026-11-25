@@ -1465,3 +1465,416 @@ async fn service_updates_do_not_revert_a_concurrently_consumed_totp_step() {
         *store.frozen.lock().unwrap() = None;
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Second review round
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_thiefs_descendant_token_dies_when_the_role_changes() {
+    let (service, store) = two_users().await;
+    let alice = store.get_user_by_username("alice").await.unwrap().unwrap();
+    let t1 = service.login("alice", "correct horse", None).await.unwrap();
+    // The thief rotates the stolen token first and holds the descendant.
+    let t2_thief = service.refresh(&t1.refresh_token).await.unwrap();
+    // An administrator changes the role: the epoch moves.
+    service.update_role(alice.id, Role::viewer()).await.unwrap();
+    // The real client replays T1 (rotated, but epoch-stale): no reuse response is possible any more,
+    // so the descendant must already be dead.
+    let _ = service.refresh(&t1.refresh_token).await;
+    assert!(
+        matches!(
+            service.refresh(&t2_thief.refresh_token).await,
+            Err(AuthError::RefreshTokenRevoked)
+        ),
+        "a token from before the epoch change must not mint tokens at the new epoch"
+    );
+}
+
+#[tokio::test]
+async fn a_refresh_token_from_an_older_epoch_is_refused_even_if_never_revoked() {
+    let (service, store) = two_users().await;
+    let alice = store.get_user_by_username("alice").await.unwrap().unwrap();
+    let tokens = service.login("alice", "correct horse", None).await.unwrap();
+    // Move the epoch without touching the token store, as a backend that missed the revoke would.
+    store
+        .modify_user(
+            alice.id,
+            Box::new(|user| {
+                user.auth_epoch += 1;
+                Ok(())
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        service.refresh(&tokens.refresh_token).await,
+        Err(AuthError::RefreshTokenRevoked)
+    ));
+}
+
+/// What an interleaving hook does when its trigger point is reached.
+enum Interleave {
+    /// On the next `get_user`: snapshot the user, run a refresh with this token to completion, then
+    /// return the (now stale) snapshot.
+    ReplayOnGetUser(String),
+    /// On the next `get_user_by_username`: snapshot, change the password, return the snapshot.
+    ChangePasswordOnLookup {
+        user: UserId,
+        old: String,
+        new: String,
+    },
+}
+
+/// A store that injects another operation between two steps of the operation under test.
+#[derive(Clone)]
+struct InterleaveStore {
+    inner: MemoryUserStore,
+    service: Arc<Mutex<Option<AuthnService<InterleaveStore>>>>,
+    hook: Arc<Mutex<Option<Interleave>>>,
+    thief_result: Arc<Mutex<Option<bool>>>,
+}
+
+impl InterleaveStore {
+    fn service(&self) -> AuthnService<InterleaveStore> {
+        self.service.lock().unwrap().clone().expect("service set")
+    }
+}
+
+#[async_trait::async_trait]
+impl UserStore for InterleaveStore {
+    async fn get_user(&self, user_id: UserId) -> AuthResult<Option<User>> {
+        let snapshot = self.inner.get_user(user_id).await?;
+        let armed = {
+            let mut hook = self.hook.lock().unwrap();
+            if matches!(*hook, Some(Interleave::ReplayOnGetUser(_))) {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some(Interleave::ReplayOnGetUser(token)) = armed {
+            let _ = self.service().refresh(&token).await;
+        }
+        Ok(snapshot)
+    }
+    async fn get_user_by_username(&self, username: &str) -> AuthResult<Option<User>> {
+        let snapshot = self.inner.get_user_by_username(username).await?;
+        let armed = {
+            let mut hook = self.hook.lock().unwrap();
+            if matches!(*hook, Some(Interleave::ChangePasswordOnLookup { .. })) {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some(Interleave::ChangePasswordOnLookup { user, old, new }) = armed {
+            self.service()
+                .update_password(user, &old, &new)
+                .await
+                .expect("the concurrent password change succeeds");
+        }
+        Ok(snapshot)
+    }
+    async fn create_user(&self, user: User) -> AuthResult<User> {
+        self.inner.create_user(user).await
+    }
+    async fn update_user(&self, user: User) -> AuthResult<User> {
+        self.inner.update_user(user).await
+    }
+    async fn modify_user(&self, user_id: UserId, change: UserChange) -> AuthResult<User> {
+        self.inner.modify_user(user_id, change).await
+    }
+    async fn delete_user(&self, user_id: UserId) -> AuthResult<()> {
+        self.inner.delete_user(user_id).await
+    }
+    async fn list_users(&self) -> AuthResult<Vec<User>> {
+        self.inner.list_users().await
+    }
+    async fn get_refresh_token(&self, hash: &str) -> AuthResult<Option<RefreshTokenRecord>> {
+        self.inner.get_refresh_token(hash).await
+    }
+    async fn store_refresh_token(&self, record: RefreshTokenRecord) -> AuthResult<()> {
+        self.inner.store_refresh_token(record).await
+    }
+    async fn consume_refresh_token(
+        &self,
+        hash: &str,
+        now: i64,
+        reason: RevokeReason,
+    ) -> AuthResult<RefreshTokenRecord> {
+        self.inner.consume_refresh_token(hash, now, reason).await
+    }
+    async fn revoke_all_refresh_tokens_for_user(
+        &self,
+        user_id: UserId,
+        now: i64,
+    ) -> AuthResult<()> {
+        self.inner
+            .revoke_all_refresh_tokens_for_user(user_id, now)
+            .await
+    }
+    async fn accept_totp_step(&self, user_id: UserId, step: u64) -> AuthResult<bool> {
+        self.inner.accept_totp_step(user_id, step).await
+    }
+}
+
+fn interleave_service() -> (AuthnService<InterleaveStore>, InterleaveStore) {
+    let store = InterleaveStore {
+        inner: MemoryUserStore::new(),
+        service: Arc::new(Mutex::new(None)),
+        hook: Arc::new(Mutex::new(None)),
+        thief_result: Arc::new(Mutex::new(None)),
+    };
+    let service = AuthnService::new(store.clone(), fast_config()).unwrap();
+    *store.service.lock().unwrap() = Some(service.clone());
+    (service, store)
+}
+
+#[tokio::test]
+async fn a_token_minted_while_the_reuse_response_runs_does_not_survive_it() {
+    let (service, store) = interleave_service();
+    service
+        .create_user("alice", "correct horse", Role::editor())
+        .await
+        .unwrap();
+    let t1 = service.login("alice", "correct horse", None).await.unwrap();
+    let t2_thief = service.refresh(&t1.refresh_token).await.unwrap();
+
+    // The thief's refresh has consumed T2' and is about to read the user; at that moment the real
+    // client replays T1 and the whole reuse response (bump + revoke) completes.
+    *store.hook.lock().unwrap() = Some(Interleave::ReplayOnGetUser(t1.refresh_token.clone()));
+    let result = service.refresh(&t2_thief.refresh_token).await;
+    assert!(
+        result.is_err(),
+        "the thief must not walk away with a token minted across the reset"
+    );
+    let _ = store.thief_result.lock().unwrap().take();
+    let user = store
+        .inner
+        .get_user_by_username("alice")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(user.auth_epoch, 1, "the reuse response ran exactly once");
+}
+
+#[tokio::test]
+async fn a_login_racing_a_password_change_does_not_outlive_it() {
+    let (service, store) = interleave_service();
+    let alice = service
+        .create_user("alice", "correct horse", Role::editor())
+        .await
+        .unwrap();
+    // The login reads the account (and verifies the old password), then the password changes, and
+    // only then is the login's refresh token stored.
+    *store.hook.lock().unwrap() = Some(Interleave::ChangePasswordOnLookup {
+        user: alice.id,
+        old: "correct horse".to_string(),
+        new: "new battery staple".to_string(),
+    });
+    let result = service.login("alice", "correct horse", None).await;
+    assert!(
+        result.is_err(),
+        "a login straddling a password change must not yield a session"
+    );
+}
+
+#[test]
+fn modify_user_cannot_change_the_id_or_username() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (service, store) = two_users().await;
+        let alice = store.get_user_by_username("alice").await.unwrap().unwrap();
+        let other_id = UserId::new();
+        let stored = store
+            .modify_user(
+                alice.id,
+                Box::new(move |user| {
+                    user.id = other_id;
+                    user.username = "mallory".to_string();
+                    Ok(())
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.id, alice.id);
+        assert_eq!(stored.username, "alice");
+        assert!(store.get_user(alice.id).await.unwrap().is_some());
+        drop(service);
+    });
+}
+
+#[test]
+fn an_adaptive_flood_cannot_evict_a_penalised_victim() {
+    let config = LoginThrottleConfig {
+        max_tracked: 100,
+        ..LoginThrottleConfig::default()
+    };
+    let origin = Instant::now();
+    let mut tracker = AttemptTracker::default();
+    // The victim burns its budget: unlocked again later, but at backoff level 1.
+    for _ in 0..5 {
+        let _ = tracker.reserve_as("victim", true, origin, &config);
+    }
+    // The attacker pushes invented names to a penalty to fill the table.
+    for index in 0..99 {
+        for _ in 0..5 {
+            let _ = tracker.reserve_as(&format!("fake-{index}"), false, origin, &config);
+        }
+    }
+    assert_eq!(tracker.entries.len(), 100);
+
+    // Lockouts expire; the flood keeps coming with new invented names.
+    let later = origin + config.base_lockout + Duration::from_secs(1);
+    for index in 0..5_000u64 {
+        let admitted = tracker.reserve_as(
+            &format!("new-fake-{index}"),
+            false,
+            later + Duration::from_millis(index),
+            &config,
+        );
+        assert!(admitted.is_err(), "a full table turns invented names away");
+        assert!(tracker.entries.len() <= 100);
+    }
+    let victim = tracker
+        .entries
+        .get("victim")
+        .expect("the victim's entry is never evicted by the flood");
+    assert_eq!(victim.level, 1);
+    assert!(tracker.reserve_as("victim", true, later, &config).is_ok());
+    assert!(
+        tracker.reserve_as("victim", true, later, &config).is_err(),
+        "its count did not restart: one guess, then locked again"
+    );
+
+    // A real account that has no entry yet is still admitted (displacing an invented one).
+    assert!(tracker.reserve_as("newcomer", true, later, &config).is_ok());
+    assert!(tracker.entries.contains_key("newcomer"));
+    assert!(tracker.entries.len() <= 100);
+
+    // Entries age out after their retention (a day of inactivity) and the table recovers.
+    let much_later = later + THROTTLE_DAY + Duration::from_secs(5);
+    assert!(tracker
+        .reserve_as("fresh-after-a-day", false, much_later, &config)
+        .is_ok());
+}
+
+fn guesses_in_a_day(wait_out_the_idle_period: bool) -> u32 {
+    let config = LoginThrottleConfig::default();
+    let origin = Instant::now();
+    let mut now = origin;
+    let mut tracker = AttemptTracker::default();
+    let mut guesses = 0;
+    while now.duration_since(origin) < THROTTLE_DAY {
+        match tracker.reserve("target", now, &config) {
+            Ok(()) => guesses += 1,
+            Err(wait) => {
+                now += if wait_out_the_idle_period {
+                    // Sit idle long enough for the level to decay and the count to restart.
+                    config.max_lockout * 2 + Duration::from_secs(1)
+                } else {
+                    wait + Duration::from_secs(1)
+                };
+            }
+        }
+    }
+    guesses
+}
+
+#[test]
+fn guesses_per_key_per_day_stay_bounded_whatever_the_waiting_strategy() {
+    // 20 failures per day, then one per full lockout (15 min): about 116 at most with the defaults.
+    for strategy in [false, true] {
+        let guesses = guesses_in_a_day(strategy);
+        assert!(
+            guesses <= 120,
+            "idle-waiting={strategy}: {guesses} guesses in a day"
+        );
+        assert!(guesses >= 20, "the budget itself is still usable");
+    }
+}
+
+#[tokio::test]
+async fn totp_failures_spend_the_login_budget_too() {
+    let (service, _clock, id, _bytes) = totp_account(fast_config()).await;
+    for _ in 0..5 {
+        let _ = service.totp_verify(id, "abcdef").await;
+    }
+    // The account's password-login budget was drawn on as well.
+    assert!(matches!(
+        service.login("ivan", "correct horse", None).await,
+        Err(AuthError::TooManyAttempts { .. })
+    ));
+}
+
+#[tokio::test]
+async fn a_whitespace_only_password_is_refused() {
+    let (service, _clock) = clocked_service(fast_config());
+    assert!(matches!(
+        service.create_user("eve", "        ", Role::viewer()).await,
+        Err(AuthError::PasswordBlank)
+    ));
+    assert!(matches!(check_password_policy("\t \u{a0} \n  x"), Ok(())));
+    assert!(matches!(
+        check_password_policy(" \t\u{3000}\n\r      "),
+        Err(AuthError::PasswordBlank)
+    ));
+}
+
+#[tokio::test]
+async fn an_operator_chosen_totp_secret_is_validated_and_enrols_like_setup() {
+    let store = MemoryUserStore::new();
+    let service = AuthnService::new(store.clone(), fast_config())
+        .unwrap()
+        .with_test_step(STEP);
+    let user = service
+        .create_user("root", "correct horse", Role::admin())
+        .await
+        .unwrap();
+
+    for bad in ["", "short", "not base32 !!!!!!!!", "AAAA", &"A".repeat(200)] {
+        let error = service
+            .totp_setup_with_secret(user.id, bad)
+            .await
+            .expect_err("an unusable secret is refused");
+        assert!(
+            bad.is_empty() || !error.to_string().contains(bad),
+            "{error}"
+        );
+    }
+    assert!(store
+        .get_user(user.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .totp_secret
+        .is_none());
+
+    // Spaces, padding and lowercase are tolerated; the stored form is canonical.
+    service
+        .totp_setup_with_secret(user.id, "jbsw y3dp ehpk 3pxp====")
+        .await
+        .expect("a valid secret");
+    let pending = store.get_user(user.id).await.unwrap().unwrap();
+    assert_eq!(pending.totp_secret.as_deref(), Some("JBSWY3DPEHPK3PXP"));
+    assert!(
+        pending.totp_pending && !pending.has_totp(),
+        "pending until confirmed"
+    );
+
+    let code = totp_code(&decode("JBSWY3DPEHPK3PXP"), STEP);
+    service
+        .totp_confirm(user.id, &code)
+        .await
+        .expect("proof activates it");
+    assert!(store.get_user(user.id).await.unwrap().unwrap().has_totp());
+    assert!(matches!(
+        service
+            .totp_setup_with_secret(user.id, "JBSWY3DPEHPK3PXP")
+            .await,
+        Err(AuthError::TotpAlreadyEnabled)
+    ));
+}
