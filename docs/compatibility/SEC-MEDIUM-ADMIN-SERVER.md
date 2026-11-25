@@ -39,8 +39,9 @@ Implemented (same in both modes; this is stock behaviour, so there is no `stock_
 Remaining intentional differences from stock (none usable by a rebinding attacker, whose `Host`
 names the attacker's domain):
 
-1. A request with no `Host` header and no URI authority (synthetic unit-test requests; HTTP/1.0 from
-   a non-browser) passes. Go would see `Host == ""` and reject.
+1. A request with no `Host` header and no URI authority passes only as HTTP/1.0 (as in Go, where it
+   then has `Host == ""`) or as a synthetic in-process request; an HTTP/1.1 request without `Host`
+   is `400 missing required Host header` like Go (hyper alone would have served it).
 2. A port-less `Host` that names an allowed host is accepted, uniformly for `localhost`,
    `127.0.0.1` and `[::1]` (CLI/test harness convenience). Stock compares `host:port` exactly.
 3. Host names compare case-insensitively (stock: exact). Origins already did.
@@ -78,27 +79,57 @@ Implemented (`crates/server/src/listeners.rs`, `crates/server/src/limits.rs`):
 - Size: bodies above `ADMIN_MAX_BODY_BYTES` (64 MiB) are `413`; an over-cap `Content-Length` is
   rejected before any byte is read, a streamed body is cut off at the cap. `stock_compat true`
   removes the cap. A transport failure while reading is `400` in both modes, never an empty body.
-- Timeouts (`ServerLimits::admin()`, stock values, both modes): `read_timeout` 10 s, header timeout
-  5 s, idle 60 s, 64 KiB header limit, no write timeout. caddy-rs applies `read_timeout` per read
-  (DIV-0029), so additionally a request body must arrive within 10 s in total
-  (`ADMIN_BODY_DEADLINE`, `408` otherwise), which is Go's whole-request `ReadTimeout`.
+- Timeouts (`ServerLimits::admin()`, both modes): `read_timeout` 10 s, first-byte/handshake budget
+  5 s, idle 60 s, 64 KiB header limit, no write timeout. Effective semantics differ from a literal
+  reading of those numbers:
+  - The read timer is request-scoped (`ReadTimeoutScope::BodyReads`): it runs only while a request
+    body is being read, like Go's per-request `ReadTimeout`. Before, the per-read timer also ran
+    during the idle wait between requests and while a handler was busy with no client bytes
+    expected, and hyper's header timer (5 s) closed idle keep-alive connections after 5 s; the
+    first fix's "60 s idle" was really 5-10 s. Now an idle keep-alive connection lives to the 60 s
+    idle timeout (test: `an_idle_keep_alive_connection_survives_past_the_read_timeout`, 12 s) and an
+    in-flight request keeps the connection from being reaped. A handler running longer than 10 s
+    with no client frames is therefore not torn down by `read_timeout` on the admin listeners (not
+    separately tested: no slow admin handler exists to drive). Public servers are unchanged
+    (DIV-0029: `read_timeout` still runs on every stalled read there, so a slow handler on a server
+    with a `read_timeout` can still be cut; not changed here).
+  - hyper has one header timer for both the idle wait and a request's header read, so on the admin
+    listeners it is set to the idle budget: a request's headers may take up to 60 s, not stock's
+    5 s (a listed divergence; the first request's first byte is still bounded to 5 s).
+  - A request body must also arrive within 10 s in total (`ADMIN_BODY_DEADLINE`, `408`), Go's
+    whole-request `ReadTimeout`. `stock_compat true` does not lift the 10 s deadline or the 5 s
+    first-byte bound (they are stock behaviour); it lifts only the size cap and the slot limits.
 - First byte: hyper's protocol sniffing starts its header timer only once a byte arrives, so the
-  plaintext TCP and unix listeners explicitly drop a connection that sends nothing within the 5 s
-  header timeout (`await_first_byte`). The remote mTLS listener has no such pre-handshake gap (the
-  handshake budget covers it); a client that completes the handshake and then stays silent is cut
-  by the 10 s read timeout, not 5 s.
-- In-flight bodies (caddy-rs addition, not in stock): each admin listener admits at most
-  `ADMIN_MAX_CONCURRENT_BODIES` (4) concurrent requests that announce a body (`Content-Length` other
-  than 0, or `Transfer-Encoding`); a fifth gets `503` until one finishes. Worst-case body memory is
-  therefore 4 x 64 MiB per listener. `stock_compat true` lifts this together with the cap. The
-  numbers are constants; no admin config field was added.
+  plaintext TCP and unix listeners explicitly drop a connection that sends nothing within 5 s
+  (`await_first_byte`, which also observes shutdown). The remote mTLS listener has no such
+  pre-handshake gap (the handshake budget covers it); a client that completes the handshake and
+  then stays silent is cut by the idle timeout, not 5 s.
+- Upload slots (caddy-rs addition, not in stock): each admin listener admits at most
+  `ADMIN_MAX_CONCURRENT_BODIES` (4) concurrent requests with a body, and one peer (remote address;
+  the certificate's issuer+serial on the mTLS listener; one shared principal on the unix socket) at
+  most `ADMIN_MAX_BODIES_PER_PEER` (2); beyond that `503`, connection closed. A body is detected
+  from the body itself (`!is_end_stream()`), not the headers, so HTTP/2 streams with DATA frames
+  and no `content-length` also take a slot (they used to bypass the limit entirely). Worst-case body
+  memory is 4 x 64 MiB per listener. `stock_compat true` lifts the slots together with the cap.
+- Order: requests are authorised (`AdminApi::authorize`: Host/Origin on the plaintext listeners,
+  access-control role on the mTLS listener) before the body is read, as stock Caddy does. A refused
+  request is answered at once, takes no slot, and closes an HTTP/1 connection with its body unread,
+  so a rebinding page or a role-limited certificate cannot pin slots or memory.
 
 Tests: `admin_body_tests::*` (boundary, one over, declared length, unbounded mode, read failure,
 `stock_compat` on/off); `admin_unix_tests::oversized_admin_request_bodies_are_rejected_with_413`;
 `admin_limits_tests::a_silent_admin_connection_is_dropped_after_the_header_timeout` (fails before:
-connection stayed open), `admin_requests_beyond_the_in_flight_body_budget_get_503` (fails before:
-the fifth request was served), `a_stalled_admin_body_times_out_with_408_and_frees_its_slot`;
-`limits::tests::admin_limits_match_stock_caddy_admin_server`.
+connection stayed open), `a_silent_admin_connection_is_dropped_by_a_forced_stop_not_after_the_budget`
+(fails before), `one_peer_cannot_take_more_than_its_share_of_the_upload_slots` (fails before),
+`the_global_upload_budget_still_applies_across_peers`,
+`http2_streams_without_content_length_take_upload_slots` (fails before),
+`an_idle_keep_alive_connection_survives_past_the_read_timeout` (fails before),
+`a_refused_request_is_answered_without_reading_its_body` and the remote
+`an_unauthorised_remote_request_is_refused_without_reading_its_body` (both fail before),
+`a_stalled_admin_body_times_out_with_408_and_frees_its_slot`,
+`slots_are_capped_per_peer_and_in_total_and_released_on_drop`;
+`limits::tests::admin_limits_match_stock_caddy_admin_server`. The slot tests poll for the holders
+to register (bounded) instead of sleeping.
 
 ## A3. Admin unix socket: creation window and delete-anything TOCTOU
 
@@ -115,6 +146,14 @@ Implemented (`bind_admin_unix_private`, `install_staged_socket`, `AdminSocketPat
   so a file or symlink that appears meanwhile is never overwritten); if a stale socket is there, it
   is re-`lstat`ed immediately before and `rename`d over only if it is still a socket with the inode
   seen at the start. The final name therefore never exists with umask-derived permissions.
+- Liveness probe: before replacing a stale socket a `connect` is tried; success means a running
+  process owns it and the bind fails with "in use by a running process" (a second caddy-rs on the
+  same admin path used to silently steal the first one's socket). Only `ECONNREFUSED`/`ENOENT`
+  count as stale; other probe failures are reported. `stock_compat true` replaces unconditionally,
+  like stock Caddy. (A listener replaced during reload is stopped, removing its socket, before the
+  new one binds, so reloads are unaffected.)
+- The `link(2)` fallback to `rename` applies only to `EPERM`/`EOPNOTSUPP`/`ENOTSUP`/`ENOSYS`
+  (`hard_link_unsupported`); `EACCES`, `EMLINK`, `ENOSPC` and the like are reported.
 - Honest limit: the stale-socket replacement is narrowed, not eliminated. `rename` cannot be made
   conditional on the inode, and this crate denies `unsafe` (so `renameat2(RENAME_NOREPLACE)` is not
   called; no safe wrapper such as `rustix`/`nix` is a direct dependency). A swap in the microseconds
@@ -125,7 +164,8 @@ Implemented (`bind_admin_unix_private`, `install_staged_socket`, `AdminSocketPat
   afterwards is left alone (its `lstat`/`unlink` pair has the same narrowed-not-eliminated window).
 - The staging directory name is 8 hex digits from the OS RNG (`getrandom`, retried on `EEXIST`), so
   it cannot be pre-created by a squatter in a world-writable parent. It adds 12 bytes to the bind
-  path (previously about 28). When the bind path does not fit `sun_path` (108 bytes including the
+  path (previously about 28); when that would overflow `sun_path` but the final path fits, a
+  4-digit name (8 bytes) is used instead (65 536 names: a squatter can delay, not redirect). When the bind path does not fit `sun_path` (108 bytes including the
   NUL on Linux, 104 elsewhere) the error names the configured path, the required length and the
   limit.
 - Behaviour change relative to before: a stale *regular file* at the path used to be deleted and is
@@ -192,7 +232,9 @@ before: write_timeout ignored); `proxy_protocol::tests::silent_client_is_dropped
 ## Exact program-repository text to merge
 
 > **DIV (proposed) SEC-MEDIUM-ADMIN-SERVER-A2** - Admin request bodies are capped at 64 MiB (`413`),
-> and each admin listener admits at most 4 concurrent requests that carry a body (`503` beyond that).
+> and each admin listener admits at most 4 concurrent requests that carry a body, at most 2 per
+> peer (`503` beyond that; HTTP/2 streams count). Requests are authorised before their body is read.
+> The admin request-header read may take up to the 60 s idle budget (stock 5 s).
 > Stock Caddy v2.11.9 reads `/load` and `/adapt` bodies without a limit. `stock_compat true` removes
 > both bounds. A failed body read is a `400` in both modes, never an empty body. The admin servers use
 > stock Caddy's timeouts in both modes, plus a 10 s total deadline for a request body (`408`) and a
@@ -202,7 +244,9 @@ before: write_timeout ignored); `proxy_protocol::tests::silent_client_is_dropped
 > staging directory with a random name and installed with `link(2)` (absent path) or a re-checked
 > `rename` (stale socket), and only an existing *socket* at the configured path is replaced; a
 > regular file, directory or symlink there is a bind error. Cleanup on stop removes only the socket
-> this listener created. Stock Caddy removes whatever is at the path. Not gated by `stock_compat`.
+> this listener created. A socket that still accepts connections is not replaced ("in use by a
+> running process"; `stock_compat true` replaces it unconditionally, like stock). Stock Caddy removes
+> whatever is at the path.
 > The stale-socket replacement is narrowed, not eliminated, against a concurrent local attacker.
 >
 > **DIV (proposed) SEC-MEDIUM-ADMIN-SERVER-A1** - The admin Host check matches stock Caddy except:
