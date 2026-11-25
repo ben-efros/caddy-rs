@@ -9452,6 +9452,23 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                     .map_err(|message| adapter_error(item.position.clone(), message))?;
                 load_balancing.insert("try_interval".to_string(), json!(nanos));
             }
+            "dial_allow" => {
+                // caddy-rs extension (SEC-MEDIUM-PROXY C3): IP/CIDR entries and `unix/<abs path>`
+                // prefixes that request-derived dials may reach although the egress guard would
+                // refuse them. Multiple subdirectives accumulate.
+                if !item.block.is_empty() || item.args.is_empty() {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "`dial_allow` takes one or more IP addresses, CIDR ranges or `unix/<path>` prefixes",
+                    ));
+                }
+                let entry = object
+                    .entry("dial_allow".to_string())
+                    .or_insert_with(|| json!([]));
+                if let Some(list) = entry.as_array_mut() {
+                    list.extend(item.args.iter().map(|argument| json!(argument)));
+                }
+            }
             "flush_interval" => {
                 // Caddy accepts either an integer (nanoseconds) or a duration string and stores
                 // `caddy.Duration`; `-1` is its documented "flush immediately after every write".

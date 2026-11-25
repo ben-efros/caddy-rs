@@ -64,6 +64,14 @@ pub trait DynamicUpstreamSource: Send + Sync + std::fmt::Debug {
 
     /// Human-readable description for logs and errors.
     fn describe(&self) -> String;
+
+    /// Whether the hosts this source returns can be influenced by the client (a name, service or
+    /// port template that references request data). Such hosts are subject to the egress guard
+    /// (SEC-MEDIUM-PROXY C3); hosts from an operator-controlled source (literal names, `env.*`)
+    /// are not. The default is the conservative answer for sources that cannot tell.
+    fn request_derived(&self) -> bool {
+        true
+    }
 }
 
 /// Parsed `dynamic_upstreams` configuration (the three built-in Caddy source modules).
@@ -138,6 +146,14 @@ impl DynamicUpstreamSource for DynamicUpstreams {
             Self::Srv(source) => source.describe(),
             Self::A(source) => source.describe(),
             Self::Multi(source) => source.describe(),
+        }
+    }
+
+    fn request_derived(&self) -> bool {
+        match self {
+            Self::Srv(source) => source.request_derived(),
+            Self::A(source) => source.request_derived(),
+            Self::Multi(source) => source.request_derived(),
         }
     }
 }
@@ -367,6 +383,12 @@ impl SrvUpstreams {
             format!("srv _{}_.{}.{}", self.service, self.proto, self.name)
         }
     }
+
+    fn request_derived(&self) -> bool {
+        [&self.name, &self.service, &self.proto]
+            .into_iter()
+            .any(|template| crate::dial_guard::template_is_request_derived(template))
+    }
 }
 
 /// A/AAAA record source (Caddy `AUpstreams`).
@@ -473,6 +495,11 @@ impl AUpstreams {
     fn describe(&self) -> String {
         format!("a {}:{}", self.name, self.port)
     }
+
+    fn request_derived(&self) -> bool {
+        crate::dial_guard::template_is_request_derived(&self.name)
+            || crate::dial_guard::template_is_request_derived(&self.port)
+    }
 }
 
 /// Aggregated source (Caddy `MultiUpstreams`).
@@ -550,6 +577,10 @@ impl MultiUpstreams {
             .map(|source| source.describe())
             .collect();
         format!("multi [{}]", described.join(", "))
+    }
+
+    fn request_derived(&self) -> bool {
+        self.sources.iter().any(|source| source.request_derived())
     }
 }
 

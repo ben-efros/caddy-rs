@@ -187,26 +187,10 @@ impl Cidr {
         Some(Self { base, prefix })
     }
 
+    /// Whether `address` is in the range, also trying the IPv4-canonical form of an IPv4-mapped
+    /// IPv6 peer (the default listener is dual-stack; SEC-MEDIUM-PROXY review).
     fn contains(&self, address: IpAddr) -> bool {
-        match (self.base, address) {
-            (IpAddr::V4(base), IpAddr::V4(address)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u32::MAX << (32 - self.prefix)
-                };
-                (u32::from(base) & mask) == (u32::from(address) & mask)
-            }
-            (IpAddr::V6(base), IpAddr::V6(address)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u128::MAX << (128 - self.prefix)
-                };
-                (u128::from(base) & mask) == (u128::from(address) & mask)
-            }
-            _ => false,
-        }
+        caddy_rs_core::net::ip_in_net(self.base, self.prefix, address)
     }
 }
 
@@ -1839,6 +1823,16 @@ mod tests {
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
     use tokio::net::TcpListener;
+
+    /// SEC-MEDIUM-PROXY (review): a trusted-proxy CIDR must match an IPv4 peer that arrives
+    /// IPv4-mapped on the default dual-stack listener.
+    #[test]
+    fn trusted_proxy_cidrs_match_ipv4_mapped_peers() {
+        let cidr = Cidr::parse("203.0.113.0/24").unwrap();
+        assert!(cidr.contains("203.0.113.5".parse().unwrap()));
+        assert!(cidr.contains("::ffff:203.0.113.5".parse().unwrap()));
+        assert!(!cidr.contains("::ffff:198.51.100.5".parse().unwrap()));
+    }
 
     fn base_request() -> Request {
         let mut request = Request::new(Method::POST, "/protected?q=1".parse::<Uri>().unwrap());

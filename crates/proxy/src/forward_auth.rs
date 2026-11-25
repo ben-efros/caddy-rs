@@ -377,10 +377,12 @@ impl HandleResponse {
                 {
                     Some(status) => return Some(HandleResponseResult::UseUpstream { status }),
                     None => {
+                        // The expansion can carry upstream/request data: log it, never reflect it.
+                        tracing::debug!(expanded = ?expanded, "handle_response status_code is not a valid HTTP status");
                         return Some(HandleResponseResult::Respond(Response::text(
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("invalid status code `{expanded}`"),
-                        )))
+                            "invalid status code",
+                        )));
                     }
                 }
             }
@@ -459,12 +461,13 @@ impl HandleResponse {
                                     {
                                         Some(status) => status,
                                         None => {
+                                            tracing::debug!(expanded = ?expanded, "static_response status_code is not a valid HTTP status");
                                             return Some(HandleResponseResult::Respond(
                                                 Response::text(
                                                     StatusCode::INTERNAL_SERVER_ERROR,
-                                                    format!("invalid status code `{expanded}`"),
+                                                    "invalid status code",
                                                 ),
-                                            ))
+                                            ));
                                         }
                                     }
                                 }
@@ -1183,6 +1186,31 @@ mod tests {
             bytes::Bytes::from_static(b"denied by policy")
         );
         assert_eq!(response.headers["x-reason"], "policy");
+    }
+
+    /// SEC-MEDIUM-PROXY (review): a bad expanded status must not be reflected into the 500 body.
+    #[test]
+    fn invalid_expanded_status_codes_are_not_reflected_in_the_body() {
+        let handle = HandleResponse::from_json(
+            Some(&serde_json::json!([{
+                "status_code": "{http.reverse_proxy.header.X-Code}"
+            }])),
+            "handle_response",
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-code", HeaderValue::from_static("banana-attacker-text"));
+        let Some(HandleResponseResult::Respond(response)) = handle.evaluate(
+            &request(Method::GET, "/"),
+            StatusCode::UNAUTHORIZED,
+            &headers,
+            None,
+        ) else {
+            panic!("an invalid status must respond");
+        };
+        assert_eq!(response.status, StatusCode::INTERNAL_SERVER_ERROR);
+        let body = String::from_utf8_lossy(&response.body).into_owned();
+        assert!(!body.contains("banana"), "reflected: {body}");
     }
 
     #[test]

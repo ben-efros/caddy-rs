@@ -28,6 +28,7 @@ pub mod identity;
 pub mod lifecycle;
 pub mod listen;
 pub mod module;
+pub mod net;
 pub mod notify;
 pub mod regex;
 pub mod timestamp;

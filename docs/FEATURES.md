@@ -33,6 +33,12 @@ connections per listener, `0` means unlimited).
 Server-level `trusted_proxies`, `trusted_proxies_strict`, `trusted_proxies_unix` and
 `client_ip_headers` control how the proxy's forwarding headers are believed. They affect the
 resolved client address used by the `client_ip` matcher, forwarding decisions and access logs.
+When `trusted_proxies_strict` is absent the client IP is the right-most address outside the trusted
+ranges (stock Caddy takes the client-controlled left-most one); `stock_compat true` or an explicit
+`"trusted_proxies_strict": false` restores the stock behaviour
+([SEC-MEDIUM-PROXY](compatibility/SEC-MEDIUM-PROXY.md)). Common breakage: with CDN -> load balancer
+-> caddy and `trusted_proxies` covering only the load balancer, `client_ip` is now the CDN edge
+address; add the CDN ranges to `trusted_proxies`.
 
 The derived `trusted_proxy`/`client_ip` variables are also consumed by `reverse_proxy`,
 `forward_auth` and the `acme_server` external-origin selection, and the per-request decision is
@@ -248,6 +254,26 @@ continue down the handler chain, so place the handler before the ones it protect
 `unix//path`, or a placeholder that expands per request. Per-upstream `max_requests` caps how many
 requests may run against that upstream at once.
 
+#### Request-derived dials (SSRF guard)
+
+A dial that contains placeholders (`{http.request.header.X-Backend}:80`) is chosen partly by the
+client, and `dynamic_upstreams` names may be request-derived too. By default such connections are refused when the resolved address is loopback, unspecified, link-local (including
+`169.254.169.254`), multicast, broadcast, `100.64.0.0/10`, `192.0.0.192` or `fd00:ec2::/32`, and
+`unix/` targets are refused (NAT64 `64:ff9b::/96` and 6to4 `2002::/16` forms are judged by the
+embedded IPv4 address). Only dials that can carry request data are guarded: literals, `{env.*}`
+and dynamic sources with such names are not, and every other placeholder (including `{vars.*}`,
+`{system.*}` and `{time.*}`) is. **RFC 1918 and ULA ranges stay reachable**, so a client who controls the
+whole dial can still reach `10.x`, `172.16/12` (for example a Docker API on `172.17.0.1`) or the
+host's LAN address: do not put request data in a dial that must not be client-influenced. The same
+guard covers FastCGI dials of discovered hosts. `dial_allow` (a handler field, or the Caddyfile
+`reverse_proxy { dial_allow <ip|cidr|unix//path>... }` subdirective) is the allow list:
+IP addresses or CIDR ranges that may be dialled despite the rule (`["127.0.0.0/8"]`) and
+`unix/<absolute path>` prefixes (`["unix//run/app"]`). A malformed entry fails at load with the
+JSON path. `stock_compat true` disables the
+guard (stock Caddy dials whatever the expansion yields). The per-expansion client cache is capped
+at 1024 entries (least recently used evicted). See
+[SEC-MEDIUM-PROXY](compatibility/SEC-MEDIUM-PROXY.md).
+
 ### Load balancing
 
 Set `load_balancing.selection_policy` to choose a policy. The default is `random`.
@@ -260,7 +286,7 @@ Set `load_balancing.selection_policy` to choose a policy. The default is `random
 | `random` | `{"policy": "random"}` | Uniformly random healthy upstream. |
 | `random_choose` | `{"policy": "random_choose", "choose": 2}` | Chooses a random sub-pool (at least 2), then the least-loaded member. |
 | `weighted_round_robin` | `{"policy": "weighted_round_robin", "weights": [3, 1]}` | Weighted rotation. |
-| `cookie` | `{"policy": "cookie", "name": "lb", "secret": "...", "max_age": 0, "fallback": "random"}` | Sticky sessions: the cookie value is an HMAC of the selected dial address. A missing or stale cookie falls back to the fallback policy and re-pins the client with `Set-Cookie`. |
+| `cookie` | `{"policy": "cookie", "name": "lb", "secret": "...", "max_age": 0, "fallback": "random"}` | Sticky sessions: the cookie value is an HMAC of the selected dial address. Without a `secret` a random per-process secret is used (stickiness survives reloads, not restarts; `stock_compat true` restores Caddy's empty secret). A missing or stale cookie falls back to the fallback policy and re-pins the client with `Set-Cookie`. |
 | `ip_hash` | `{"policy": "ip_hash"}` | Hashes the peer IP. |
 | `client_ip_hash` | `{"policy": "client_ip_hash"}` | Hashes the resolved client IP. |
 | `uri_hash` | `{"policy": "uri_hash"}` | Hashes the request URI. |
