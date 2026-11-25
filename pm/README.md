@@ -108,6 +108,16 @@ changing host semantics.
 
 - `ConfigSettings` defaults to 80/443; the ports are written to both `http_port`/`https_port` and
   the `pm_http`/`pm_https` `listen` addresses;
+- **No placeholder text from the operator.** The data plane expands Caddy placeholders
+  (`{env.NAME}`, `{file.PATH}`, request placeholders) in header values and in a reverse-proxy
+  `dial`. `caddy-rs-pm-core` therefore rejects `{`/`}` and control characters in the five
+  security-header strings (CSP, `Permissions-Policy`, `X-Frame-Options`, `X-Content-Type-Options`,
+  `Referrer-Policy`) and in the upstream host, with an error naming the field
+  (`security_headers.content_security_policy must not contain ...`). The check runs on host
+  create/update, on global `PUT /security-headers`, at config assembly (so already-stored values
+  fail the next apply instead of leaking) and again inside the compiler. Domains and redirect
+  targets are already restricted to DNS label characters. A stored value that now violates this
+  must be edited before the next apply succeeds.
 - `ConfigSettings::security_headers` is an optional global `security_headers` block; a host
   inherits it unless it sets its own `Host::security_headers` (the host block wins), and the
   effective block is validated during assembly (`ConfigError::InvalidSecurityHeaders`) before any

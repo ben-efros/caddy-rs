@@ -670,6 +670,95 @@ async fn host_detail_exposes_a_stored_security_headers_override() {
 }
 
 #[tokio::test]
+async fn an_editor_cannot_store_placeholder_text_in_host_security_headers() {
+    // E3: the editor role can update host headers without `settings:admin`. A CSP of
+    // `{env.CF_API_TOKEN}` would be expanded by the data plane into every response of the site.
+    let (_dir, server, authn) = server_with_authn();
+    let admin = first_admin(&server).await;
+    let created = server
+        .post("/api/v1/hosts")
+        .add_header("Authorization", bearer(&admin.access_token))
+        .json(&dead_body("leak.example.com"))
+        .await;
+    assert_eq!(created.status_code(), StatusCode::CREATED);
+    let host: HostResponse = created.json();
+    let (_, editor) = user_tokens(&authn, "eddie", caddy_rs_authn::Role::editor()).await;
+
+    for field in [
+        "content_security_policy",
+        "permissions_policy",
+        "x_frame_options",
+        "x_content_type_options",
+        "referrer_policy",
+    ] {
+        for payload in ["{env.CF_API_TOKEN}", "{file./etc/passwd}"] {
+            let response = server
+                .put(&format!("/api/v1/hosts/{}/security-headers", host.id))
+                .add_header("Authorization", bearer(&editor.access_token))
+                .json(&serde_json::json!({ field: payload }))
+                .await;
+            assert_eq!(
+                response.status_code(),
+                StatusCode::BAD_REQUEST,
+                "{field}={payload} must be refused: {}",
+                response.text()
+            );
+            let envelope = error_envelope(&response);
+            assert_eq!(envelope.error.code, ErrorCode::Validation);
+            assert!(
+                envelope.error.message.contains(field),
+                "the error names the field: {}",
+                envelope.error.message
+            );
+        }
+    }
+
+    // Nothing was stored, and a legitimate value from the same caller still works.
+    let detail: HostResponse = server
+        .get(&format!("/api/v1/hosts/{}", host.id))
+        .await
+        .json();
+    assert!(detail.security_headers.is_none(), "nothing was persisted");
+    let ok = server
+        .put(&format!("/api/v1/hosts/{}/security-headers", host.id))
+        .add_header("Authorization", bearer(&editor.access_token))
+        .json(&serde_json::json!({
+            "content_security_policy": "default-src 'self'",
+            "permissions_policy": "geolocation=()"
+        }))
+        .await;
+    assert_eq!(ok.status_code(), StatusCode::OK, "{}", ok.text());
+}
+
+#[tokio::test]
+async fn host_creation_rejects_a_placeholder_upstream() {
+    let (_dir, server, _runtime) = server_with_runtime();
+    let response = server
+        .post("/api/v1/hosts")
+        .json(&serde_json::json!({
+            "domains": ["ssrf.example.com"],
+            "spec": {"kind": "proxy", "spec": {
+                "upstream": {"scheme": "http", "host": "{http.request.header.X-Target}", "port": 80}
+            }}
+        }))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::BAD_REQUEST,
+        "a placeholder upstream must be refused: {}",
+        response.text()
+    );
+    assert!(
+        error_envelope(&response)
+            .error
+            .message
+            .contains("upstream host"),
+        "{}",
+        response.text()
+    );
+}
+
+#[tokio::test]
 async fn create_rejects_a_duplicate_domain_with_409() {
     let (_dir, server, _runtime) = server_with_runtime();
     let _ = create_dead(&server, "taken.example.com").await;

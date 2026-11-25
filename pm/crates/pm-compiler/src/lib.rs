@@ -205,6 +205,10 @@ fn host_handle(host: &Host, on_https: bool) -> Result<Vec<Value>, CompileError> 
 /// block. The block is emitted as a fill-if-absent default stage: explicit `headers` handlers
 /// later in the chain override these values.
 fn security_headers_handler(security: &SecurityHeadersConfig) -> Result<Value, CompileError> {
+    // Defence in depth (E3): `compile_routes` already ran `Host::validate_structure`, but this is
+    // the single point where operator text becomes `security_headers` JSON that the data plane
+    // expands as placeholders, so re-check here rather than trust every caller to have validated.
+    security.validate()?;
     let mut block = serde_json::Map::new();
 
     if let Some(csp) = &security.content_security_policy {
@@ -487,5 +491,73 @@ mod tests {
             .to_json()
             .to_string();
         assert!(!rendered.contains("PRIVATE KEY"));
+    }
+
+    /// E3: no operator-supplied text may reach the data plane carrying placeholder syntax.
+    #[test]
+    fn placeholder_text_is_rejected_before_it_reaches_the_compiled_json() {
+        use caddy_rs_pm_core::SecurityHeadersConfig;
+
+        for dangerous in [
+            "{env.CF_API_TOKEN}",
+            "{file./etc/shadow}",
+            "x {http.request.host}",
+        ] {
+            let mut host = proxy_host(20, &["example.com"], HostTls::disabled());
+            host.security_headers = Some(SecurityHeadersConfig {
+                content_security_policy: Some(dangerous.to_string()),
+                ..SecurityHeadersConfig::default()
+            });
+            assert!(
+                compile_routes(&[host]).is_err(),
+                "a CSP of {dangerous:?} must not compile"
+            );
+
+            let mut host = proxy_host(21, &["example.com"], HostTls::disabled());
+            if let HostSpec::Proxy(spec) = &mut host.spec {
+                spec.upstream.host = dangerous.to_string();
+                spec.preserve_host = false;
+            }
+            assert!(
+                compile_routes(&[host]).is_err(),
+                "an upstream host of {dangerous:?} must not compile"
+            );
+        }
+
+        // The compiler's own re-check holds even for a caller that skipped host validation.
+        let hostile = SecurityHeadersConfig {
+            permissions_policy: Some("{env.SECRET}".to_string()),
+            ..SecurityHeadersConfig::default()
+        };
+        assert!(security_headers_handler(&hostile).is_err());
+    }
+
+    #[test]
+    fn a_fully_populated_legitimate_host_leaks_nothing_through_the_round_trip() {
+        use caddy_rs_pm_core::{SecurityHeadersConfig, SecurityHeadersHstsConfig};
+
+        let mut host = proxy_host(22, &["example.com"], HostTls::disabled());
+        host.security_headers = Some(SecurityHeadersConfig {
+            content_security_policy: Some(
+                "default-src 'self'; img-src https://cdn.example.com".into(),
+            ),
+            permissions_policy: Some("geolocation=()".to_string()),
+            strict_transport_security: Some(SecurityHeadersHstsConfig {
+                max_age: 31_536_000,
+                include_subdomains: true,
+                preload: false,
+            }),
+            ..SecurityHeadersConfig::default()
+        });
+        let rendered = compile_routes(&[host])
+            .expect("legitimate values compile")
+            .to_json()
+            .to_string();
+        assert!(rendered.contains("default-src 'self'; img-src https://cdn.example.com"));
+        assert!(rendered.contains("geolocation=()"));
+        assert!(
+            !rendered.contains("{env.") && !rendered.contains("{file."),
+            "no dangerous placeholder in {rendered}"
+        );
     }
 }
