@@ -692,8 +692,19 @@ pub fn build_ocsp_request(leaf_der: &[u8], issuer_der: &[u8]) -> Result<OcspRequ
 // OCSP response parsing
 // ---------------------------------------------------------------------------------------------
 
+/// Largest OCSP response accepted for stapling. Genuine responses are a few KiB (even with a
+/// delegated responder chain); the embedded `certs` list is outside the signature, so the bound
+/// stops an on-path attacker from inflating a genuine staple that is sent to every client.
+pub const MAX_OCSP_RESPONSE_BYTES: usize = 32 * 1024;
+
 /// Parse a DER-encoded `OCSPResponse`.
 pub fn parse_ocsp_response(der: &[u8]) -> Result<OcspResponse, OcspError> {
+    if der.len() > MAX_OCSP_RESPONSE_BYTES {
+        return Err(OcspError::Malformed(format!(
+            "OCSP response of {} bytes exceeds the {MAX_OCSP_RESPONSE_BYTES} byte limit",
+            der.len()
+        )));
+    }
     let mut outer = DerReader::new(der);
     let (tag, body, _) = outer.read_tlv_full()?;
     if tag != 0x30 {
