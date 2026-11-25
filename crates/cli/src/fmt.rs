@@ -749,8 +749,146 @@ mod tests {
     ///      two outputs. So non-idempotence here is a *compatibility requirement*, not a defect:
     ///      "fixing" it would make caddy-rs diverge from Caddy. The oracle fixtures below pin that.
     ///
-    /// Determinism: inputs come from a seeded xorshift64 PRNG implemented in this function. No
-    /// external fuzzing crate and no ambient randomness, so a failure reproduces from the seed.
+    // ---------------------------------------------------------------------------------------------
+    // Tier 1 knobs (FUZZ_SEED / FUZZ_CASES) — test-only
+    // ---------------------------------------------------------------------------------------------
+    //
+    // Everything in this block is inside `#[cfg(test)] mod tests`, so none of it is compiled into
+    // the shipped binary and the environment cannot affect `run`, `format` or
+    // `formatting_difference`. That confinement is the point: this is production source, so an env
+    // read reachable at runtime would make shipped behaviour depend on the environment.
+
+    /// Tier-0 seed, used when `FUZZ_SEED` is unset.
+    const SEED: u64 = 0x0F0F_0000_0000_0042;
+    /// Tier-0 case count, used when `FUZZ_CASES` is unset.
+    const CASES: usize = 8_000;
+    /// Ceiling for `FUZZ_CASES`; the suite must stay CI-fast, so an out-of-range value is a loud
+    /// error rather than a slow suite.
+    const MAX_CASES: usize = 50_000;
+
+    /// Read a knob. `Ok(None)` when unset (the silent tier-0 path); `Ok(Some(v))` when set to a
+    /// valid value; `Err` naming the variable and the offending value when set to something
+    /// unusable — so a misconfigured sweep fails loudly instead of silently running tier 0 and
+    /// reporting green.
+    #[cfg(test)]
+    fn knob<T>(name: &str, max: Option<T>) -> Result<Option<T>, String>
+    where
+        T: std::str::FromStr + PartialOrd + std::fmt::Display + Copy,
+    {
+        knob_from(name, std::env::var(name), max)
+    }
+
+    /// The body of [`knob`], taking the looked-up value as a parameter so the "present" branch is
+    /// testable without mutating the process environment (which is global and would race the other
+    /// tests running in parallel). A test that called [`parse_knob`] directly would bypass this
+    /// function and miss a wrapper that swallowed the error.
+    #[cfg(test)]
+    fn knob_from<T>(
+        name: &str,
+        looked_up: Result<String, std::env::VarError>,
+        max: Option<T>,
+    ) -> Result<Option<T>, String>
+    where
+        T: std::str::FromStr + PartialOrd + std::fmt::Display + Copy,
+    {
+        match looked_up {
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(err) => Err(format!("{name} is set but unreadable: {err}")),
+            Ok(raw) => parse_knob(name, &raw, max),
+        }
+    }
+
+    /// Validate one raw knob value. Split out of [`knob`] so the parsing contract can be tested
+    /// without touching the process environment, which is global and would race tests running in
+    /// parallel.
+    ///
+    /// `Ok(Some(v))` when `raw` parses and is within `max`; `Err` naming the variable and the
+    /// offending value otherwise.
+    #[cfg(test)]
+    fn parse_knob<T>(name: &str, raw: &str, max: Option<T>) -> Result<Option<T>, String>
+    where
+        T: std::str::FromStr + PartialOrd + std::fmt::Display + Copy,
+    {
+        let value = raw.parse::<T>().map_err(|_| {
+            format!("{name}={raw:?} is not a valid value; unset it to run tier 0 (using the in-file constant), or pass a parseable value")
+        })?;
+        if let Some(max) = max {
+            if value > max {
+                return Err(format!(
+                    "{name}={raw:?} is out of range: must be at most {max}; unset it to run tier 0 (using the in-file constant)"
+                ));
+            }
+        }
+        Ok(Some(value))
+    }
+
+    /// Resolved knob values for one run. Test-only.
+    #[cfg(test)]
+    struct FuzzKnobs {
+        seed: Option<u64>,
+        cases: Option<usize>,
+    }
+
+    #[cfg(test)]
+    impl FuzzKnobs {
+        /// Resolve both knobs from the environment, failing loudly on an invalid value.
+        fn from_env() -> Result<Self, String> {
+            Ok(Self {
+                seed: knob::<u64>("FUZZ_SEED", None)?,
+                cases: knob::<usize>("FUZZ_CASES", Some(MAX_CASES))?,
+            })
+        }
+
+        /// The seed the loop starts from: the tier-1 `FUZZ_SEED` when set, else the constant.
+        fn seed(&self) -> u64 {
+            self.seed.unwrap_or(SEED)
+        }
+
+        /// Cases the loop runs: the tier-1 `FUZZ_CASES` when set, else the constant.
+        ///
+        /// This test has a single flat loop, so `FUZZ_CASES` is the suite total directly — no
+        /// ratio to divide by, unlike the multi-generator targets.
+        fn cases(&self) -> usize {
+            self.cases.unwrap_or(CASES)
+        }
+
+        /// Cases actually executed. Mirrors the loop, which is flat, so it equals `cases()`;
+        /// kept as its own method so the announcement goes through a name that would have to be
+        /// updated if the loop ever gained a multiplier (the adapter's per-seed defect).
+        fn cases_total(&self) -> usize {
+            self.cases()
+        }
+
+        /// Print the resolved seed and case count so the corpus is identifiable from the log.
+        fn announce(&self, cases: usize) {
+            match (self.seed, self.cases) {
+                (None, None) => println!(
+                    "fmt fuzz: tier 0 (FUZZ_SEED/FUZZ_CASES unset) — seed {SEED}, cases {cases} total"
+                ),
+                (seed, requested) => println!(
+                    "fmt fuzz: tier 1 — resolved FUZZ_SEED={:?}, FUZZ_CASES={:?} ({cases} cases total)",
+                    seed, requested
+                ),
+            }
+        }
+    }
+
+    /// Determinism: inputs come from a seeded xorshift64 PRNG implemented in this module's test
+    /// code. No external fuzzing crate and no ambient randomness, so a failure reproduces from the
+    /// seed.
+    ///
+    /// Tier: **tier 1** (T-FUZZ-SEED-FMT). The seed and case count are the constants below unless
+    /// overridden by `FUZZ_SEED` (u64) and `FUZZ_CASES` (usize), read by [`FuzzKnobs`]. Knob
+    /// contract, per `docs/compatibility/TESTING.md` §Fuzzing:
+    ///
+    /// - **absent ⇒ silent tier 0**: with both variables unset the test uses the constants, so a
+    ///   plain `cargo test` is byte-identical to the pre-tier behaviour;
+    /// - **present ⇒ tier 1**: the value replaces the constant, so a scheduled sweep explores a
+    ///   different corpus each run. Still deterministic *within* a run;
+    /// - **present-but-invalid ⇒ loud failure**, naming the variable and the offending value.
+    ///
+    /// The knobs live in `#[cfg(test)]` code and are unreachable from the shipped binary: nothing
+    /// in `run`, `format` or `formatting_difference` reads the environment.
     #[test]
     fn format_is_total_and_preserves_output_invariants() {
         // xorshift64 — deterministic, dependency-free PRNG.
@@ -766,11 +904,19 @@ mod tests {
         // The bytes that drive the formatter's state machine: braces, quotes, backslashes,
         // whitespace, comment markers, heredoc markers and multi-byte UTF-8.
         const ALPHABET: &[u8] = b"ab{}[]()\"`#\\ \t\r\n,<>=*\xc3\xa9\xe2\x82\xac";
-        const CASES: usize = 8_000;
 
-        let mut state = 0x0F0F_0000_0000_0042_u64;
+        let knobs = FuzzKnobs::from_env().unwrap_or_else(|err| panic!("fmt fuzz: {err}"));
+        let cases = knobs.cases();
+        knobs.announce(cases);
+        assert_eq!(
+            cases,
+            knobs.cases_total(),
+            "the announced total must be the count the loop runs"
+        );
+
+        let mut state = knobs.seed();
         let mut checked = 0_usize;
-        for case in 0..CASES {
+        for case in 0..cases {
             let len = (xorshift(&mut state) % 48) as usize;
             let mut input = Vec::with_capacity(len);
             for _ in 0..len {
@@ -833,9 +979,130 @@ mod tests {
             }
         }
         assert!(
-            checked > CASES / 2,
-            "only {checked} of {CASES} cases produced brace-bearing or multi-line output; the \
+            checked > cases / 2,
+            "only {checked} of {cases} cases produced brace-bearing or multi-line output; the \
              generator is no longer exercising the formatter"
+        );
+    }
+
+    /// Tier 1 must actually vary the corpus between runs: two different `FUZZ_SEED` values must
+    /// produce different case streams, while a repeated value reproduces exactly.
+    #[test]
+    fn different_resolved_seeds_produce_different_case_streams() {
+        fn xorshift(state: &mut u64) -> u64 {
+            let mut x = *state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *state = x;
+            x
+        }
+        let stream = |seed: u64| {
+            let mut state = seed;
+            (0..16)
+                .map(|_| {
+                    let len = (xorshift(&mut state) % 48) as usize;
+                    (0..len)
+                        .map(|_| (xorshift(&mut state) as usize % 26) as u8)
+                        .collect::<Vec<u8>>()
+                })
+                .collect::<Vec<Vec<u8>>>()
+        };
+        assert_ne!(
+            stream(1),
+            stream(2),
+            "FUZZ_SEED=1 and FUZZ_SEED=2 produced identical streams; tier 1 would be a no-op"
+        );
+        assert_eq!(
+            stream(1),
+            stream(1),
+            "the same seed must reproduce exactly (determinism within a run)"
+        );
+    }
+
+    /// A present knob must actually override its constant. Without this, a resolver that silently
+    /// ignored the environment would run tier 0 and report green — the failure the tier contract
+    /// forbids, and one that slipped through on an earlier target until it was pinned.
+    #[test]
+    fn present_knobs_actually_override_the_constants() {
+        let tier0 = FuzzKnobs {
+            seed: None,
+            cases: None,
+        };
+        let tier1 = FuzzKnobs {
+            seed: Some(12345),
+            cases: Some(50),
+        };
+        assert_ne!(
+            tier1.seed(),
+            tier0.seed(),
+            "FUZZ_SEED must change the seed, not silently fall back to the constant"
+        );
+        assert_ne!(
+            tier1.cases(),
+            tier0.cases(),
+            "FUZZ_CASES must change the case count, not silently fall back to the constant"
+        );
+        assert_eq!(tier1.cases(), 50, "FUZZ_CASES=50 must run exactly 50 cases");
+        // Tier 0 stays exactly the constants.
+        assert_eq!(tier0.seed(), SEED);
+        assert_eq!(tier0.cases(), CASES);
+    }
+
+    /// An unparsable or out-of-range knob must be a loud `Err` naming the variable and the
+    /// offending value — never a silent fallback to the constant, which would let a misconfigured
+    /// sweep run tier 0 and report green.
+    #[test]
+    fn invalid_knob_values_are_loud_errors_naming_variable_and_value() {
+        // Unparsable: the message names the variable and the offending value.
+        let err = parse_knob::<u64>("FUZZ_SEED", "abc", None)
+            .expect_err("an unparsable FUZZ_SEED must be an error, not a silent fallback");
+        assert!(err.contains("FUZZ_SEED"), "must name the variable: {err}");
+        assert!(err.contains("abc"), "must name the offending value: {err}");
+        assert!(
+            err.contains("not a valid value"),
+            "must say the value is invalid: {err}"
+        );
+
+        // Out of range: the message names the variable, the value and the bound.
+        let err = parse_knob::<usize>("FUZZ_CASES", "999999", Some(MAX_CASES))
+            .expect_err("an out-of-range FUZZ_CASES must be an error");
+        assert!(err.contains("FUZZ_CASES"), "must name the variable: {err}");
+        assert!(
+            err.contains("999999"),
+            "must name the offending value: {err}"
+        );
+        assert!(
+            err.contains("out of range") && err.contains(&MAX_CASES.to_string()),
+            "must name the range: {err}"
+        );
+
+        // The full knob path — including the present/unparsable branch, which is where a wrapper
+        // that swallowed the error would hide — must also be loud.
+        let err = knob_from::<u64>("FUZZ_SEED", Ok("abc".to_string()), None)
+            .expect_err("the full knob path must propagate the error, not swallow it");
+        assert!(err.contains("FUZZ_SEED") && err.contains("abc"), "{err}");
+
+        let err = knob_from::<usize>("FUZZ_CASES", Ok("999999".to_string()), Some(MAX_CASES))
+            .expect_err("the full knob path must propagate an out-of-range error");
+        assert!(
+            err.contains("FUZZ_CASES") && err.contains("999999"),
+            "{err}"
+        );
+
+        // Valid values parse through, and the absent path is a silent Ok(None).
+        assert_eq!(
+            parse_knob::<u64>("FUZZ_SEED", "12345", None),
+            Ok(Some(12345))
+        );
+        assert_eq!(
+            parse_knob::<usize>("FUZZ_CASES", "50", Some(MAX_CASES)),
+            Ok(Some(50))
+        );
+        assert_eq!(
+            knob::<u64>("CADDY_RS_TEST_UNSET_FUZZ_SEED", None),
+            Ok(None),
+            "an unset knob must be the silent tier-0 path"
         );
     }
 
