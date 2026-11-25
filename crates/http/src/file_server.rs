@@ -461,9 +461,16 @@ impl FileServerHandler {
     /// absolute filename. Automatic entries from [`auto_hide_entries`] are absolute, so this is
     /// where the relative app data/config directories become effective.
     fn hidden(&self, filename: &str, request: &Request) -> bool {
+        self.hide_matcher(request).is_hidden(filename)
+    }
+
+    /// Expand the `hide` entries (placeholders, absolute paths) once, so a directory listing does
+    /// not redo that work for every entry and pattern.
+    fn hide_matcher(&self, request: &Request) -> HideMatcher {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         // On Windows `PathBuf` yields `\` separators, which the `/`-based matching below would never
         // split on (so `hide .env` never matched a basename); compare in `/` form, case-insensitively.
+        // Normalising here, once per entry, keeps that behaviour while still expanding only once.
         let normalise = |path: String| -> String {
             if cfg!(windows) {
                 path.replace('\\', "/").to_ascii_lowercase()
@@ -471,16 +478,28 @@ impl FileServerHandler {
                 path
             }
         };
-        let filename_abs = normalise(
-            fast_abs(Path::new(filename), &cwd)
-                .to_string_lossy()
-                .into_owned(),
-        );
-        self.hide.iter().any(|pattern| {
-            // Caddy: `hide[i] = repl.ReplaceAll(fsrv.Hide[i], "")` (staticfiles.go).
-            let expanded = request.replace_all(pattern);
-            hide_entry_matches(&expanded, &filename_abs, &cwd, cfg!(windows))
-        })
+        let patterns: Vec<String> = self
+            .hide
+            .iter()
+            .filter_map(|pattern| {
+                // Caddy: `hide[i] = repl.ReplaceAll(fsrv.Hide[i], "")` (staticfiles.go).
+                let expanded = request.replace_all(pattern);
+                // An empty expansion (for example a missing placeholder) never hides anything.
+                if expanded.is_empty() {
+                    return None;
+                }
+                Some(if expanded.contains('/') || expanded.contains('\\') {
+                    normalise(
+                        fast_abs(Path::new(&expanded), &cwd)
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                } else {
+                    expanded
+                })
+            })
+            .collect();
+        HideMatcher { cwd, patterns }
     }
 
     /// Serve one regular file through Caddy's `ServeContent` pipeline.
@@ -865,9 +884,10 @@ impl Handler for FileServerHandler {
                 )));
             }
             if let Some(browse) = &self.browse {
+                let matcher = self.hide_matcher(&request);
                 let body =
                     browse_html(&filename, request.uri.clone(), relative, browse, &|entry| {
-                        self.hidden(entry, &request)
+                        matcher.is_hidden(entry)
                     })
                     .await?;
                 return Ok(Outcome::Respond(Response::bytes(
@@ -1866,6 +1886,46 @@ async fn read_segments(file: &mut fs::File, segments: &[BodySegment]) -> std::io
     Ok(Bytes::from(body))
 }
 
+/// `hide` entries after placeholder and absolute-path expansion (see
+/// [`FileServerHandler::hide_matcher`]).
+struct HideMatcher {
+    cwd: PathBuf,
+    patterns: Vec<String>,
+}
+
+impl HideMatcher {
+    /// Caddy's `fileHidden` against one filesystem path.
+    fn is_hidden(&self, filename: &str) -> bool {
+        // The basename comparison below splits on `/`, and glob matching is case-insensitive on
+        // Windows, so the filename is put in the same normalised form as the expanded patterns.
+        let filename_abs = {
+            let path = fast_abs(Path::new(filename), &self.cwd)
+                .to_string_lossy()
+                .into_owned();
+            if cfg!(windows) {
+                path.replace('\\', "/").to_ascii_lowercase()
+            } else {
+                path
+            }
+        };
+        self.patterns.iter().any(|pattern| {
+            if !pattern.contains('/') {
+                if filename_abs
+                    .split('/')
+                    .any(|component| glob_match(pattern, component, cfg!(windows)))
+                {
+                    return true;
+                }
+            } else if let Some(rest) = filename_abs.strip_prefix(pattern.as_str()) {
+                if rest.starts_with('/') {
+                    return true;
+                }
+            }
+            glob_match(pattern, &filename_abs, cfg!(windows))
+        })
+    }
+}
+
 fn forbidden() -> Outcome {
     Outcome::Respond(Response::text(StatusCode::FORBIDDEN, "403 Forbidden"))
 }
@@ -2388,6 +2448,42 @@ mod tests {
             header(&response, header::ETAG),
             calculate_etag(&std::fs::metadata(&file).unwrap())
         );
+    }
+
+    /// SEC-MEDIUM-HTTP B3 review: stock Caddy's `fileHidden` matches a name-only pattern against
+    /// every component of the filesystem path. A root below a matching directory (`hide [".*"]`
+    /// with root `/home/u/.www`) therefore 404s the request itself before any listing is built, so
+    /// the listing can never be "emptied" by an ancestor match; and below an unrelated root a
+    /// name-only pattern hides exactly the entries whose own name matches.
+    #[tokio::test]
+    async fn browse_hide_matches_entry_names_and_an_ancestor_match_404s_the_request() {
+        let base = tempfile::Builder::new().prefix("site").tempdir().unwrap();
+        let hidden_root = base.path().join(".www");
+        std::fs::create_dir(&hidden_root).unwrap();
+        std::fs::write(hidden_root.join("a.txt"), b"a").unwrap();
+        let visible_root = base.path().join("www");
+        std::fs::create_dir(&visible_root).unwrap();
+        std::fs::write(visible_root.join("a.txt"), b"a").unwrap();
+        std::fs::write(visible_root.join(".env"), b"SECRET=1").unwrap();
+
+        let build = |root: &Path| {
+            FileServerHandler::from_json(
+                &serde_json::json!({
+                    "handler": "file_server", "root": root, "browse": {}, "hide": [".*"]
+                }),
+                "handler",
+            )
+            .unwrap()
+        };
+        let under_hidden = build(&hidden_root);
+        for path in ["/", "/a.txt"] {
+            let response = respond(&under_hidden, make_request(Method::GET, path)).await;
+            assert_eq!(response.status, StatusCode::NOT_FOUND, "{path}");
+        }
+        let response = respond(&build(&visible_root), make_request(Method::GET, "/")).await;
+        let listing = String::from_utf8(response.body.to_vec()).unwrap();
+        assert!(listing.contains("a.txt"), "{listing}");
+        assert!(!listing.contains(".env"), "{listing}");
     }
 
     fn install_open_hook(path: PathBuf, hook: impl Fn() + Send + Sync + 'static) {
