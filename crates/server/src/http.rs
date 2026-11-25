@@ -40,7 +40,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use bytes::Bytes;
 use http::{Method, StatusCode, Version};
-use http_body_util::{BodyExt, LengthLimitError, Limited};
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::upgrade::OnUpgrade;
 
@@ -52,7 +52,7 @@ use caddy_rs_http::{
 use caddy_rs_proxy::trusted_proxies::ServerTrustedProxies;
 
 use crate::auto_https::AutomaticHttpsServing;
-use crate::limits::ServerLimits;
+use crate::limits::{BufferedBodyReservation, ServerLimits};
 
 /// One served request at the hyper connection boundary.
 ///
@@ -492,12 +492,44 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
     // buffering is bounded by the configured limit.
     let can_stream =
         !router.requires_buffered_request_body() && (declared_length.is_some() || limit.is_none());
+    // Held until the response is produced: the buffered body stays in memory for the whole request.
+    let mut buffered_reservation = BufferedBodyReservation::default();
     if !can_stream {
+        // A declared length over the buffering ceiling is refused before a byte is read.
+        if declared_length.is_some_and(|declared| declared > limits.buffered_body_limit()) {
+            return served_response_with_identity(
+                limits,
+                status_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "413 Request Entity Too Large",
+                ),
+            );
+        }
         // Compatibility/bounded path: handlers that consume the full body today (the reverse
         // proxy; T-PROXY-004 follow-up streams through it) and chunked bodies with a configured
-        // limit are buffered, enforcing the limit while reading exactly as before.
-        let body = match read_body(body, limit).await {
+        // limit are buffered, bounded per request by `buffered_body_limit` and across requests by
+        // the process-wide buffered-body budget.
+        let body = match read_body(
+            body,
+            limits.buffered_body_limit(),
+            &mut buffered_reservation,
+        )
+        .await
+        {
             Ok(body) => body,
+            Err(BodyReadError::Overloaded) => {
+                tracing::warn!(
+                    path = %path,
+                    "too many request bodies are buffered in memory; refusing with 503"
+                );
+                return served_response_with_identity(
+                    limits,
+                    status_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "503 Service Unavailable",
+                    ),
+                );
+            }
             Err(BodyReadError::TooLarge { limit }) => {
                 tracing::debug!(
                     limit,
@@ -651,30 +683,38 @@ pub(crate) fn declared_content_length(headers: &http::HeaderMap) -> Option<u64> 
 enum BodyReadError {
     /// The configured body limit was exceeded.
     TooLarge { limit: u64 },
+    /// The process-wide budget for buffered request bodies is exhausted.
+    Overloaded,
     /// The transport failed while reading the body.
     Read(Box<dyn std::error::Error + Send + Sync>),
 }
 
-/// Collect a request body, enforcing an optional byte limit.
-async fn read_body(body: Incoming, limit: Option<u64>) -> Result<Bytes, BodyReadError> {
-    match limit {
-        Some(limit) => {
-            // `usize::try_from(...).unwrap_or(usize::MAX)` keeps the limit meaningful on
-            // platforms where `usize` is narrower than `u64`.
-            let capacity = usize::try_from(limit).unwrap_or(usize::MAX);
-            match Limited::new(body, capacity).collect().await {
-                Ok(collected) => Ok(collected.to_bytes()),
-                Err(error) if error.downcast_ref::<LengthLimitError>().is_some() => {
-                    Err(BodyReadError::TooLarge { limit })
-                }
-                Err(error) => Err(BodyReadError::Read(error)),
-            }
+/// Collect a request body into one contiguous buffer, enforcing a byte limit and reserving every
+/// byte against the process-wide buffered-body budget (see [`BUFFERED_BODY_BUDGET_BYTES`]).
+///
+/// Frames are copied straight into one growing buffer (no chunk list plus a second contiguous
+/// copy), and the reservation is taken *before* the bytes are accepted, so a flood of in-flight
+/// bodies is refused rather than allocated.
+async fn read_body(
+    mut body: Incoming,
+    limit: u64,
+    reservation: &mut BufferedBodyReservation,
+) -> Result<Bytes, BodyReadError> {
+    let mut buffer = bytes::BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|error| BodyReadError::Read(Box::new(error)))?;
+        let Ok(data) = frame.into_data() else {
+            continue; // trailers are not part of the body
+        };
+        if buffer.len() as u64 + data.len() as u64 > limit {
+            return Err(BodyReadError::TooLarge { limit });
         }
-        None => match body.collect().await {
-            Ok(collected) => Ok(collected.to_bytes()),
-            Err(error) => Err(BodyReadError::Read(Box::new(error))),
-        },
+        if !reservation.try_grow(data.len()) {
+            return Err(BodyReadError::Overloaded);
+        }
+        buffer.extend_from_slice(&data);
     }
+    Ok(buffer.freeze())
 }
 
 /// Convert a fully buffered internal response to a hyper response.
