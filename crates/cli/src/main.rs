@@ -95,6 +95,7 @@ mod manpage;
 mod respond;
 mod reverse_proxy;
 mod setup;
+mod setup_tls;
 mod signals;
 mod storage;
 
@@ -865,6 +866,28 @@ async fn run(command: Command) -> anyhow::Result<()> {
             let config = setup::generate_config(&args).map_err(|error| anyhow!("{error}"))?;
             let mut tokens = setup::TokenStore::new(config.registration_timeout);
             let token = tokens.mint(std::time::SystemTime::now());
+            // T-SETUP-008: the activation URLs are `https://`, so the endpoint is TLS. The leaf
+            // comes from the internal CA the generated configuration already asks for
+            // (`local_certs`), covers `--domain` and every `--host`, and its SHA-256 fingerprint is
+            // printed BEFORE the URLs so the operator can verify it out of band before clicking.
+            let tls = setup_tls::activate(&config)
+                .await
+                .map_err(|error| anyhow!("{error}"))?;
+            println!(
+                "caddy-rs setup: data directory {}",
+                config.data_dir.display()
+            );
+            println!("caddy-rs setup: listening on {}", config.activation_listen);
+            println!(
+                "caddy-rs setup: activation certificate SHA-256 fingerprint (leaf, compare with \
+                 `openssl x509 -fingerprint -sha256`): {}",
+                tls.fingerprint()
+            );
+            println!(
+                "caddy-rs setup: certificate covers {}; it is signed by the local CA, so the \
+                 browser will warn until that CA is trusted",
+                tls.names().join(", ")
+            );
             for url in &config.activation_urls {
                 println!("{}", setup::activation_url_with_token(url, &token.value));
             }
@@ -886,12 +909,20 @@ async fn run(command: Command) -> anyhow::Result<()> {
             // missing binary must be a located error rather than a boot that comes up serving 503.
             // It is stopped on handoff, when the activation layer returns, so a normal run never
             // inherits it and a failed serve does not leak it.
-            let pm =
-                setup::SetupService::new(setup::ProcessService::default(), setup::SETUP_GENERATION);
+            let pm = setup::SetupService::new(
+                setup::ProcessService::default(),
+                setup::SETUP_GENERATION,
+                config.data_dir.clone(),
+            );
             pm.start().map_err(|error| anyhow!("{error}"))?;
+            let tls_app = setup_tls::tls_app_with(setup_tls::load_pem_pair(
+                tls.certificate_pem().to_string(),
+                tls.private_key_pem().to_string(),
+            ));
             let served = activation::serve_with(
                 &config.activation_listen,
                 service,
+                tls_app,
                 builtin_module_registry(),
                 channels.shutdown,
                 channels.force,

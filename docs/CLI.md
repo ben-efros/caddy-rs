@@ -62,9 +62,9 @@ Synopsis: `caddy-rs setup [OPTIONS] --domain <DOMAIN>`
 | `--registration-timeout <DURATION>` | Activation-token TTL; must be between 5m and 60m. | `15m` |
 | `--data-dir <PATH>` | Data directory. The generated Caddyfile is written to `<data-dir>/setup/Caddyfile`. | `$CADDY_RS_DATA_DIR`, else `./.caddy-rs` |
 | `--host <HOST>` | Additional host name; repeatable. Each becomes a site address and an activation URL; duplicates are dropped. | none |
-| `--listen-address <ADDR>` | Only the port is used: the generated site is `https://<host>:<port>`, the listener binds `:port` on all interfaces, and automatic HTTPS also binds `:80`. The supplied IP is not used as a bind address (bind-address bug, T-SETUP-007); the port appears in the activation URL (omitted when 443). | `:443` |
-| `--acme` | Accepted but not wired: the generated configuration only omits `local_certs`; it adds no ACME issuer or automation policy, so the server falls back to automatic HTTPS's default ACME attempt (T-SETUP-008). | off |
-| `--cloudflare` | Accepted but not wired: only the presence of a token source (`--cf-api-token` or `CF_API_TOKEN`) is validated; no `dns.providers.cloudflare` configuration is generated (T-SETUP-008). It also suppresses `local_certs`, so the server falls back to automatic HTTPS. | off |
+| `--listen-address <ADDR>` | Binds the activation listener to exactly this address. Accepted forms: `IP`, `IP:port`, `[IPv6]`, `[IPv6]:port`, `:port`. An address that names an IP binds **that IP only** and is never widened to the wildcard; a bare `IP` or `[IPv6]` means port 443; a host-less `:port` is the one form that means **all interfaces** (`0.0.0.0`). The port also appears in the activation URL (omitted when 443). See "Listen addresses" below. | `127.0.0.1:443` |
+| `--acme` | Accepted but not wired: the generated configuration only omits `local_certs`; it adds no ACME issuer or automation policy, so the server falls back to automatic HTTPS's default ACME attempt (T-SETUP-014). | off |
+| `--cloudflare` | Accepted but not wired: only the presence of a token source (`--cf-api-token` or `CF_API_TOKEN`) is validated; no `dns.providers.cloudflare` configuration is generated (T-SETUP-014). It also suppresses `local_certs`, so the server falls back to automatic HTTPS. | off |
 | `--cf-api-token <SOURCE>` | Cloudflare API-token source: omitted reads `CF_API_TOKEN`, `/path` reads the first line of that file, `-` reads standard input. The token value is never accepted as an argument. | `CF_API_TOKEN` |
 
 The generated Caddyfile has a global block (`admin localhost:2019`, plus `local_certs` unless
@@ -73,23 +73,68 @@ containing a `route /_caddy-pm/activate*` block and a catch-all `respond`. The t
 before boot, so a generation bug is reported as a located error. The activation URL is
 `https://<host>[:<port>]/_caddy-pm/activate?token=<hex>`.
 
-`--data-dir` only chooses where the generated Caddyfile is written
-(`<data-dir>/setup/Caddyfile`). The boot runner invokes `caddy-rs run --config <path> --adapter
-caddyfile` without `--data-dir`, so the running server resolves its data directory normally (see
-`run` above); the flag does not control the server's data directory.
+`--data-dir` is the data directory for the whole setup boot, not only for the generated Caddyfile.
+It is resolved once (`--data-dir`, else `$CADDY_RS_DATA_DIR`, else `./.caddy-rs`) and then used for
+three things: the generated Caddyfile is written to `<data-dir>/setup/Caddyfile`, the booted
+`caddy-rs run` child is invoked with `--data-dir <data-dir>`, and the `caddy-rs-pm` service is
+started with `--data-dir <data-dir>` and `PM_DATA_DIR=<data-dir>` (the service's own default is
+`/var/lib/caddy-rs`, which is read-only on a hardened host). The internal CA that issues the
+activation certificate is rooted at `<data-dir>/pki/authorities/local`.
 
 The token is 128 random bits rendered as 32 hex characters and held in memory. The token store
 records a single use and rejects an elapsed TTL or a second use, and the activation route consults
-it: `setup` prints the auth method, storage, token lifetime, expiry (Unix seconds) and each
-activation URL, then runs
-`caddy-rs run --config <data-dir>/setup/Caddyfile --adapter caddyfile` in the foreground.
+it. `setup` prints, in this order: the data directory, the bound listener, the certificate's SHA-256
+fingerprint, the names the certificate covers, and then each activation URL. The activation layer
+itself is served in-process by `caddy-rs setup` (the generated Caddyfile is written for inspection
+and for a later `run`).
+
+### Listen addresses
+
+`--listen-address` accepts exactly the ADR-0039 forms, and the bound socket is the address the form
+names:
+
+| Form | Binds |
+|---|---|
+| *(flag omitted)* | `127.0.0.1:443` — loopback, the safe default for a live single-use token |
+| `192.0.2.7` | `192.0.2.7:443` |
+| `192.0.2.7:18443` | `192.0.2.7:18443` |
+| `[2001:db8::1]` | `[2001:db8::1]:443` |
+| `[2001:db8::1]:8443` | `[2001:db8::1]:8443` |
+| `[::1]` / `[::1]:8443` | `[::1]:443` / `[::1]:8443` |
+| `:8443` | `0.0.0.0:8443` — **all interfaces**, the one spelling that means that |
+
+An address that names an IP is never widened to the wildcard, and a host-less `:port` is the only
+way to bind every interface. A malformed address (an unknown host, a non-numeric or out-of-range
+port, an empty string) is a located error naming the value.
+
+### TLS and the printed fingerprint
+
+The activation endpoint is TLS with a certificate issued by the **internal CA** — the same
+`Caddy Local Authority` that `local_certs` uses, rooted at `<data-dir>/pki/authorities/local`. One
+leaf covers `--domain` and every `--host`, so a single fingerprint covers every printed URL and the
+`--host` sites reuse it rather than minting their own. Before printing any URL, `setup` prints the
+leaf's **SHA-256** fingerprint in the form `openssl x509 -fingerprint -sha256` uses (uppercase hex,
+colon-separated, 32 bytes):
+
+```
+caddy-rs setup: activation certificate SHA-256 fingerprint (leaf, compare with `openssl x509 -fingerprint -sha256`): AB:CD:...
+```
+
+Compare it against the certificate the listener actually presents before redeeming the token:
+
+```sh
+echo | openssl s_client -connect 127.0.0.1:18443 -servername localhost 2>/dev/null \
+  | openssl x509 -noout -fingerprint -sha256
+```
 
 ### The activation endpoint
 
-A setup boot serves `GET`/`POST /_caddy-pm/activate` on the activation listener, loopback by default.
-The token is read from the `token` query parameter, for example
-`http://127.0.0.1:<port>/_caddy-pm/activate?token=<32 hex chars>`; if the parameter repeats, the first
-occurrence wins. The endpoint is a single-use hand-off: a valid token returns `200` and is consumed, so
+A setup boot serves `GET`/`POST /_caddy-pm/activate` on the activation listener **over TLS**,
+loopback by default. The token is read from the `token` query parameter, for example
+`https://127.0.0.1:<port>/_caddy-pm/activate?token=<32 hex chars>`; if the parameter repeats, the first
+occurrence wins. The endpoint serves the scheme its printed URL advertises: the listener terminates
+TLS with an internal-CA leaf (see "TLS and the printed fingerprint" below), so `curl -k` — or a
+browser after accepting the self-signed CA — is how it is reached. The endpoint is a single-use hand-off: a valid token returns `200` and is consumed, so
 a replay of the same token is rejected. A token value is never written to a log line; the response body
 of every outcome is checked by test to be token-free.
 
@@ -113,9 +158,9 @@ single-use token (T-SETUP-003):
 
 ```sh
 # 1. Mint the secret. Returns the otpauth:// URI to scan, once per activation.
-curl "http://127.0.0.1:<port>/_caddy-pm/activate?token=<token>&step=begin"
+curl -k "https://127.0.0.1:<port>/_caddy-pm/activate?token=<token>&step=begin"
 # 2. Prove possession. A correct code enrols the credential and closes the window.
-curl "http://127.0.0.1:<port>/_caddy-pm/activate?token=<token>&step=verify&code=<6 digits>"
+curl -k "https://127.0.0.1:<port>/_caddy-pm/activate?token=<token>&step=verify&code=<6 digits>"
 ```
 
 The link admits the *session*, not each request: the first step consumes the token and only that same
@@ -146,9 +191,9 @@ Documented limits of this build (T-SETUP-003/T-SETUP-004/T-SETUP-005):
   endpoint steps described above.
 * The enrolled credential is held in process memory for the activation window and does not survive a
   restart (T-SETUP-005 owns persistence); DIV-0152 records the gap.
-* The activation endpoint is cleartext HTTP on the loopback address, and the generated configuration
-  sets `apps.http.https_port = 0` for it, because the printed `https://` URL cannot be served without
-  the `caddy-rs-pm` service (T-SETUP-004). Do not treat the printed scheme as TLS on this endpoint.
+* The activation certificate is signed by the **internal CA**, which no browser trusts until the
+  `Caddy Local Authority` root is installed in its store; the browser warning is expected, and the
+  printed SHA-256 fingerprint is what to compare it against (see below).
 * `setup` does not spawn `caddy-rs-pm`; only `caddy-rs` itself is started.
   Per-backend credential persistence is not implemented.
 * In the stock-compatibility profile (`CADDY_RS_STOCK_COMPAT=1`, `true` or `yes`) `setup` is

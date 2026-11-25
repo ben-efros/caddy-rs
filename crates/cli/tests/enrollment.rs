@@ -10,6 +10,8 @@ mod activation;
 mod enrollment;
 #[path = "../src/setup.rs"]
 mod setup;
+#[path = "../src/setup_tls.rs"]
+mod setup_tls;
 
 use caddy_rs_authn::{totp_code_for_step, totp_step_at};
 use enrollment::{
@@ -318,6 +320,27 @@ fn totp_enrollment_completes_over_the_real_listener() {
         ActivationService::new(store, AuthMethod::Totp).with_enrollment(Arc::clone(&enrollment)),
     );
 
+    // T-SETUP-008: the endpoint serves TLS, so issue the leaf the same way `setup` does.
+    let data_dir = tempfile::tempdir().expect("temp data dir");
+    let config = setup::generate_config(&setup::SetupArgs {
+        domain: "localhost".to_string(),
+        auth_method: AuthMethod::Totp,
+        data_dir: Some(data_dir.path().to_path_buf()),
+        listen_address: Some(addr.to_string()),
+        ..Default::default()
+    })
+    .expect("generate_config");
+    let tls = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(setup_tls::activate(&config))
+        .expect("issue the activation certificate");
+    let tls_app = setup_tls::tls_app_with(setup_tls::load_pem_pair(
+        tls.certificate_pem().to_string(),
+        tls.private_key_pem().to_string(),
+    ));
+
     let listen = addr.to_string();
     let thread = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -329,30 +352,15 @@ fn totp_enrollment_completes_over_the_real_listener() {
             let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
             let (_force_tx, force) = tokio::sync::watch::channel(false);
             let _keep = shutdown_tx;
-            if let Err(error) = serve_with(&listen, service, registry, shutdown, force).await {
+            if let Err(error) =
+                serve_with(&listen, service, tls_app, registry, shutdown, force).await
+            {
                 eprintln!("activation serve failed: {error:#}");
             }
         });
     });
 
-    let request = |target: &str| -> String {
-        let req = format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-        for _ in 0..100 {
-            if let Ok(mut stream) = TcpStream::connect(addr) {
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .expect("read timeout");
-                if stream.write_all(req.as_bytes()).is_ok() {
-                    let mut response = String::new();
-                    if stream.read_to_string(&mut response).is_ok() && !response.is_empty() {
-                        return response;
-                    }
-                }
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        panic!("no response for {target}");
-    };
+    let request = |target: &str| -> String { tls_request(addr, target) };
 
     // Step 1: begin. The response must carry a scannable otpauth:// URI.
     let began = request(&format!("/_caddy-pm/activate?token={token}&step=begin"));
@@ -451,4 +459,84 @@ fn a_different_token_cannot_continue_another_tokens_enrollment_session() {
     ));
     assert_eq!(ok, activation::ActivationOutcome::Enrolled);
     assert!(enrollment.is_enrolled());
+}
+
+/// Perform one TLS request against the activation listener, returning the response.
+///
+/// The internal CA is self-signed, so the client accepts any certificate: the endpoint's job here
+/// is the enrollment flow, and the fingerprint comparison is covered by
+/// `crates/cli/tests/activation.rs`.
+fn tls_request(addr: std::net::SocketAddr, target: &str) -> String {
+    let mut config = rustls::ClientConfig::builder()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+    config
+        .dangerous()
+        .set_certificate_verifier(std::sync::Arc::new(AcceptAnyCertificate));
+    let config = std::sync::Arc::new(config);
+    let req = format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    for _ in 0..100 {
+        let Ok(mut tcp) = std::net::TcpStream::connect(addr) else {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            continue;
+        };
+        tcp.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("read timeout");
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+        let mut conn = rustls::ClientConnection::new(std::sync::Arc::clone(&config), name)
+            .expect("client connection");
+        let mut stream = rustls::Stream::new(&mut conn, &mut tcp);
+        if std::io::Write::write_all(&mut stream, req.as_bytes()).is_err() {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            continue;
+        }
+        let mut response = String::new();
+        let _ = std::io::Read::read_to_string(&mut stream, &mut response);
+        if !response.is_empty() {
+            return response;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("no response for {target}");
+}
+
+/// Accepts any server certificate (the internal CA is self-signed and not a platform root).
+#[derive(Debug)]
+struct AcceptAnyCertificate;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyCertificate {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
