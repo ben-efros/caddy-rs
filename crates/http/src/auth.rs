@@ -689,6 +689,93 @@ pub struct BasicAuthHandler {
     /// Longest a request may wait for a hash permit before a 503. `None` (`stock_compat: true`)
     /// waits indefinitely, like stock Caddy.
     max_wait: Option<std::time::Duration>,
+    /// Uncached verifications currently in flight per client bucket.
+    waiters: std::sync::Arc<ClientWaiters>,
+    /// Most uncached verifications one client may have in flight (`None` under `stock_compat`).
+    per_client_cap: Option<usize>,
+}
+
+/// In-flight uncached verifications one client (IPv4 address, or IPv6 /64) may have at once under
+/// the secure default; more get 429 immediately instead of queueing behind the hash pool.
+const CLIENT_WAITER_CAP: usize = 4;
+
+type ClientBucket = [u8; 16];
+
+/// The client bucket of a request: the resolved `client_ip` variable (set by the server from the
+/// trusted-proxy configuration, like the `client_ip` matcher) or else the peer address; IPv6
+/// addresses are bucketed by their /64.
+fn client_bucket(request: &Request) -> Option<ClientBucket> {
+    let parse = |value: &str| {
+        value
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .or_else(|| value.parse::<std::net::SocketAddr>().ok().map(|a| a.ip()))
+    };
+    let ip = request
+        .vars
+        .get("client_ip")
+        .and_then(|value| parse(value))
+        .or_else(|| request.remote_addr.map(|remote| remote.ip()))?;
+    Some(match ip {
+        std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
+        std::net::IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            octets[8..].fill(0);
+            // An IPv4-mapped address is the IPv4 client, not a /64 of mapped space.
+            match v6.to_ipv4_mapped() {
+                Some(v4) => v4.to_ipv6_mapped().octets(),
+                None => octets,
+            }
+        }
+    })
+}
+
+/// Bounded by construction: an entry exists only while that client has a verification in flight.
+#[derive(Default, Debug)]
+struct ClientWaiters {
+    counts: std::sync::Mutex<std::collections::HashMap<ClientBucket, usize>>,
+}
+
+struct WaiterGuard {
+    owner: std::sync::Arc<ClientWaiters>,
+    bucket: ClientBucket,
+}
+
+impl ClientWaiters {
+    fn enter(self: &std::sync::Arc<Self>, bucket: ClientBucket, cap: usize) -> Option<WaiterGuard> {
+        let mut counts = self.counts.lock().ok()?;
+        let count = counts.entry(bucket).or_insert(0);
+        if *count >= cap {
+            return None;
+        }
+        *count += 1;
+        Some(WaiterGuard {
+            owner: std::sync::Arc::clone(self),
+            bucket,
+        })
+    }
+}
+
+impl Drop for WaiterGuard {
+    fn drop(&mut self) {
+        if let Ok(mut counts) = self.owner.counts.lock() {
+            if let Some(count) = counts.get_mut(&self.bucket) {
+                *count -= 1;
+                if *count == 0 {
+                    counts.remove(&self.bucket);
+                }
+            }
+        }
+    }
+}
+
+/// Why a verification was refused instead of computed.
+#[derive(Debug, PartialEq, Eq)]
+enum Refusal {
+    /// The hash pool stayed saturated past the secure-default wait (503).
+    Overloaded,
+    /// This client already has the maximum in-flight uncached verifications (429).
+    ClientBusy,
 }
 
 /// Longest wait for a hash permit under the secure default before answering 503 + `Retry-After`.
@@ -862,6 +949,7 @@ impl BasicAuthHandler {
     ) -> Result<Self> {
         let mut handler = Self::from_json_inner(value, path)?;
         handler.max_wait = (!stock_compat).then_some(HASH_QUEUE_MAX_WAIT);
+        handler.per_client_cap = (!stock_compat).then_some(CLIENT_WAITER_CAP);
         Ok(handler)
     }
 
@@ -921,6 +1009,8 @@ impl BasicAuthHandler {
                     cache: std::sync::Arc::new(HashCache::new()),
                     limiter: std::sync::Arc::clone(hash_verification_limiter()),
                     max_wait: Some(HASH_QUEUE_MAX_WAIT),
+                    waiters: std::sync::Arc::default(),
+                    per_client_cap: Some(CLIENT_WAITER_CAP),
                 });
             }
             Some(provider) => provider.as_object().ok_or_else(|| {
@@ -1036,6 +1126,8 @@ impl BasicAuthHandler {
             cache: std::sync::Arc::new(HashCache::new()),
             limiter: std::sync::Arc::clone(hash_verification_limiter()),
             max_wait: Some(HASH_QUEUE_MAX_WAIT),
+            waiters: std::sync::Arc::default(),
+            per_client_cap: Some(CLIENT_WAITER_CAP),
         })
     }
 }
@@ -1396,12 +1488,13 @@ impl BasicAuthHandler {
     /// every cache key.
     async fn verify_offloaded(
         &self,
+        bucket: Option<ClientBucket>,
         username: Option<&str>,
         hash: std::sync::Arc<PasswordHash>,
         password: Vec<u8>,
-    ) -> Option<bool> {
+    ) -> std::result::Result<bool, Refusal> {
         if matches!(*hash, PasswordHash::Plaintext(_)) {
-            return Some(verify_password(&hash, &password));
+            return Ok(verify_password(&hash, &password));
         }
         let key = username.map(|username| {
             let mut identity = (username.len() as u64).to_be_bytes().to_vec();
@@ -1410,8 +1503,15 @@ impl BasicAuthHandler {
             self.cache.key(&identity, &password)
         });
         if key.as_ref().is_some_and(|key| self.cache.hit(key)) {
-            return Some(true);
+            return Ok(true);
         }
+        // Per-client fairness (secure default only): released when this future ends.
+        let _slot = match (self.per_client_cap, bucket) {
+            (Some(cap), Some(bucket)) => {
+                Some(self.waiters.enter(bucket, cap).ok_or(Refusal::ClientBusy)?)
+            }
+            _ => None,
+        };
         let cache = std::sync::Arc::clone(&self.cache);
         run_limited_within(&self.limiter, self.max_wait, move || {
             let matched = verify_password(&hash, &password);
@@ -1422,12 +1522,21 @@ impl BasicAuthHandler {
             matched
         })
         .await
+        .ok_or(Refusal::Overloaded)
     }
 }
 
 fn overloaded() -> Outcome {
+    refusal_response(StatusCode::SERVICE_UNAVAILABLE)
+}
+
+fn client_busy() -> Outcome {
+    refusal_response(StatusCode::TOO_MANY_REQUESTS)
+}
+
+fn refusal_response(status: StatusCode) -> Outcome {
     let mut response = Response {
-        status: StatusCode::SERVICE_UNAVAILABLE,
+        status,
         headers: HeaderMap::new(),
         body: Bytes::new(),
     };
@@ -1557,11 +1666,18 @@ impl Handler for BasicAuthHandler {
             |account| std::sync::Arc::clone(&account.hash),
         );
         let cache_user = account.is_some().then_some(username.as_str());
-        let Some(matches) = self
-            .verify_offloaded(cache_user, hash, password.into_bytes())
+        let matches = match self
+            .verify_offloaded(
+                client_bucket(&request),
+                cache_user,
+                hash,
+                password.into_bytes(),
+            )
             .await
-        else {
-            return Ok(overloaded());
+        {
+            Ok(matches) => matches,
+            Err(Refusal::Overloaded) => return Ok(overloaded()),
+            Err(Refusal::ClientBusy) => return Ok(client_busy()),
         };
         if !matches || account.is_none() {
             return Ok(challenge(&self.realm));
@@ -2631,6 +2747,96 @@ mod tests {
         );
     }
 
+    async fn attempt_from(handler: &BasicAuthHandler, remote: &str, password: &str) -> Outcome {
+        let mut request = base_request();
+        request.remote_addr = Some(remote.parse().unwrap());
+        request
+            .headers
+            .insert(header::AUTHORIZATION, authorization("alice", password));
+        handler.handle(request).await.unwrap()
+    }
+
+    /// B1 round 2: a single client may not occupy the whole wait queue. With the pool exhausted,
+    /// the fifth concurrent uncached attempt from one client (IPv6 bucketed by /64) is refused at
+    /// once with 429 + `Retry-After`, while another client still queues. `stock_compat` has no
+    /// per-client cap.
+    #[tokio::test]
+    async fn one_client_cannot_fill_the_hash_wait_queue() {
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let handler = Arc::new(
+            cached_handler(false, &limiter)
+                .with_hash_limits(Arc::clone(&limiter), Duration::from_secs(2)),
+        );
+        let held = Arc::clone(&limiter).acquire_owned().await.unwrap();
+        let mut waiting = Vec::new();
+        for index in 0..4 {
+            let handler = Arc::clone(&handler);
+            // Same /64, different interface identifiers.
+            let remote = format!("[2001:db8:1:2::{}]:5555", index + 1);
+            waiting.push(tokio::spawn(async move {
+                attempt_from(&handler, &remote, &format!("pw{index}")).await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let started = std::time::Instant::now();
+        let refused = tokio::time::timeout(
+            Duration::from_millis(500),
+            attempt_from(&handler, "[2001:db8:1:2::99]:1", "pw-extra"),
+        )
+        .await
+        .expect("the over-cap attempt must be refused immediately, not queued");
+        assert!(started.elapsed() < Duration::from_millis(500));
+        let Outcome::Respond(response) = refused else {
+            panic!("expected a response");
+        };
+        assert_eq!(response.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers.contains_key(http::header::RETRY_AFTER));
+        // A different client still queues (it is still waiting after 200 ms).
+        assert!(tokio::time::timeout(
+            Duration::from_millis(200),
+            attempt_from(&handler, "[2001:db8:9::1]:1", "pw-other")
+        )
+        .await
+        .is_err());
+        drop(held);
+        for task in waiting {
+            assert_eq!(
+                status_of(&task.await.unwrap()),
+                Some(StatusCode::UNAUTHORIZED)
+            );
+        }
+
+        // stock_compat: no per-client cap.
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let stock = Arc::new(cached_handler(true, &limiter));
+        let _held = Arc::clone(&limiter).acquire_owned().await.unwrap();
+        let mut pending = Vec::new();
+        for index in 0..6 {
+            let stock = Arc::clone(&stock);
+            pending.push(tokio::spawn(async move {
+                attempt_from(&stock, "203.0.113.7:1", &format!("pw{index}")).await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(pending.iter().all(|task| !task.is_finished()));
+        for task in pending {
+            task.abort();
+        }
+    }
+
+    #[test]
+    fn client_buckets_group_ipv6_by_64_and_keep_ipv4_exact() {
+        let key = |remote: &str| {
+            let mut request = base_request();
+            request.remote_addr = Some(remote.parse().unwrap());
+            client_bucket(&request)
+        };
+        assert_eq!(key("[2001:db8:1:2::1]:1"), key("[2001:db8:1:2:ffff::9]:2"));
+        assert_ne!(key("[2001:db8:1:2::1]:1"), key("[2001:db8:1:3::1]:1"));
+        assert_ne!(key("203.0.113.7:1"), key("203.0.113.8:1"));
+        assert_eq!(key("203.0.113.7:1"), key("203.0.113.7:99"));
+    }
+
     /// B1 round 2: only successes are cached. A failure gains no availability (the legitimate
     /// client is the one that succeeds) and every junk password would otherwise insert an entry,
     /// the flood vector that flushes legitimate entries.
@@ -2761,23 +2967,23 @@ mod tests {
         );
         let handler = basic_auth_handler(serde_json::json!({"handler": "basic_auth"}));
         let accept = handler
-            .verify_offloaded(Some("u"), bcrypt.clone(), b"pw".to_vec())
+            .verify_offloaded(None, Some("u"), bcrypt.clone(), b"pw".to_vec())
             .await;
-        assert_eq!(accept, Some(true));
+        assert_eq!(accept, Ok(true));
         let reject = handler
-            .verify_offloaded(Some("u"), bcrypt, b"nope".to_vec())
+            .verify_offloaded(None, Some("u"), bcrypt, b"nope".to_vec())
             .await;
-        assert_eq!(reject, Some(false));
+        assert_eq!(reject, Ok(false));
 
         let plain = std::sync::Arc::new(PasswordHash::Plaintext(b"pw".to_vec()));
         let accept = handler
-            .verify_offloaded(Some("u"), plain.clone(), b"pw".to_vec())
+            .verify_offloaded(None, Some("u"), plain.clone(), b"pw".to_vec())
             .await;
-        assert_eq!(accept, Some(true));
+        assert_eq!(accept, Ok(true));
         let reject = handler
-            .verify_offloaded(Some("u"), plain, b"px".to_vec())
+            .verify_offloaded(None, Some("u"), plain, b"px".to_vec())
             .await;
-        assert_eq!(reject, Some(false));
+        assert_eq!(reject, Ok(false));
     }
 }
 
