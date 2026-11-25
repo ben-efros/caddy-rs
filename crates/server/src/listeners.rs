@@ -2874,6 +2874,24 @@ where
     }
 }
 
+/// [`await_first_byte`] that also gives up on a forced shutdown (immediately) or a graceful one
+/// ([`HANDSHAKE_SHUTDOWN_GRACE`]), so a silent connection does not keep its tracker guard for the
+/// rest of the header budget after the listener is stopped.
+async fn admit_first_byte<I>(
+    stream: I,
+    budget: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+    force: &mut watch::Receiver<bool>,
+) -> Option<PrefixedStream<I>>
+where
+    I: AsyncRead + Unpin,
+{
+    bounded_handshake(await_first_byte(stream, budget), budget, shutdown, force)
+        .await
+        .ok()
+        .flatten()
+}
+
 /// A fresh per-listener in-flight body budget ([`ADMIN_MAX_CONCURRENT_BODIES`]).
 fn new_admin_body_slots() -> Arc<tokio::sync::Semaphore> {
     Arc::new(tokio::sync::Semaphore::new(ADMIN_MAX_CONCURRENT_BODIES))
@@ -3435,8 +3453,8 @@ async fn bind_admin_unix(
                 }
                 accepted = listener.accept() => {
                     let Ok((stream, _peer)) = accepted else { continue };
-                    let connection_shutdown = receiver.clone();
-                    let connection_force = force_receiver.clone();
+                    let mut connection_shutdown = receiver.clone();
+                    let mut connection_force = force_receiver.clone();
                     let tracked = loop_tracker.guard();
                     let service = AdminService {
                         api: api.clone(),
@@ -3447,8 +3465,13 @@ async fn bind_admin_unix(
                         let limits = Arc::new(ServerLimits::admin());
                         // Go's ReadHeaderTimeout runs from accept; hyper's protocol sniffing does
                         // not start it until the first byte, so bound a silent connection here.
-                        let Some(stream) =
-                            await_first_byte(stream, limits.read_header_timeout).await
+                        let Some(stream) = admit_first_byte(
+                            stream,
+                            limits.read_header_timeout,
+                            &mut connection_shutdown,
+                            &mut connection_force,
+                        )
+                        .await
                         else {
                             return;
                         };
@@ -3525,8 +3548,8 @@ pub(crate) async fn bind_admin(
                 accepted = listener.accept() => {
                     let Ok((stream, _peer)) = accepted else { continue };
                     let api = api.clone();
-                    let connection_shutdown = receiver.clone();
-                    let connection_force = force_receiver.clone();
+                    let mut connection_shutdown = receiver.clone();
+                    let mut connection_force = force_receiver.clone();
                     let tracked = loop_tracker.guard();
                     let service = AdminService {
                         api,
@@ -3536,8 +3559,13 @@ pub(crate) async fn bind_admin(
                         let _tracked = tracked;
                         let limits = Arc::new(ServerLimits::admin());
                         // See the Unix listener: bound a connection that never sends a byte.
-                        let Some(stream) =
-                            await_first_byte(stream, limits.read_header_timeout).await
+                        let Some(stream) = admit_first_byte(
+                            stream,
+                            limits.read_header_timeout,
+                            &mut connection_shutdown,
+                            &mut connection_force,
+                        )
+                        .await
                         else {
                             return;
                         };
@@ -4709,6 +4737,57 @@ mod admin_limits_tests {
             started.elapsed()
         );
         handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_silent_admin_connection_is_dropped_by_a_forced_stop_not_after_the_budget() {
+        let (handle, address) = listener().await;
+        let mut stream = TcpStream::connect(address).await.expect("connect");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let started = Instant::now();
+        handle.stop_forcibly().await;
+        let mut buffer = [0_u8; 16];
+        let outcome =
+            tokio::time::timeout(Duration::from_millis(1500), stream.read(&mut buffer)).await;
+        assert!(
+            outcome.is_ok(),
+            "a forced stop must drop a connection that has sent nothing ({:?})",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admit_first_byte_observes_shutdown_and_passes_traffic() {
+        use super::admit_first_byte;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (force_tx, force_rx) = tokio::sync::watch::channel(false);
+        let (mut shutdown, mut force) = (shutdown_rx.clone(), force_rx.clone());
+        // Traffic: the first byte is handed back unconsumed.
+        let (mut client, server) = tokio::io::duplex(64);
+        client.write_all(b"G").await.unwrap();
+        let admitted = admit_first_byte(server, Duration::from_secs(5), &mut shutdown, &mut force)
+            .await
+            .expect("a byte arrived");
+        let mut replay = Vec::new();
+        let mut admitted = admitted;
+        let mut one = [0_u8; 1];
+        admitted.read_exact(&mut one).await.unwrap();
+        replay.extend_from_slice(&one);
+        assert_eq!(replay, b"G");
+        // Silence + forced shutdown: gone immediately, long before the 5 s budget.
+        let (_client, server) = tokio::io::duplex(64);
+        let (mut shutdown, mut force) = (shutdown_rx.clone(), force_rx.clone());
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move {
+            admit_first_byte(server, Duration::from_secs(5), &mut shutdown, &mut force)
+                .await
+                .is_none()
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        force_tx.send(true).unwrap();
+        assert!(task.await.unwrap());
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        drop(shutdown_tx);
     }
 
     /// A body that never produces a frame, like a client trickling nothing.
