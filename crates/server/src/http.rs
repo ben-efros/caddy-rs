@@ -40,7 +40,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use bytes::Bytes;
 use http::{Method, StatusCode, Version};
-use http_body_util::{BodyExt, LengthLimitError, Limited};
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::upgrade::OnUpgrade;
 
@@ -52,7 +52,7 @@ use caddy_rs_http::{
 use caddy_rs_proxy::trusted_proxies::ServerTrustedProxies;
 
 use crate::auto_https::AutomaticHttpsServing;
-use crate::limits::ServerLimits;
+use crate::limits::{BufferedBodyReservation, ServerLimits};
 
 /// One served request at the hyper connection boundary.
 ///
@@ -185,21 +185,34 @@ pub(crate) async fn serve_request_with_automatic(
     }
 }
 
-/// Serve one already-buffered request through the router (the HTTP/3 path).
+/// The request body of one HTTP/3 request, as handed to the router.
+#[cfg(feature = "http3")]
+pub(crate) enum H3RequestBody {
+    /// The whole body, already collected (bounded and reserved against the buffered-body budget by
+    /// the caller). Used when a handler in the route tree needs the complete body up front.
+    Buffered(Bytes),
+    /// A body fed chunk by chunk from the QUIC stream while the handler consumes it, so a file of
+    /// any size flows through without being held in memory. The status is set by the body reader
+    /// when the upload fails (timeout, length mismatch, transport error); see [`serve_internal_h3`].
+    Streaming(StreamingBody, Arc<std::sync::atomic::AtomicU16>),
+}
+
+/// Serve one HTTP/3 request through the router.
 ///
-/// HTTP/3 requests arrive through `h3` as `http::Request<()>` plus a stream; the server collects
-/// the request body first (bounded by the server's `max_request_body_size`, matching the buffered
-/// HTTP/1.1 path) and then runs the exact same internal [`caddy_rs_http::Request`] pipeline as
+/// HTTP/3 requests arrive through `h3` as `http::Request<()>` plus a stream. The body is either
+/// already collected (bounded by the buffered-body limit and budget) or a stream the handlers pull
+/// from, bounded lazily by `max_request_body_size` exactly like HTTP/1.1 and HTTP/2. This then runs
+/// the exact same internal [`caddy_rs_http::Request`] pipeline as
 /// HTTP/1.1/HTTP/2: server-level trusted-proxy resolution, `tls.alpn`, local-address variables and
 /// [`caddy_rs_http::Router::handle_upgradable`]. Protocol upgrades (WebSocket/WebTransport) are not
 /// supported over HTTP/3 and are reported as `501 Not Implemented` instead of a silent downgrade.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "http3")]
-pub(crate) async fn serve_internal_buffered(
+pub(crate) async fn serve_internal_h3(
     limits: &ServerLimits,
     router: Arc<Router>,
     parts: http::request::Parts,
-    body: Bytes,
+    body: H3RequestBody,
     remote_addr: Option<SocketAddr>,
     local_addr: Option<SocketAddr>,
     tls: bool,
@@ -230,7 +243,7 @@ pub(crate) async fn serve_internal_buffered(
             );
         }
     }
-    if let Some(limit) = limit {
+    if let (Some(limit), H3RequestBody::Buffered(body)) = (limit, &body) {
         if body.len() as u64 > limit {
             return served_response_with_identity(
                 limits,
@@ -249,10 +262,23 @@ pub(crate) async fn serve_internal_buffered(
     internal.tls_connection = tls_connection;
     internal.client_certificate = client_certificate;
     internal.sni = sni;
-    if let Some(access_log) = access_log {
-        internal = internal.with_access_log(access_log);
+    if let Some(access_log) = &access_log {
+        internal = internal.with_access_log(Arc::clone(access_log));
     }
-    internal.body = body;
+    let mut body_failure = None;
+    match body {
+        H3RequestBody::Buffered(body) => internal.body = body,
+        H3RequestBody::Streaming(mut stream, failure) => {
+            body_failure = Some(failure);
+            // The limit is applied lazily by `RequestBody::with_limit`; the shared counter records
+            // the bytes the handlers actually read (Caddy's `bytes_read`).
+            if let Some(access_log) = &access_log {
+                stream = stream.with_counter(access_log.request_bytes());
+            }
+            internal =
+                internal.with_streaming_body(RequestBody::streaming(stream).with_limit(limit));
+        }
+    }
     if let Some(local) = local_addr {
         internal
             .vars
@@ -272,7 +298,25 @@ pub(crate) async fn serve_internal_buffered(
             .insert("tls.alpn".to_string(), alpn.to_string());
     }
     trusted_proxies.apply(&mut internal);
-    match router.handle_upgradable(internal).await {
+    let outcome = router.handle_upgradable(internal).await;
+    // The request body failed mid-stream (the client stalled, sent a body that disagrees with its
+    // `Content-Length`, or the stream broke). A proxy upstream may have seen the failed body as a
+    // complete, shorter one and answered success; the client must never be told its upload
+    // succeeded, so the handler's answer is replaced.
+    if let Some(status) = body_failure
+        .as_ref()
+        .map(|failure| failure.load(std::sync::atomic::Ordering::SeqCst))
+        .filter(|status| *status != 0)
+        .and_then(|status| StatusCode::from_u16(status).ok())
+    {
+        let text = if status == StatusCode::REQUEST_TIMEOUT {
+            "408 Request Timeout"
+        } else {
+            "400 Bad Request"
+        };
+        return served_response_with_identity(limits, status_response(status, text));
+    }
+    match outcome {
         Ok(ResponseOutcome::Response(response)) => ServedResponse::Response(
             to_hyper_streaming_with_identity(response, &limits.server_identity),
         ),
@@ -492,12 +536,44 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
     // buffering is bounded by the configured limit.
     let can_stream =
         !router.requires_buffered_request_body() && (declared_length.is_some() || limit.is_none());
+    // Held until the response is produced: the buffered body stays in memory for the whole request.
+    let mut buffered_reservation = BufferedBodyReservation::default();
     if !can_stream {
+        // A declared length over the buffering ceiling is refused before a byte is read.
+        if declared_length.is_some_and(|declared| declared > limits.buffered_body_limit()) {
+            return served_response_with_identity(
+                limits,
+                status_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "413 Request Entity Too Large",
+                ),
+            );
+        }
         // Compatibility/bounded path: handlers that consume the full body today (the reverse
         // proxy; T-PROXY-004 follow-up streams through it) and chunked bodies with a configured
-        // limit are buffered, enforcing the limit while reading exactly as before.
-        let body = match read_body(body, limit).await {
+        // limit are buffered, bounded per request by `buffered_body_limit` and across requests by
+        // the process-wide buffered-body budget.
+        let body = match read_body(
+            body,
+            limits.buffered_body_limit(),
+            &mut buffered_reservation,
+        )
+        .await
+        {
             Ok(body) => body,
+            Err(BodyReadError::Overloaded) => {
+                tracing::warn!(
+                    path = %path,
+                    "too many request bodies are buffered in memory; refusing with 503"
+                );
+                return served_response_with_identity(
+                    limits,
+                    status_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "503 Service Unavailable",
+                    ),
+                );
+            }
             Err(BodyReadError::TooLarge { limit }) => {
                 tracing::debug!(
                     limit,
@@ -651,30 +727,38 @@ pub(crate) fn declared_content_length(headers: &http::HeaderMap) -> Option<u64> 
 enum BodyReadError {
     /// The configured body limit was exceeded.
     TooLarge { limit: u64 },
+    /// The process-wide budget for buffered request bodies is exhausted.
+    Overloaded,
     /// The transport failed while reading the body.
     Read(Box<dyn std::error::Error + Send + Sync>),
 }
 
-/// Collect a request body, enforcing an optional byte limit.
-async fn read_body(body: Incoming, limit: Option<u64>) -> Result<Bytes, BodyReadError> {
-    match limit {
-        Some(limit) => {
-            // `usize::try_from(...).unwrap_or(usize::MAX)` keeps the limit meaningful on
-            // platforms where `usize` is narrower than `u64`.
-            let capacity = usize::try_from(limit).unwrap_or(usize::MAX);
-            match Limited::new(body, capacity).collect().await {
-                Ok(collected) => Ok(collected.to_bytes()),
-                Err(error) if error.downcast_ref::<LengthLimitError>().is_some() => {
-                    Err(BodyReadError::TooLarge { limit })
-                }
-                Err(error) => Err(BodyReadError::Read(error)),
-            }
+/// Collect a request body into one contiguous buffer, enforcing a byte limit and reserving every
+/// byte against the process-wide buffered-body budget (see [`BUFFERED_BODY_BUDGET_BYTES`]).
+///
+/// Frames are copied straight into one growing buffer (no chunk list plus a second contiguous
+/// copy), and the reservation is taken *before* the bytes are accepted, so a flood of in-flight
+/// bodies is refused rather than allocated.
+async fn read_body(
+    mut body: Incoming,
+    limit: u64,
+    reservation: &mut BufferedBodyReservation,
+) -> Result<Bytes, BodyReadError> {
+    let mut buffer = bytes::BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|error| BodyReadError::Read(Box::new(error)))?;
+        let Ok(data) = frame.into_data() else {
+            continue; // trailers are not part of the body
+        };
+        if buffer.len() as u64 + data.len() as u64 > limit {
+            return Err(BodyReadError::TooLarge { limit });
         }
-        None => match body.collect().await {
-            Ok(collected) => Ok(collected.to_bytes()),
-            Err(error) => Err(BodyReadError::Read(Box::new(error))),
-        },
+        if !reservation.try_grow(data.len()) {
+            return Err(BodyReadError::Overloaded);
+        }
+        buffer.extend_from_slice(&data);
     }
+    Ok(buffer.freeze())
 }
 
 /// Convert a fully buffered internal response to a hyper response.

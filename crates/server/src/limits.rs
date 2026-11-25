@@ -37,6 +37,13 @@ pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Default HTTP/1 header-read timeout, matching Caddy's `defaultReadHeaderTimeout` (1 minute).
 pub const DEFAULT_READ_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Caddy's `read_idle_timeout` default: how long a request-body read may stall before the request
+/// is aborted. A negative configured value disables it.
+pub const DEFAULT_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Caddy server field for the stalled-read timeout (preserved in the unknown-field map).
+pub const READ_IDLE_TIMEOUT_FIELD: &str = "read_idle_timeout";
+
 /// caddy-rs extension: maximum request body size in bytes (`0`/absent = unlimited).
 pub const MAX_REQUEST_BODY_SIZE_FIELD: &str = "max_request_body_size";
 
@@ -93,6 +100,11 @@ pub struct ServerLimits {
     /// Maximum time to read HTTP/1 request headers. Always set; Caddy's default is 1 minute.
     pub read_header_timeout: Duration,
 
+    /// How long a request-body read may stall before the request is aborted (Caddy's
+    /// `read_idle_timeout`, default 1 minute; `None` when configured negative). Enforced on
+    /// HTTP/3 request bodies; HTTP/1.1 and HTTP/2 rely on `read_timeout` (DIV-0029).
+    pub read_idle_timeout: Option<Duration>,
+
     /// Maximum size in bytes of the request head. `None` uses the hyper default.
     pub max_header_bytes: Option<usize>,
 
@@ -114,6 +126,7 @@ impl Default for ServerLimits {
             write_timeout: None,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             read_header_timeout: DEFAULT_READ_HEADER_TIMEOUT,
+            read_idle_timeout: Some(DEFAULT_READ_IDLE_TIMEOUT),
             max_header_bytes: None,
             max_request_body_size: None,
             max_connections: None,
@@ -122,7 +135,63 @@ impl Default for ServerLimits {
     }
 }
 
+/// Ceiling for a request body that the server must hold in memory (the buffered path: routes with
+/// `reverse_proxy` retries, FastCGI or `handle_response`, and every HTTP/3 request) when no
+/// `max_request_body_size` is configured. Streamed bodies are unaffected. Without it one
+/// unauthenticated client streaming a multi-GB chunked body exhausts memory.
+pub const DEFAULT_BUFFERED_BODY_LIMIT: u64 = 128 * 1024 * 1024;
+
+/// Process-wide budget, in bytes of *peak memory*, for request bodies buffered at the same time.
+///
+/// The per-request cap alone does not bound memory: one HTTP/2 connection multiplexes hundreds of
+/// streams and `max_connections` is unlimited, so N requests just under the cap still pin
+/// N x cap. Every buffered body reserves twice its size here (collecting and the final contiguous
+/// copy can briefly both be alive) and the reservation is held until the response is produced.
+/// When the budget is exhausted the request is answered `503` instead of growing the heap.
+pub const BUFFERED_BODY_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
+
+/// One permit per KiB keeps the budget inside `Semaphore::MAX_PERMITS` on 32-bit targets.
+const BUDGET_UNIT: usize = 1024;
+
+static BUFFERED_BODY_BUDGET: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(BUFFERED_BODY_BUDGET_BYTES / BUDGET_UNIT);
+
+/// A growing reservation against [`BUFFERED_BODY_BUDGET_BYTES`], released on drop.
+#[derive(Default)]
+pub(crate) struct BufferedBodyReservation {
+    permit: Option<tokio::sync::SemaphorePermit<'static>>,
+}
+
+impl BufferedBodyReservation {
+    /// Reserve room for `bytes` more body bytes (twice that in budget terms). Returns `false`,
+    /// reserving nothing further, when the process-wide budget cannot cover it.
+    pub(crate) fn try_grow(&mut self, bytes: usize) -> bool {
+        let units = bytes.saturating_mul(2).div_ceil(BUDGET_UNIT).max(1);
+        let Ok(units) = u32::try_from(units) else {
+            return false;
+        };
+        match BUFFERED_BODY_BUDGET.try_acquire_many(units) {
+            Ok(permit) => {
+                match self.permit.as_mut() {
+                    Some(existing) => existing.merge(permit),
+                    None => self.permit = Some(permit),
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
 impl ServerLimits {
+    /// Body-size limit applied while buffering a request body: the configured
+    /// `max_request_body_size`, or [`DEFAULT_BUFFERED_BODY_LIMIT`] when none is set.
+    #[must_use]
+    pub fn buffered_body_limit(&self) -> u64 {
+        self.max_request_body_size
+            .unwrap_or(DEFAULT_BUFFERED_BODY_LIMIT)
+    }
+
     /// Parse the limits and timeouts of one Caddy HTTP server object.
     ///
     /// Errors are located at the offending JSON path, for example
@@ -160,6 +229,23 @@ impl ServerLimits {
             READ_HEADER_TIMEOUT_FIELD,
         )?
         .unwrap_or(DEFAULT_READ_HEADER_TIMEOUT);
+        let read_idle_timeout = match server.extra.get(READ_IDLE_TIMEOUT_FIELD) {
+            None => Some(DEFAULT_READ_IDLE_TIMEOUT),
+            Some(value) if value.is_null() => Some(DEFAULT_READ_IDLE_TIMEOUT),
+            Some(value) => {
+                let nanos = parse_caddy_duration(value).map_err(|message| {
+                    CoreError::invalid(
+                        format!("{base}.{READ_IDLE_TIMEOUT_FIELD}"),
+                        format!("invalid duration: {message}"),
+                    )
+                })?;
+                match nanos {
+                    nanos if nanos < 0 => None,
+                    0 => Some(DEFAULT_READ_IDLE_TIMEOUT),
+                    nanos => Some(Duration::from_nanos(nanos as u64)),
+                }
+            }
+        };
 
         let max_header_bytes = extra_size(
             &server.extra,
@@ -196,6 +282,7 @@ impl ServerLimits {
             write_timeout,
             idle_timeout,
             read_header_timeout,
+            read_idle_timeout,
             max_header_bytes,
             max_request_body_size,
             max_connections,
@@ -401,6 +488,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn buffered_bodies_are_bounded_even_without_a_configured_limit() {
+        let mut limits = ServerLimits::default();
+        assert_eq!(limits.buffered_body_limit(), DEFAULT_BUFFERED_BODY_LIMIT);
+        limits.max_request_body_size = Some(1024);
+        assert_eq!(limits.buffered_body_limit(), 1024);
+    }
+
     fn nanos(value: Value) -> Result<i64, String> {
         parse_caddy_duration(&value)
     }
@@ -562,5 +657,70 @@ mod tests {
         assert!(error
             .to_string()
             .contains("apps.http.servers.srv0.max_connections"));
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn reservation_draws_on_the_budget_refuses_when_empty_and_releases_on_drop() {
+        // This binary's other unit tests never buffer request bodies, so the process-wide budget
+        // is idle here.
+        let mut hog = BufferedBodyReservation::default();
+        // Twice the body size is reserved, so half the budget in bytes takes all of it.
+        assert!(hog.try_grow(BUFFERED_BODY_BUDGET_BYTES / 2));
+        let mut other = BufferedBodyReservation::default();
+        assert!(!other.try_grow(1), "an exhausted budget refuses even one byte");
+        drop(hog);
+        assert!(other.try_grow(1024), "the budget is returned on drop");
+        assert!(other.try_grow(1024), "a reservation can keep growing");
+    }
+}
+
+#[cfg(test)]
+mod read_idle_timeout_tests {
+    use super::*;
+
+    fn limits(server_fields: serde_json::Value) -> Result<ServerLimits, CoreError> {
+        let mut server = serde_json::json!({"listen": [":8080"], "routes": []});
+        for (key, value) in server_fields.as_object().unwrap() {
+            server[key] = value.clone();
+        }
+        let server: HttpServer = serde_json::from_value(server).unwrap();
+        ServerLimits::from_http_server("srv0", &server, false, false)
+    }
+
+    /// Stock Caddy: `read_idle_timeout` defaults to one minute, a negative value disables it, and
+    /// zero means "use the default".
+    #[test]
+    fn read_idle_timeout_follows_caddys_semantics() {
+        assert_eq!(
+            limits(serde_json::json!({})).unwrap().read_idle_timeout,
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            limits(serde_json::json!({"read_idle_timeout": "5s"}))
+                .unwrap()
+                .read_idle_timeout,
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            limits(serde_json::json!({"read_idle_timeout": "-1s"}))
+                .unwrap()
+                .read_idle_timeout,
+            None,
+            "a negative value disables the timeout"
+        );
+        assert_eq!(
+            limits(serde_json::json!({"read_idle_timeout": 0}))
+                .unwrap()
+                .read_idle_timeout,
+            Some(Duration::from_secs(60)),
+            "zero keeps the default"
+        );
+        let error = limits(serde_json::json!({"read_idle_timeout": "soon"})).unwrap_err();
+        assert!(error.to_string().contains("read_idle_timeout"), "{error}");
     }
 }

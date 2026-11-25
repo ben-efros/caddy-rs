@@ -30,6 +30,25 @@ Per-server limits and timeouts are available as `read_timeout`, `write_timeout`,
 extensions: `max_request_body_size` (bytes, `0` means unlimited) and `max_connections` (concurrent
 connections per listener, `0` means unlimited).
 
+On HTTP/3 a request body read that stalls for `read_idle_timeout` (Caddy's field; default one
+minute, a negative value disables it) or `read_timeout`, whichever is shorter, aborts the request
+with `408`, and a body that disagrees with its declared `Content-Length` is a `400`.
+
+Request bodies stream to the handlers on HTTP/1.1, HTTP/2 and HTTP/3, so an upload of any size
+(tens of gigabytes) passes through without being held in memory. A body is **buffered** instead
+only when a handler in the server's route tree needs all of it up front — `reverse_proxy` with
+`retries`/`try_duration`, FastCGI (`php_fastcgi`), `handle_response` (and so `forward_auth`) — or
+when a `max_request_body_size` is configured and the client sends a chunked body with no
+`Content-Length`. The buffering decision is made per server, not per route: one such route makes
+every request on that server buffered. Buffered bodies are bounded in this build even when no limit
+is configured: each request is capped at 128 MiB (`413` over it; a declared `Content-Length` over
+the cap is refused before any byte is read; a larger `max_request_body_size` raises the cap) and
+all in-flight buffered bodies together draw on a 1 GiB process-wide budget, after which new
+buffered requests are answered `503`. Put large-upload endpoints on a server block that has no
+buffering handler (and leave `max_request_body_size` unset, or send a `Content-Length`) so they
+stream. These ceilings are registered as divergences from stock Caddy, which has no default limit;
+see [compatibility/SECURITY-REVIEW-HARDENING.md](compatibility/SECURITY-REVIEW-HARDENING.md).
+
 Server-level `trusted_proxies`, `trusted_proxies_strict`, `trusted_proxies_unix` and
 `client_ip_headers` control how the proxy's forwarding headers are believed. They affect the
 resolved client address used by the `client_ip` matcher, forwarding decisions and access logs.
