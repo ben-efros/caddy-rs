@@ -22,12 +22,132 @@
 //!
 //! Re-run just this file:
 //! `cargo test --offline -p caddy-rs-tls --test ocsp_request_fuzz`
+//!
+//! Tier 1 knobs: `FUZZ_SEED` (u64) and `FUZZ_CASES` (usize) override the tier-0 constants below, so
+//! a sweep can vary the corpus without editing the file. The contract matches the one
+//! `crates/config/tests/adapter_fuzz.rs` established (T-FUZZ-SPEC-TIERS) and that `ocsp_fuzz.rs`
+//! carries (T-FUZZ-SEED-OCSP): unset is the silent tier-0 path, a parseable value switches to tier 1,
+//! and an unparseable or out-of-range value is a loud failure naming the variable — never a silent
+//! fall back to tier 0 that reports green.
 
 use caddy_rs_tls::{build_ocsp_request, OcspError};
 
+// -------------------------------------------------------------------------------------------------
+// Tier 1 knobs (FUZZ_SEED / FUZZ_CASES)
+// -------------------------------------------------------------------------------------------------
+
 /// Corpus size. Bounded so the suite stays CI-fast (target: well under 5 s on a debug build).
+/// Used when `FUZZ_CASES` is unset.
 const RANDOM_CASES: usize = 4_000;
 const MUTATION_CASES: usize = 4_000;
+
+/// Tier-0 seeds, one per generator. Used when `FUZZ_SEED` is unset.
+const SEED_RANDOM: u64 = 0x5EED_0000_0000_0011;
+const SEED_MUTATION: u64 = 0x5EED_0000_0000_0012;
+
+/// Ceiling for `FUZZ_CASES`. The suite must stay CI-fast, so an out-of-range value is a loud error
+/// rather than a slow suite. Matches `MAX_CASES` in `adapter_fuzz.rs` and `ocsp_fuzz.rs`.
+const MAX_CASES: usize = 10_000;
+
+/// Read a knob. `Ok(None)` when unset (the silent tier-0 path); `Ok(Some(v))` when set to a valid
+/// value; `Err` naming the variable and the offending value when set to something unusable — so a
+/// misconfigured sweep fails loudly instead of silently running tier 0 and reporting green.
+///
+/// Kept identical in shape to the copies in `crates/config/tests/adapter_fuzz.rs` and
+/// `ocsp_fuzz.rs`. The copies cannot be shared today: an integration test is its own crate and
+/// `caddy-rs-tls` does not dev-depend on a common helper. Extraction is filed as
+/// T-FUZZ-SEED-OTHER-TARGETS rather than done here, because this change's declared scope is this
+/// file; with three call sites it is now worth doing rather than duplicating again.
+fn knob<T>(name: &str, max: Option<T>) -> Result<Option<T>, String>
+where
+    T: std::str::FromStr + PartialOrd + std::fmt::Display + Copy,
+{
+    match std::env::var(name) {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(format!("{name} is set but unreadable: {err}")),
+        Ok(raw) => {
+            let value = raw.parse::<T>().map_err(|_| {
+                format!("{name}={raw:?} is not a valid value; unset it to run tier 0 (using the in-file constant), or pass a parseable value")
+            })?;
+            if let Some(max) = max {
+                if value > max {
+                    return Err(format!(
+                        "{name}={raw:?} is out of range: must be at most {max}; unset it to run tier 0 (using the in-file constant)"
+                    ));
+                }
+            }
+            Ok(Some(value))
+        }
+    }
+}
+
+/// Resolved knob values for one run: the tier the run executed and the seeds/counts it used.
+struct Knobs {
+    seed: Option<u64>,
+    cases: Option<usize>,
+}
+
+impl Knobs {
+    /// Resolve both knobs from the environment, failing loudly on an invalid value.
+    fn from_env() -> Result<Self, String> {
+        Ok(Self {
+            seed: knob::<u64>("FUZZ_SEED", None)?,
+            cases: knob::<usize>("FUZZ_CASES", Some(MAX_CASES))?,
+        })
+    }
+
+    /// Seed for a generator: the tier-1 `FUZZ_SEED` when set, else this generator's tier-0 constant.
+    ///
+    /// Offset by a distinct constant per generator so a given `FUZZ_SEED` still yields a different
+    /// stream per generator, exactly as the tier-0 constants do.
+    fn seed(&self, tier0: u64) -> u64 {
+        match self.seed {
+            Some(seed) => seed.wrapping_add(tier0),
+            None => tier0,
+        }
+    }
+
+    /// One line naming the tier and the resolved values, so a sweep's output identifies which knobs
+    /// it actually executed.
+    fn announce(&self) -> String {
+        match (self.seed, self.cases) {
+            (None, None) => {
+                "fuzz tier 0 (unset FUZZ_SEED/FUZZ_CASES; in-file constants)".to_string()
+            }
+            (seed, cases) => format!(
+                "fuzz tier 1: FUZZ_SEED={} FUZZ_CASES={}",
+                seed.map_or_else(|| "unset".to_string(), |v| v.to_string()),
+                cases.map_or_else(|| "unset".to_string(), |v| v.to_string()),
+            ),
+        }
+    }
+
+    /// Case count for a generator, scaled so `FUZZ_CASES` is the total across this file rather than
+    /// per generator. The tier-0 ratio between generators is preserved, and every generator still
+    /// runs at least one case so a tiny `FUZZ_CASES` exercises all of them.
+    fn cases(&self, tier0: usize) -> usize {
+        match self.cases {
+            None => tier0,
+            Some(total) => (total * tier0 / tier0_total()).max(1),
+        }
+    }
+}
+
+/// Resolve the knobs for a test body, panicking with the located message when a value is unusable.
+///
+/// A panicking resolver is the point: `FUZZ_SEED=garbage` must fail the run naming the variable, not
+/// quietly execute tier 0 and report success.
+fn knobs_or_fail() -> Knobs {
+    match Knobs::from_env() {
+        Ok(knobs) => knobs,
+        Err(err) => panic!("{err}"),
+    }
+}
+
+/// Tier-0 total, the denominator the tier-1 case counts are scaled against.
+fn tier0_total() -> usize {
+    RANDOM_CASES + MUTATION_CASES
+}
 
 /// xorshift64 — deterministic, dependency-free PRNG.
 fn xorshift(state: &mut u64) -> u64 {
@@ -236,10 +356,92 @@ fn assert_typed_outcome(leaf: &[u8], issuer: &[u8], context: &str) {
 
 // --- Tests ----------------------------------------------------------------------------------
 
+// -------------------------------------------------------------------------------------------------
+// Recording harness for the knob contract tests
+// -------------------------------------------------------------------------------------------------
+//
+// The generators assert a typed outcome and return nothing, so a contract test cannot observe what
+// they generated. Rather than re-implement them in the test -- which is how T-FUZZ-SEED-OCSP's first
+// revision ended up asserting nothing about the real code -- each body records a transcript of what
+// it saw, and the contract tests compare transcripts.
+
+thread_local! {
+    static TRANSCRIPT: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Record one observation: a byte per assertion site, cheap and order-preserving.
+fn record(observation: u8) {
+    TRANSCRIPT.with(|t| t.borrow_mut().push(observation));
+}
+
+fn take_transcript() -> Vec<u8> {
+    TRANSCRIPT.with(|t| std::mem::take(&mut *t.borrow_mut()))
+}
+
+/// Fold a byte string to one observation byte, so a corpus of multi-kilobyte certificate blobs
+/// collapses to something comparable across seeds.
+fn fold(bytes: &[u8]) -> u8 {
+    bytes
+        .iter()
+        .fold(0_u8, |acc, b| acc.wrapping_mul(31).wrapping_add(*b))
+}
+
+/// Called by the generator wrappers, so a test can prove the WRAPPER announced its tier rather than
+/// only that `announce()` returns a well-formed string.
+/// Emit one line of operator-visible output.
+///
+/// The wrappers announce through this. Two earlier revisions tested the announcement in-process --
+/// first by asserting `announce()`'s return value, then by recording beside `println!` in a sink --
+/// and BOTH stayed green when the print was deleted, because an in-process proxy is a statement about
+/// a helper the test calls, not about the bytes an operator sees. The announcement is therefore
+/// asserted by re-running this binary as a subprocess and reading its real stdout; see
+/// `a_tier1_run_prints_its_tier_line`.
+fn emit(line: String) {
+    println!("{line}");
+}
+
+fn record_random(knobs: &Knobs) -> Vec<u8> {
+    take_transcript();
+    run_random(knobs);
+    take_transcript()
+}
+
+fn record_mutated(knobs: &Knobs) -> Vec<u8> {
+    take_transcript();
+    run_mutated(knobs);
+    take_transcript()
+}
+
+/// A stable digest for pinning an observed transcript. FNV-1a: no dependency, adequate for a
+/// change-detector, and deliberately not a security primitive.
+fn digest(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Pinned tier-0 digests of the OBSERVED transcripts. These change only for an intended, reviewed
+/// tier-0 change: a tier-0 constant or count that moves must move them, which is the point, but
+/// re-pinning them without asking why defeats the test.
+const EXPECTED_TIER0_RANDOM: u64 = 0x5a7e052b4af625fe;
+const EXPECTED_TIER0_MUTATED: u64 = 0xbd22d50e6bd14c32;
+
 #[test]
 fn random_buffers_never_panic_and_only_return_typed_errors() {
-    let mut state = 0x5EED_0000_0000_0011_u64;
-    for case in 0..RANDOM_CASES {
+    let knobs = knobs_or_fail();
+    emit(knobs.announce());
+    run_random(&knobs);
+}
+
+/// Body of `random_buffers_never_panic_and_only_return_typed_errors`, callable with an explicit
+/// [`Knobs`] so the knob contract can be asserted against the generator that actually runs rather
+/// than against `Knobs` alone.
+fn run_random(knobs: &Knobs) {
+    let mut state = knobs.seed(SEED_RANDOM);
+    for case in 0..knobs.cases(RANDOM_CASES) {
         let leaf_len = (xorshift(&mut state) % 96) as usize;
         let mut leaf = Vec::with_capacity(leaf_len);
         for _ in 0..leaf_len {
@@ -250,6 +452,7 @@ fn random_buffers_never_panic_and_only_return_typed_errors() {
         for _ in 0..issuer_len {
             issuer.push(xorshift(&mut state) as u8);
         }
+        record(fold(&leaf) ^ fold(&issuer));
         assert_typed_outcome(&leaf, &issuer, &format!("random case {case}"));
     }
 }
@@ -266,9 +469,17 @@ fn valid_certificates_are_accepted() {
 
 #[test]
 fn mutated_valid_certificates_never_panic() {
+    let knobs = knobs_or_fail();
+    emit(knobs.announce());
+    run_mutated(&knobs);
+}
+
+/// Body of `mutated_valid_certificates_never_panic`, callable with an explicit [`Knobs`] so the knob
+/// contract can be asserted against the generator that actually runs.
+fn run_mutated(knobs: &Knobs) {
     let (leaf, issuer) = valid_pair();
-    let mut state = 0x5EED_0000_0000_0012_u64;
-    for case in 0..MUTATION_CASES {
+    let mut state = knobs.seed(SEED_MUTATION);
+    for case in 0..knobs.cases(MUTATION_CASES) {
         let mut leaf = leaf.clone();
         let mut issuer = issuer.clone();
         // Flip between one and four bytes across both certificates.
@@ -285,6 +496,7 @@ fn mutated_valid_certificates_never_panic() {
             let at = (xorshift(&mut state) as usize) % target.len();
             target[at] = xorshift(&mut state) as u8;
         }
+        record(fold(&leaf) ^ fold(&issuer));
         assert_typed_outcome(&leaf, &issuer, &format!("mutation case {case}"));
     }
 }
@@ -471,4 +683,194 @@ fn regression_corpus_never_panics() {
     for (description, leaf, issuer) in corpus {
         assert_typed_outcome(&leaf, &issuer, description);
     }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Tier 1 knob contract
+// -------------------------------------------------------------------------------------------------
+//
+// These build `Knobs` by hand rather than reading the environment, so they do not depend on how this
+// binary was invoked and cannot race the other tests in it (std::env::set_var is unsafe in Rust 2024
+// for exactly that reason).
+
+#[test]
+fn every_generator_honours_the_seed_knob() {
+    // The test T-FUZZ-SEED-OCSP's review demanded: each REAL generator body is driven with explicit
+    // Knobs, so dropping the seed threading at any one call site -- leaving that generator ignoring
+    // FUZZ_SEED forever while the suite stays green -- fails here.
+    let tier0 = Knobs {
+        seed: None,
+        cases: Some(3),
+    };
+    let a = Knobs {
+        seed: Some(999),
+        cases: Some(3),
+    };
+    let b = Knobs {
+        seed: Some(1000),
+        cases: Some(3),
+    };
+
+    let ra = record_random(&a);
+    let rb = record_random(&b);
+    let ma = record_mutated(&a);
+    let mb = record_mutated(&b);
+    assert_ne!(ra, rb, "random_buffers_never_panic... ignores FUZZ_SEED");
+    assert_ne!(ma, mb, "mutated_valid_certificates... ignores FUZZ_SEED");
+
+    // And unset must differ from both, or the knob silently has no tier-0 path.
+    let r0 = record_random(&tier0);
+    let m0 = record_mutated(&tier0);
+    assert_ne!(r0, ra, "random generator ignores the knob when it is unset");
+    assert_ne!(
+        m0, ma,
+        "mutation generator ignores the knob when it is unset"
+    );
+}
+
+#[test]
+fn the_tier0_corpus_is_pinned() {
+    // Pins the OBSERVED tier-0 output, not a constant compared with itself, so changing SEED_RANDOM,
+    // SEED_MUTATION, RANDOM_CASES or MUTATION_CASES changes these digests and fails.
+    let tier0 = Knobs {
+        seed: None,
+        cases: None,
+    };
+    let observed = (
+        digest(&record_random(&tier0)),
+        digest(&record_mutated(&tier0)),
+    );
+    assert_eq!(
+        observed,
+        (EXPECTED_TIER0_RANDOM, EXPECTED_TIER0_MUTATED),
+        "the tier-0 corpus changed: unset FUZZ_SEED/FUZZ_CASES must reproduce the historical stream \
+         exactly, so a changed digest means a tier-0 constant or count moved"
+    );
+}
+
+#[test]
+fn the_case_budget_is_split_across_generators_and_never_reaches_zero() {
+    let knobs = Knobs {
+        seed: None,
+        cases: Some(50),
+    };
+    assert_eq!(
+        knobs.cases(RANDOM_CASES) + knobs.cases(MUTATION_CASES),
+        50,
+        "the budget must be the suite total"
+    );
+    let tiny = Knobs {
+        seed: None,
+        cases: Some(1),
+    };
+    assert_eq!(tiny.cases(RANDOM_CASES), 1);
+    assert_eq!(tiny.cases(MUTATION_CASES), 1);
+    let zero = Knobs {
+        seed: None,
+        cases: Some(0),
+    };
+    assert_eq!(zero.cases(RANDOM_CASES), 1);
+    assert_eq!(zero.cases(MUTATION_CASES), 1);
+}
+
+#[test]
+fn tier1_says_which_tier_it_ran() {
+    let knobs = Knobs {
+        seed: Some(12345),
+        cases: Some(50),
+    };
+    let announced = knobs.announce();
+    assert!(
+        announced.contains("tier 1"),
+        "announce must name the tier: {announced}"
+    );
+    assert!(
+        announced.contains("12345"),
+        "announce must name the seed: {announced}"
+    );
+    assert!(
+        announced.contains("50"),
+        "announce must name the case budget: {announced}"
+    );
+    assert!(Knobs {
+        seed: None,
+        cases: None
+    }
+    .announce()
+    .contains("tier 0"));
+}
+
+#[test]
+fn a_tier1_run_prints_its_tier_line() {
+    // THE observable: a real tier-1 run prints a tier line. Asserted by re-running this very binary as
+    // a subprocess with the knobs set and reading the CHILD'S stdout. Every in-process approach was
+    // measured to stay green while the print was dead:
+    //   revision 1: asserted announce()'s return value  -> green with println! deleted
+    //   revision 2: recorded beside println! in a sink  -> green with println! deleted
+    // A proxy for stdout is not stdout. This reads the bytes an operator sees.
+    let exe = std::env::current_exe().expect("the test binary must be reachable");
+    let output = std::process::Command::new(exe)
+        .args([
+            "random_buffers_never_panic",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("FUZZ_SEED", "12345")
+        .env("FUZZ_CASES", "50")
+        .output()
+        .expect("re-running the test binary must work");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the child run failed; stdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("fuzz tier 1: FUZZ_SEED=12345 FUZZ_CASES=50"),
+        "a real tier-1 run printed no tier line; child stdout was:\n{stdout}"
+    );
+}
+
+#[test]
+fn an_unset_run_prints_the_tier0_line() {
+    // The other half: unset knobs must announce tier 0, so a default run is identifiable too.
+    let exe = std::env::current_exe().expect("the test binary must be reachable");
+    let output = std::process::Command::new(exe)
+        .args([
+            "mutated_valid_certificates",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env_remove("FUZZ_SEED")
+        .env_remove("FUZZ_CASES")
+        .output()
+        .expect("re-running the test binary must work");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the child run failed; stdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("fuzz tier 0"),
+        "an unset run printed no tier-0 line; child stdout was:\n{stdout}"
+    );
+}
+
+#[test]
+fn an_unset_knob_is_the_silent_tier0_path() {
+    // `knob` reads the real environment, so this asserts the case that is stable regardless of how
+    // the suite was invoked: a name no test sets resolves to the tier-0 path rather than erroring.
+    assert_eq!(
+        knob::<u64>("CADDY_RS_FUZZ_KNOB_ABSENT", None).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn the_case_ceiling_is_the_published_value() {
+    assert_eq!(
+        MAX_CASES, 10_000,
+        "the ceiling is part of the published contract"
+    );
 }
