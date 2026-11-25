@@ -1589,34 +1589,37 @@ impl BasicAuthHandler {
     /// plaintext extension is trivially cheap and stays inline. Repeated pairs are answered from
     /// the hash cache. `None` means the hash pool stayed saturated past the secure-default wait.
     ///
-    /// `username` is `Some` only for a real account: the verdict for the fake hash of an unknown
-    /// user is never cached (a cached unknown-user verdict would make a repeat probe cheaper than
-    /// the same probe of a real account, a user-existence oracle), and the username is part of
-    /// every cache key.
+    /// The flight key is username-specific for every username, known or unknown, so a burst of
+    /// identical guesses takes one slot whether or not the account exists (otherwise unknown
+    /// users would get 429s where real accounts get shared 401s, a user-existence oracle).
+    /// `cache_user` is `Some` only for a real account: the verdict for the fake hash of an
+    /// unknown user is never cached (a cached unknown-user verdict would make a repeat probe
+    /// cheaper than the same probe of a real account, a user-existence oracle).
     async fn verify_offloaded(
         &self,
         bucket: Option<ClientBucket>,
-        username: Option<&str>,
+        username: &str,
+        cache_user: Option<&str>,
         hash: std::sync::Arc<PasswordHash>,
         password: Vec<u8>,
     ) -> std::result::Result<bool, Refusal> {
         if matches!(*hash, PasswordHash::Plaintext(_)) {
             return Ok(verify_password(&hash, &password));
         }
-        let key = username.map(|username| {
-            let mut identity = (username.len() as u64).to_be_bytes().to_vec();
-            identity.extend_from_slice(username.as_bytes());
-            identity.extend_from_slice(&hash.cache_identity());
-            self.cache.key(&identity, &password)
-        });
+        let mut identity = (username.len() as u64).to_be_bytes().to_vec();
+        identity.extend_from_slice(username.as_bytes());
+        identity.extend_from_slice(&hash.cache_identity());
+        let key = self.cache.key(&identity, &password);
+        let cache_key = cache_user.map(|_| key);
         // Single flight: identical concurrent (user, password) checks wait for one verification.
         let mut leader = None;
         loop {
-            let Some(key) = key.as_ref() else { break };
-            if self.cache.hit(key) {
-                return Ok(true);
+            if let Some(cache_key) = cache_key {
+                if self.cache.hit(&cache_key) {
+                    return Ok(true);
+                }
             }
-            match self.flights.join(*key) {
+            match self.flights.join(key) {
                 Joined::Leader(own) => {
                     leader = Some(own);
                     break;
@@ -1649,8 +1652,8 @@ impl BasicAuthHandler {
             runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let matched = verify_password(&hash, &password);
             // Cached from inside the job so a hash whose request was cancelled still pays off.
-            if let Some(key) = key.filter(|_| matched) {
-                cache.insert(key);
+            if let Some(cache_key) = cache_key.filter(|_| matched) {
+                cache.insert(cache_key);
             }
             if let Some(leader) = leader {
                 leader.finish(matched);
@@ -1805,6 +1808,7 @@ impl Handler for BasicAuthHandler {
         let matches = match self
             .verify_offloaded(
                 client_bucket(&request),
+                &username,
                 cache_user,
                 hash,
                 password.into_bytes(),
@@ -3065,6 +3069,53 @@ mod tests {
         assert_eq!(handler.hash_runs.load(Ordering::SeqCst) - before, 1);
     }
 
+    /// Codex P2 on #43: unknown usernames share one flight too. Real accounts join a single
+    /// flight keyed by username; unknown ones used to skip single flight and each consume a
+    /// per-client slot, so a burst of identical guesses for an unknown user got 429s where a
+    /// real account got shared 401s, an account-existence oracle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_usernames_share_one_flight() {
+        use std::sync::atomic::Ordering;
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let handler = Arc::new(
+            cached_handler(false, &limiter)
+                .with_hash_limits(Arc::clone(&limiter), Duration::from_secs(5)),
+        );
+        let before = handler.hash_runs.load(Ordering::SeqCst);
+        let held = Arc::clone(&limiter).acquire_owned().await.unwrap();
+        let mut tasks = Vec::new();
+        for _ in 0..(CLIENT_WAITER_CAP * 3) {
+            let handler = Arc::clone(&handler);
+            tasks.push(tokio::spawn(async move {
+                let mut request = base_request();
+                request.remote_addr = Some("[2001:db8:c::1]:1".parse().unwrap());
+                request
+                    .headers
+                    .insert(header::AUTHORIZATION, authorization("nobody", "wrong"));
+                handler.handle(request).await.unwrap()
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(held);
+        for task in tasks {
+            let outcome = task.await.unwrap();
+            assert_eq!(
+                status_of(&outcome),
+                Some(StatusCode::UNAUTHORIZED),
+                "an unknown user must get the same shared 401 as a real one"
+            );
+        }
+        assert_eq!(
+            handler.hash_runs.load(Ordering::SeqCst) - before,
+            1,
+            "identical concurrent checks for an unknown user must share one hash"
+        );
+        // The shared unknown-user failure is still not cached.
+        let before = handler.hash_runs.load(Ordering::SeqCst);
+        attempt(&handler, "nobody", "wrong").await;
+        assert_eq!(handler.hash_runs.load(Ordering::SeqCst) - before, 1);
+    }
+
     /// B1 round 3: the per-client table is process-wide like the hash pool, so many `basic_auth`
     /// handlers cannot each give a client its own cap.
     #[test]
@@ -3237,21 +3288,21 @@ mod tests {
         );
         let handler = basic_auth_handler(serde_json::json!({"handler": "basic_auth"}));
         let accept = handler
-            .verify_offloaded(None, Some("u"), bcrypt.clone(), b"pw".to_vec())
+            .verify_offloaded(None, "u", Some("u"), bcrypt.clone(), b"pw".to_vec())
             .await;
         assert_eq!(accept, Ok(true));
         let reject = handler
-            .verify_offloaded(None, Some("u"), bcrypt, b"nope".to_vec())
+            .verify_offloaded(None, "u", Some("u"), bcrypt, b"nope".to_vec())
             .await;
         assert_eq!(reject, Ok(false));
 
         let plain = std::sync::Arc::new(PasswordHash::Plaintext(b"pw".to_vec()));
         let accept = handler
-            .verify_offloaded(None, Some("u"), plain.clone(), b"pw".to_vec())
+            .verify_offloaded(None, "u", Some("u"), plain.clone(), b"pw".to_vec())
             .await;
         assert_eq!(accept, Ok(true));
         let reject = handler
-            .verify_offloaded(None, Some("u"), plain, b"px".to_vec())
+            .verify_offloaded(None, "u", Some("u"), plain, b"px".to_vec())
             .await;
         assert_eq!(reject, Ok(false));
     }
