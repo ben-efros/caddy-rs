@@ -179,6 +179,34 @@ enforced it server-side).
 `setup_enforces_the_password_policy_server_side`. Not covered: the removed bcrypt fallback has no
 test because Argon2 cannot be made to fail on demand with valid parameters.
 
+## E5 — refresh-token reuse is treated as theft (`crates/authn`)
+
+### Vulnerability (low)
+
+Replaying a consumed refresh token returned `RefreshTokenRevoked` but left the token family alive:
+a thief who rotated first kept a working descendant token (and its access tokens) indefinitely even
+after the legitimate client noticed the failure and replayed its stale copy.
+
+### Behaviour
+
+`AuthnService::refresh` now, on `RefreshTokenRevoked`, looks up the token's owner, revokes every
+refresh token of that user and bumps `auth_epoch` (retiring outstanding access tokens). The caller
+still receives `RefreshTokenRevoked` (pm-api: `401 invalid refresh token`, unchanged) and must log in
+again. Unknown and expired tokens revoke nothing; `revoke_refresh_token` (logout) is unchanged and
+idempotent. A store failure while containing the reuse is returned, not swallowed. Trade-off: a stale
+client presenting a token revoked by logout or a password change also ends the user's other
+sessions, because the record does not say why a token was revoked. Each reuse presentation bumps the
+epoch once.
+
+### Tests
+
+`crates/authn/src/tests_security.rs`: `replaying_a_consumed_refresh_token_revokes_the_whole_family`,
+`reuse_by_one_user_never_touches_another_user`, `unknown_and_expired_tokens_revoke_nothing`,
+`an_idempotent_logout_replay_does_not_sign_out_other_sessions`. Three pre-existing tests were
+adjusted because they encoded the old behaviour (`login_and_refresh_rotation`,
+`revoke_all_for_user_invalidates_access_and_refresh`,
+`revoke_refresh_token_ends_one_session_and_is_replay_safe`).
+
 ## Exact program-repository text to merge
 
 `docs/compatibility/BEHAVIOR-DIVERGENCES.md`, new entry (`caddy-rs extension`, no stock Caddy
@@ -196,4 +224,5 @@ equivalent; `stock_compat` does not apply):
 > expands `{env.*}` there; hand-written JSON keeps that behaviour, only the proxy-manager forms refuse).
 > The authentication service refuses Argon2 parameters below the OWASP minimum (unless explicitly
 > allowed), never falls back to bcrypt, caps passwords at 1024 bytes and requires 8 characters for
-> the first administrator.
+> the first administrator. Replaying a consumed refresh token revokes all of that user's refresh
+> tokens and bumps the authentication epoch.

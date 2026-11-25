@@ -730,6 +730,136 @@ async fn the_pending_secret_never_reaches_debug_output() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// E5: refresh-token reuse is treated as theft
+// ---------------------------------------------------------------------------------------------
+
+async fn two_users() -> (AuthnService<MemoryUserStore>, MemoryUserStore) {
+    let store = MemoryUserStore::new();
+    let service = AuthnService::new(store.clone(), fast_config()).expect("build service");
+    service
+        .create_user("alice", "correct horse", Role::editor())
+        .await
+        .unwrap();
+    service
+        .create_user("bob", "battery staple", Role::viewer())
+        .await
+        .unwrap();
+    (service, store)
+}
+
+#[tokio::test]
+async fn replaying_a_consumed_refresh_token_revokes_the_whole_family() {
+    let (service, store) = two_users().await;
+    let alice = store.get_user_by_username("alice").await.unwrap().unwrap();
+    let stolen = service.login("alice", "correct horse", None).await.unwrap();
+    let other_device = service.login("alice", "correct horse", None).await.unwrap();
+
+    // The thief rotates first and keeps the descendant; the owner then replays the old token.
+    let descendant = service.refresh(&stolen.refresh_token).await.unwrap();
+    assert!(service
+        .verify_access_token(&descendant.access_token)
+        .await
+        .is_ok());
+    assert!(matches!(
+        service.refresh(&stolen.refresh_token).await,
+        Err(AuthError::RefreshTokenRevoked)
+    ));
+    let after = store.get_user(alice.id).await.unwrap().unwrap();
+    assert_eq!(after.auth_epoch, alice.auth_epoch + 1, "epoch bumped once");
+
+    // The descendant, the user's other session and every outstanding access token are dead.
+    assert!(matches!(
+        service.refresh(&descendant.refresh_token).await,
+        Err(AuthError::RefreshTokenRevoked)
+    ));
+    assert!(matches!(
+        service.refresh(&other_device.refresh_token).await,
+        Err(AuthError::RefreshTokenRevoked)
+    ));
+    assert!(service
+        .verify_access_token(&descendant.access_token)
+        .await
+        .is_err());
+    assert!(service
+        .verify_access_token(&other_device.access_token)
+        .await
+        .is_err());
+
+    // Logging in again works: the user is not locked out, only their old sessions are.
+    service
+        .login("alice", "correct horse", None)
+        .await
+        .expect("a fresh login after the revocation");
+}
+
+#[tokio::test]
+async fn reuse_by_one_user_never_touches_another_user() {
+    let (service, store) = two_users().await;
+    let bob = service.login("bob", "battery staple", None).await.unwrap();
+    let alice = service.login("alice", "correct horse", None).await.unwrap();
+    service.refresh(&alice.refresh_token).await.unwrap();
+    assert!(service.refresh(&alice.refresh_token).await.is_err());
+
+    let bob_user = store.get_user_by_username("bob").await.unwrap().unwrap();
+    assert_eq!(bob_user.auth_epoch, 0);
+    assert!(service.verify_access_token(&bob.access_token).await.is_ok());
+    assert!(service.refresh(&bob.refresh_token).await.is_ok());
+}
+
+#[tokio::test]
+async fn unknown_and_expired_tokens_revoke_nothing() {
+    let (service, store) = two_users().await;
+    let alice = service.login("alice", "correct horse", None).await.unwrap();
+    assert!(matches!(
+        service.refresh("never-issued").await,
+        Err(AuthError::RefreshTokenNotFound)
+    ));
+    let user = store.get_user_by_username("alice").await.unwrap().unwrap();
+    assert_eq!(
+        user.auth_epoch, 0,
+        "an unknown token is not evidence of theft"
+    );
+    assert!(service.refresh(&alice.refresh_token).await.is_ok());
+
+    // An expired token is a plain expiry, not reuse.
+    let expiring = AuthnService::new(
+        store.clone(),
+        AuthnConfig {
+            refresh_ttl: Duration::from_secs(1),
+            ..fast_config()
+        },
+    )
+    .unwrap();
+    let short = expiring.login("bob", "battery staple", None).await.unwrap();
+    std::thread::sleep(Duration::from_millis(2100));
+    assert!(matches!(
+        expiring.refresh(&short.refresh_token).await,
+        Err(AuthError::TokenExpired)
+    ));
+    let bob = store.get_user_by_username("bob").await.unwrap().unwrap();
+    assert_eq!(bob.auth_epoch, 0);
+}
+
+#[tokio::test]
+async fn an_idempotent_logout_replay_does_not_sign_out_other_sessions() {
+    let (service, _store) = two_users().await;
+    let first = service.login("alice", "correct horse", None).await.unwrap();
+    let second = service.login("alice", "correct horse", None).await.unwrap();
+    service
+        .revoke_refresh_token(&first.refresh_token)
+        .await
+        .unwrap();
+    assert!(matches!(
+        service.revoke_refresh_token(&first.refresh_token).await,
+        Err(AuthError::RefreshTokenRevoked)
+    ));
+    assert!(
+        service.refresh(&second.refresh_token).await.is_ok(),
+        "logging out one device twice must not end the user's other session"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // E4: password hashing parameters, length limits
 // ---------------------------------------------------------------------------------------------
 

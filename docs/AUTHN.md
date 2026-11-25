@@ -106,6 +106,14 @@ so response time does not reveal whether an account exists.
   token and issues a new pair. A reused, revoked, expired or unknown token is rejected with a
   distinct `AuthError` (`RefreshTokenRevoked`, `RefreshTokenNotFound`, `TokenExpired`, …);
   `revoke_all_for_user` revokes every live refresh token for an account.
+- **Reuse is treated as theft.** Presenting an already-consumed or revoked refresh token to
+  `refresh` revokes *every* refresh token of that user and bumps `auth_epoch` (so outstanding
+  access tokens die too); the caller still gets `RefreshTokenRevoked` and the user must log in
+  again. This is the standard rotation defence: a thief who rotated first holds a live descendant
+  that would otherwise keep working. An unknown or merely expired token revokes nothing, and the
+  idempotent `revoke_refresh_token` (logout) does not trigger it. Consequence to know about: a stale
+  client that presents a token revoked by logout or a password change also ends the user's other
+  sessions (fail-safe; the token's history cannot tell a stale client from a thief).
 
 ## Login throttling
 

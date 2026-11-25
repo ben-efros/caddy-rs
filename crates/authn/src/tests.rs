@@ -401,14 +401,11 @@ async fn login_and_refresh_rotation() {
         service.refresh(&tokens.refresh_token).await,
         Err(AuthError::RefreshTokenRevoked)
     ));
-    assert_ne!(
-        service
-            .refresh(&rotated.refresh_token)
-            .await
-            .unwrap()
-            .refresh_token,
-        rotated.refresh_token
-    );
+    // E5: replaying the consumed token was treated as theft, so the descendant is revoked too.
+    assert!(matches!(
+        service.refresh(&rotated.refresh_token).await,
+        Err(AuthError::RefreshTokenRevoked)
+    ));
 }
 
 #[tokio::test]
@@ -542,14 +539,16 @@ async fn revoke_all_for_user_invalidates_access_and_refresh() {
         service.verify_access_token(&tokens.access_token).await,
         Err(AuthError::InvalidToken)
     ));
-    assert!(matches!(
-        service.refresh(&tokens.refresh_token).await,
-        Err(AuthError::RefreshTokenRevoked)
-    ));
+    // Checked before the revoked token is presented: presenting it is itself a reuse (E5) and
+    // would bump the epoch again.
     assert_eq!(
         store.get_user(user.id).await.unwrap().unwrap().auth_epoch,
         1
     );
+    assert!(matches!(
+        service.refresh(&tokens.refresh_token).await,
+        Err(AuthError::RefreshTokenRevoked)
+    ));
 }
 
 #[tokio::test]
@@ -1740,6 +1739,12 @@ async fn revoke_refresh_token_ends_one_session_and_is_replay_safe() {
         .revoke_refresh_token(&first.refresh_token)
         .await
         .expect("revoke the first session");
+    // Logging out one device leaves the other session usable. (Order matters since E5: afterwards
+    // *presenting* the revoked token to `refresh` is a reuse and ends every session.)
+    service
+        .refresh(&second.refresh_token)
+        .await
+        .expect("other sessions are untouched");
     assert!(
         matches!(
             service.refresh(&first.refresh_token).await,
@@ -1747,10 +1752,6 @@ async fn revoke_refresh_token_ends_one_session_and_is_replay_safe() {
         ),
         "a revoked refresh token cannot be exchanged"
     );
-    service
-        .refresh(&second.refresh_token)
-        .await
-        .expect("other sessions are untouched");
 
     assert!(
         matches!(

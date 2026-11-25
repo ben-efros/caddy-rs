@@ -2567,18 +2567,61 @@ impl<S: UserStore> AuthnService<S> {
     ///
     /// The presented refresh token is atomically consumed and a fresh pair is issued. A reused,
     /// revoked or expired token is rejected.
+    ///
+    /// # Reuse detection
+    ///
+    /// Presenting a token that was already consumed (or revoked) is treated as theft: either the
+    /// legitimate client or an attacker is holding a stale copy, and the service cannot tell which.
+    /// Every refresh token of that user is revoked and the authentication epoch is bumped, so the
+    /// whole token family, including the descendant the thief may already have minted, and every
+    /// outstanding access token stop working; the user must log in again. The caller still
+    /// receives [`AuthError::RefreshTokenRevoked`]. A merely unknown or expired token revokes
+    /// nothing. [`revoke_refresh_token`](Self::revoke_refresh_token) (logout) is deliberately
+    /// idempotent and does not trigger this.
     pub async fn refresh(&self, refresh_token: &str) -> AuthResult<TokenPair> {
         let token_hash = hash_refresh_token(refresh_token);
-        let record = self
+        let record = match self
             .store
             .consume_refresh_token(&token_hash, now_ts()?)
-            .await?;
+            .await
+        {
+            Ok(record) => record,
+            Err(AuthError::RefreshTokenRevoked) => {
+                self.revoke_family_after_reuse(&token_hash).await?;
+                return Err(AuthError::RefreshTokenRevoked);
+            }
+            Err(other) => return Err(other),
+        };
         let user = self
             .store
             .get_user(record.user_id)
             .await?
             .ok_or(AuthError::UserNotFound)?;
         self.issue_token_pair(&user).await
+    }
+
+    /// Respond to the reuse of a consumed refresh token: revoke the user's whole token family.
+    ///
+    /// A store failure is returned rather than swallowed, so a reuse that could not be contained
+    /// is reported as an error instead of looking like an ordinary rejected token.
+    async fn revoke_family_after_reuse(&self, token_hash: &str) -> AuthResult<()> {
+        let Some(record) = self.store.get_refresh_token(token_hash).await? else {
+            return Ok(());
+        };
+        let Some(mut user) = self.store.get_user(record.user_id).await? else {
+            return Ok(());
+        };
+        tracing::warn!(
+            user = %user.id.0,
+            "refresh token reuse detected; revoking all of the user's sessions"
+        );
+        bump_epoch(&mut user)?;
+        user.updated_at = Timestamp::now();
+        let user_id = user.id;
+        self.store.update_user(user).await?;
+        self.store
+            .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
+            .await
     }
 
     /// Revoke one refresh token, as a single-device logout does.
