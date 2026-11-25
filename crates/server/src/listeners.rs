@@ -1231,9 +1231,14 @@ async fn serve_h3_connection(
                             );
                             continue;
                         }
-                        let limit = context.limits.max_request_body_size;
+                        // HTTP/3 always buffers the body, so it is always bounded.
+                        let limit = Some(context.limits.buffered_body_limit());
                         let mut body = BytesMut::new();
                         let mut too_large = false;
+                        // Process-wide budget shared with the HTTP/1 and HTTP/2 buffered path; held until
+                        // this request's response has been produced.
+                        let mut reservation = crate::limits::BufferedBodyReservation::default();
+                        let mut overloaded = false;
                         loop {
                             match stream.recv_data().await {
                                 Ok(Some(mut chunk)) => {
@@ -1243,6 +1248,10 @@ async fn serve_h3_connection(
                                             too_large = true;
                                             break;
                                         }
+                                    }
+                                    if !reservation.try_grow(chunk.len()) {
+                                        overloaded = true;
+                                        break;
                                     }
                                     body.extend_from_slice(&chunk);
                                 }
@@ -1258,14 +1267,26 @@ async fn serve_h3_connection(
                             // actually read from the transport (Caddy's `bytes_read`).
                             access_log_context.request_bytes().set(body.len() as u64);
                         }
-                        if too_large {
+                        if too_large || overloaded {
+                            let (refusal_status, refusal_body): (http::StatusCode, &'static [u8]) =
+                                if overloaded {
+                                    (
+                                        http::StatusCode::SERVICE_UNAVAILABLE,
+                                        b"503 Service Unavailable",
+                                    )
+                                } else {
+                                    (
+                                        http::StatusCode::PAYLOAD_TOO_LARGE,
+                                        b"413 Request Entity Too Large",
+                                    )
+                                };
                             let response = http::Response::builder()
-                                .status(http::StatusCode::PAYLOAD_TOO_LARGE)
+                                .status(refusal_status)
                                 .body(())
                                 .unwrap_or_else(|_| http::Response::new(()));
                             let _ = stream.send_response(response).await;
                             let _ = stream
-                                .send_data(Bytes::from_static(b"413 Request Entity Too Large"))
+                                .send_data(Bytes::from_static(refusal_body))
                                 .await;
                             let _ = stream.finish().await;
                             observe_request(
@@ -1276,7 +1297,7 @@ async fn serve_h3_connection(
                                 &method,
                                 snapshot.as_ref(),
                                 started,
-                                413,
+                                refusal_status.as_u16(),
                                 0,
                                 &http::HeaderMap::new(),
                                 access_log_context.as_ref(),

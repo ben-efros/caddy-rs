@@ -122,7 +122,84 @@ impl Default for ServerLimits {
     }
 }
 
+/// Ceiling for a request body that the server must hold in memory (the buffered path: routes with
+/// `reverse_proxy` retries, FastCGI or `handle_response`, and every HTTP/3 request) when no
+/// `max_request_body_size` is configured. Streamed bodies are unaffected. Without it one
+/// unauthenticated client streaming a multi-GB chunked body exhausts memory.
+pub const DEFAULT_BUFFERED_BODY_LIMIT: u64 = 128 * 1024 * 1024;
+
+/// Process-wide budget, in bytes of *peak memory*, for request bodies buffered at the same time.
+///
+/// The per-request cap alone does not bound memory: one HTTP/2 connection multiplexes hundreds of
+/// streams and `max_connections` is unlimited, so N requests just under the cap still pin
+/// N x cap. Every buffered body reserves twice its size here (collecting and the final contiguous
+/// copy can briefly both be alive) and the reservation is held until the response is produced.
+/// When the budget is exhausted the request is answered `503` instead of growing the heap.
+pub const BUFFERED_BODY_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
+
+/// One permit per KiB keeps the budget inside `Semaphore::MAX_PERMITS` on 32-bit targets.
+const BUDGET_UNIT: usize = 1024;
+
+static BUFFERED_BODY_BUDGET: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(BUFFERED_BODY_BUDGET_BYTES / BUDGET_UNIT);
+
+/// A growing reservation against [`BUFFERED_BODY_BUDGET_BYTES`], released on drop.
+#[derive(Default)]
+pub(crate) struct BufferedBodyReservation {
+    permit: Option<tokio::sync::SemaphorePermit<'static>>,
+    /// Body bytes reserved so far, before the doubling and the rounding up to `BUDGET_UNIT`.
+    ///
+    /// Rounding per call instead of per reservation would charge a full unit for every frame: a
+    /// one-byte frame costs 1 KiB, so a body delivered in small chunks exhausts the budget after
+    /// about a thousandth of the bytes it should be allowed. Keeping the running total makes the
+    /// rounding error at most one unit per *reservation* rather than one per call.
+    reserved_bytes: usize,
+}
+
+impl BufferedBodyReservation {
+    /// Reserve room for `bytes` more body bytes (twice that in budget terms). Returns `false`,
+    /// reserving nothing further, when the process-wide budget cannot cover it.
+    pub(crate) fn try_grow(&mut self, bytes: usize) -> bool {
+        // Nothing to reserve for an empty frame, and charging it a unit would make a stream of
+        // zero-length chunks consume the whole budget while buffering no body bytes at all.
+        if bytes == 0 {
+            return true;
+        }
+        let total = self.reserved_bytes.saturating_add(bytes);
+        let total_units = total.saturating_mul(2).div_ceil(BUDGET_UNIT);
+        let held_units = self.reserved_bytes.saturating_mul(2).div_ceil(BUDGET_UNIT);
+        let units = total_units.saturating_sub(held_units);
+        if units == 0 {
+            // The extra bytes fit inside the unit already held for this reservation.
+            self.reserved_bytes = total;
+            return true;
+        }
+        let Ok(units) = u32::try_from(units) else {
+            return false;
+        };
+        match BUFFERED_BODY_BUDGET.try_acquire_many(units) {
+            Ok(permit) => {
+                match self.permit.as_mut() {
+                    Some(existing) => existing.merge(permit),
+                    None => self.permit = Some(permit),
+                }
+                self.reserved_bytes = total;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
 impl ServerLimits {
+    /// Body-size limit applied while buffering a request body: the configured
+    /// `max_request_body_size`, or [`DEFAULT_BUFFERED_BODY_LIMIT`] when none is set.
+    #[must_use]
+    pub fn buffered_body_limit(&self) -> u64 {
+        self.max_request_body_size
+            .unwrap_or(DEFAULT_BUFFERED_BODY_LIMIT)
+    }
+
     /// Parse the limits and timeouts of one Caddy HTTP server object.
     ///
     /// Errors are located at the offending JSON path, for example
@@ -401,6 +478,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn buffered_bodies_are_bounded_even_without_a_configured_limit() {
+        let mut limits = ServerLimits::default();
+        assert_eq!(limits.buffered_body_limit(), DEFAULT_BUFFERED_BODY_LIMIT);
+        limits.max_request_body_size = Some(1024);
+        assert_eq!(limits.buffered_body_limit(), 1024);
+    }
+
     fn nanos(value: Value) -> Result<i64, String> {
         parse_caddy_duration(&value)
     }
@@ -562,5 +647,80 @@ mod tests {
         assert!(error
             .to_string()
             .contains("apps.http.servers.srv0.max_connections"));
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// These tests share the process-wide `BUFFERED_BODY_BUDGET` semaphore, so they must not run
+    /// concurrently: cargo runs the tests in one process and each one assumes it can take the
+    /// whole budget. A mutex serializes them; `#[test]` ordering is not relied on.
+    static BUDGET_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+        BUDGET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn reservation_draws_on_the_budget_refuses_when_empty_and_releases_on_drop() {
+        let _guard = exclusive();
+        // This binary's other unit tests never buffer request bodies, so the process-wide budget
+        // is idle here.
+        let mut hog = BufferedBodyReservation::default();
+        // Twice the body size is reserved, so half the budget in bytes takes all of it.
+        assert!(hog.try_grow(BUFFERED_BODY_BUDGET_BYTES / 2));
+        let mut other = BufferedBodyReservation::default();
+        assert!(
+            !other.try_grow(1),
+            "an exhausted budget refuses even one byte"
+        );
+        drop(hog);
+        assert!(other.try_grow(1024), "the budget is returned on drop");
+        assert!(other.try_grow(1024), "a reservation can keep growing");
+    }
+
+    /// A body delivered in tiny frames must not exhaust the budget by rounding.
+    ///
+    /// Regression test for per-call rounding: `div_ceil(..).max(1)` charged a full `BUDGET_UNIT`
+    /// (1 KiB) for every frame, so one-byte frames consumed the whole process budget after about
+    /// a thousandth of the body bytes the budget is meant to allow, and legitimate requests were
+    /// refused with `503` long before it was genuinely full.
+    #[test]
+    fn many_small_frames_do_not_inflate_the_reservation() {
+        let _guard = exclusive();
+        // One byte per call, a quarter of the budget's worth of body bytes.
+        let one_byte_frames = BUFFERED_BODY_BUDGET_BYTES / 8;
+        let mut reservation = BufferedBodyReservation::default();
+        for _ in 0..one_byte_frames {
+            assert!(
+                reservation.try_grow(1),
+                "a small frame must be covered while the budget has room"
+            );
+        }
+
+        // The reservation must be proportional to the body, not to the frame count: half the
+        // budget's worth of body bytes takes at most (about) half the budget, so a second
+        // reservation of the same size still fits. With per-call rounding the first loop would
+        // have exhausted the whole budget and this grow would have been refused.
+        let mut other = BufferedBodyReservation::default();
+        assert!(
+            other.try_grow(BUFFERED_BODY_BUDGET_BYTES / 8),
+            "a body of this size must not have consumed the whole process budget"
+        );
+    }
+
+    /// Empty frames acquire nothing, so a stream of them cannot drain the budget.
+    #[test]
+    fn zero_length_frames_reserve_nothing() {
+        let _guard = exclusive();
+        let mut reservation = BufferedBodyReservation::default();
+        assert!(reservation.try_grow(0));
+        // With nothing reserved by the empty frames, the full budget is still available.
+        let mut full = BufferedBodyReservation::default();
+        assert!(full.try_grow(BUFFERED_BODY_BUDGET_BYTES / 2));
     }
 }
