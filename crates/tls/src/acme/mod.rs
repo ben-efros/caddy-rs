@@ -2154,10 +2154,36 @@ impl AcmeStorage for MemoryAcmeStorage {
 }
 
 fn storage_path(root: &Path, key: &str) -> Result<PathBuf> {
-    if key.is_empty() || key.contains("..") || key.starts_with('/') || key.contains('\0') {
+    // `\` is a separator on Windows and `C:` a drive prefix (`root.join("C:\x")` replaces the
+    // root), so neither is a legal key byte there. A key must name a file: a trailing `/` or a
+    // final `.` component would make the temporary-file name replace the storage root itself.
+    // (Callers never produce `:` on any platform: `sanitize_directory_url` maps it to `-`.)
+    if key.is_empty()
+        || key.contains("..")
+        || key.starts_with('/')
+        || key.ends_with('/')
+        || key == "."
+        || key.ends_with("/.")
+        || key.contains(['\0', '\\'])
+        || (cfg!(windows) && key.contains(':'))
+    {
         return Err(Error::InvalidKey(key.to_string()));
     }
     Ok(root.join(key))
+}
+
+/// Restrict an existing file or directory to its owner when it is readable or writable by anyone
+/// else. Material written by an earlier version used the default umask (0644 files in 0755
+/// directories); reading or rewriting it must not leave it that way. Best effort: a failure to
+/// chmod must not turn a working ACME account into an outage.
+#[cfg(unix)]
+async fn restrict_to_owner(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = fs::metadata(path).await {
+        if metadata.permissions().mode() & 0o077 != 0 {
+            let _ = fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).await;
+        }
+    }
 }
 
 /// [`AcmeStorage`] over the filesystem certificate storage root.
@@ -2173,7 +2199,13 @@ impl AcmeStorage for FileStorage {
     async fn load(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let path = storage_path(self.root(), key)?;
         match fs::read(&path).await {
-            Ok(value) => Ok(Some(value)),
+            Ok(value) => {
+                // Self-heal material an earlier version wrote world-readable (see
+                // `restrict_to_owner`); without this an existing account key stays 0644 forever.
+                #[cfg(unix)]
+                restrict_to_owner(&path, 0o600).await;
+                Ok(Some(value))
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(Error::Io(error)),
         }
@@ -2182,11 +2214,58 @@ impl AcmeStorage for FileStorage {
     async fn store(&self, key: &str, value: &[u8]) -> Result<()> {
         let path = storage_path(self.root(), key)?;
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await?;
+            // Owner-only directories: ACME account keys live under here, and a default (0755)
+            // directory plus a default umask made them readable by every local user.
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            builder.mode(0o700);
+            builder.create(parent).await?;
+            // `DirBuilder::mode` only applies to directories it creates: tighten the ones an
+            // earlier version made 0755, from the key's directory up to (excluding) the root.
+            #[cfg(unix)]
+            for ancestor in path
+                .ancestors()
+                .skip(1)
+                .take_while(|ancestor| *ancestor != self.root())
+            {
+                restrict_to_owner(ancestor, 0o700).await;
+            }
         }
-        let temporary = path.with_extension("tmp");
-        fs::write(&temporary, value).await?;
-        fs::rename(&temporary, &path).await?;
+        // A unique temporary name per write, created exclusively and with owner-only permissions
+        // from the first byte so the key is never readable between creation and a later chmod.
+        // Uniqueness must hold across processes and restarts (a container often runs as PID 1 and
+        // restarts the counter at 0, and a crashed run leaves its temporary behind), so the name
+        // carries the wall-clock nanoseconds as well as the pid and an in-process counter.
+        static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let mut temporary_name = path.file_name().unwrap_or_default().to_os_string();
+        temporary_name.push(format!(
+            ".{}.{nanos}.{}.tmp",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let temporary = path.with_file_name(temporary_name);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        // Opening exclusively means a failure here names a file this call did not create, so it is
+        // never removed; only a temporary this call made is cleaned up on a later error.
+        let mut file = options.open(&temporary).await?;
+        let written = async {
+            tokio::io::AsyncWriteExt::write_all(&mut file, value).await?;
+            tokio::io::AsyncWriteExt::flush(&mut file).await?;
+            file.sync_all().await?;
+            fs::rename(&temporary, &path).await
+        }
+        .await;
+        if let Err(error) = written {
+            let _ = fs::remove_file(&temporary).await;
+            return Err(Error::Io(error));
+        }
         Ok(())
     }
 
@@ -2950,6 +3029,219 @@ EVdZ8IcAQzAPk1jBxj0YDC0rR5d09Q==
             "memory",
             "storage backend must be reachable through the store"
         );
+    }
+
+    /// Every file under `root`, recursively.
+    #[cfg(unix)]
+    fn files_under(root: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    found.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    /// The ACME account key authorises certificate orders and revocation for the account, so it
+    /// must never be readable by another local user: not in the final file, not in a directory
+    /// that lets others traverse to it, and not in a temporary file left behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn account_key_and_its_directories_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        // Under the usual umask (022) the old code inherited it and produced 0644 files in 0755
+        // directories, so this fails without the explicit modes.
+        let store = AccountStore::new(FileStorage::new(directory.path()), None);
+        let (_key, created) = store
+            .load_or_create_account_key(DIRECTORY_URL)
+            .await
+            .unwrap();
+        assert!(created);
+
+        let files = files_under(directory.path());
+        assert!(!files.is_empty(), "the account key was written");
+        for file in &files {
+            let mode = std::fs::metadata(file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{} must be 0600, got {mode:o}", file.display());
+            assert!(
+                !file.to_string_lossy().ends_with(".tmp"),
+                "temporary file {} was not cleaned up",
+                file.display()
+            );
+        }
+        // Every directory the store created below the root is owner-only too.
+        let mut parent = files[0].parent().unwrap().to_path_buf();
+        while parent != directory.path() {
+            let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} must be 0700, got {mode:o}", parent.display());
+            parent = parent.parent().unwrap().to_path_buf();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_stores_of_one_key_never_corrupt_or_leak_temporaries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Arc::new(FileStorage::new(directory.path()));
+        let mut writers = Vec::new();
+        for index in 0..16u8 {
+            let storage = Arc::clone(&storage);
+            writers.push(tokio::spawn(async move {
+                let value = vec![index; 4096];
+                storage.store("acme/ca/users/u/account.key", &value).await
+            }));
+        }
+        for writer in writers {
+            writer.await.unwrap().unwrap();
+        }
+        let stored = storage
+            .load("acme/ca/users/u/account.key")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.len(), 4096);
+        assert!(
+            stored.iter().all(|byte| *byte == stored[0]),
+            "the file is exactly one writer's value, never a mix"
+        );
+        let files = files_under(directory.path());
+        assert_eq!(files.len(), 1, "no temporary file survives: {files:?}");
+        let mode = std::fs::metadata(&files[0]).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    /// An account key an earlier version left 0644 in 0755 directories must be tightened the next
+    /// time it is read or the directory is written, not kept world-readable forever. The modes are
+    /// set explicitly so the test does not depend on the process umask.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn loose_modes_from_an_older_version_are_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let user_dir = directory.path().join("acme/ca/users/u");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        let key_file = user_dir.join("account.key");
+        std::fs::write(&key_file, b"pem").unwrap();
+        for path in [
+            &key_file,
+            &user_dir,
+            &directory.path().join("acme/ca/users"),
+            &directory.path().join("acme/ca"),
+            &directory.path().join("acme"),
+        ] {
+            let mode = if path.is_dir() { 0o755 } else { 0o644 };
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let storage = FileStorage::new(directory.path());
+
+        // Reading heals the file.
+        assert_eq!(
+            storage
+                .load("acme/ca/users/u/account.key")
+                .await
+                .unwrap()
+                .unwrap(),
+            b"pem"
+        );
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&key_file), 0o600);
+
+        // Writing heals every directory between the key and the root.
+        storage
+            .store("acme/ca/users/u/account.json", b"{}")
+            .await
+            .unwrap();
+        for relative in ["acme/ca/users/u", "acme/ca/users", "acme/ca", "acme"] {
+            assert_eq!(
+                mode(&directory.path().join(relative)),
+                0o700,
+                "{relative} must be owner-only"
+            );
+        }
+    }
+
+    /// A temporary file left by a crashed run (same pid, restarted counter) must neither break
+    /// the next write nor be deleted by it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_temporaries_do_not_break_or_get_removed_by_later_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(directory.path());
+        let pid = std::process::id();
+        std::fs::create_dir_all(directory.path().join("acme")).unwrap();
+        let stale: Vec<PathBuf> = (0..4)
+            .map(|counter| directory.path().join(format!("acme/k.{pid}.0.{counter}.tmp")))
+            .chain((0..4).map(|counter| directory.path().join(format!("acme/k.{counter}.tmp"))))
+            .collect();
+        for path in &stale {
+            std::fs::write(path, b"stale").unwrap();
+        }
+        for _ in 0..8 {
+            storage.store("acme/k", b"fresh").await.unwrap();
+        }
+        assert_eq!(storage.load("acme/k").await.unwrap().unwrap(), b"fresh");
+        for path in &stale {
+            assert_eq!(std::fs::read(path).unwrap(), b"stale", "{path:?} survives");
+        }
+    }
+
+    #[tokio::test]
+    async fn keys_that_do_not_name_a_file_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(directory.path());
+        for key in [".", "acme/.", "acme/x/", "acme/"] {
+            assert!(
+                matches!(storage.store(key, b"x").await, Err(Error::InvalidKey(_))),
+                "{key:?} must be rejected"
+            );
+        }
+        // Nothing was created beside the root by the rejected writes.
+        let parent = directory.path().parent().unwrap();
+        let leaked = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!leaked, "no temporary file escaped the storage root");
+    }
+
+    #[tokio::test]
+    async fn file_storage_rejects_traversal_and_windows_path_syntax_but_keeps_ports() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(directory.path());
+        for key in [
+            "",
+            "../outside",
+            "acme/../../outside",
+            "/absolute",
+            "acme\\..\\outside",
+            "acme/ca\\user",
+            "bad\0key",
+        ] {
+            assert!(
+                matches!(storage.store(key, b"x").await, Err(Error::InvalidKey(_))),
+                "{key:?} must be rejected"
+            );
+        }
+        // A CA directory name derived from `localhost:14000/dir` carries a port; that stays valid
+        // everywhere a colon is a legal file-name byte.
+        if !cfg!(windows) {
+            storage
+                .store("acme/localhost:14000-dir/users/u/account.json", b"{}")
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]
