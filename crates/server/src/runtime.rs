@@ -811,7 +811,11 @@ impl ServerRuntime {
                 generation.config().stock_compat(),
                 has_reverse_proxy,
             )?;
-            let _trusted_proxies = parse_server_trusted_proxies(server, server_name)?;
+            let _trusted_proxies = parse_server_trusted_proxies(
+                server,
+                server_name,
+                generation.config().stock_compat(),
+            )?;
             let matcher_deps = Self::matcher_deps(generation.config())?;
             let policies = server.tls_connection_policies.as_deref();
             let has_connection_policies = policies.is_some_and(|policies| !policies.is_empty());
@@ -2285,7 +2289,11 @@ impl ServerRuntime {
                 generation.config().stock_compat(),
                 has_reverse_proxy,
             )?);
-            let trusted_proxies = parse_server_trusted_proxies(server, server_name)?;
+            let trusted_proxies = parse_server_trusted_proxies(
+                server,
+                server_name,
+                generation.config().stock_compat(),
+            )?;
             let allow_0rtt = allow_0rtt_enabled(server, server_name)?;
             let matcher_deps = Self::matcher_deps(generation.config())?;
             let policies = server.tls_connection_policies.as_deref();
@@ -2615,6 +2623,7 @@ fn allow_0rtt_enabled(
 fn parse_server_trusted_proxies(
     server: &caddy_rs_core::config::HttpServer,
     server_name: &str,
+    stock_compat: bool,
 ) -> Result<Arc<caddy_rs_proxy::trusted_proxies::ServerTrustedProxies>> {
     let mut object = serde_json::Map::new();
     for field in [
@@ -2628,9 +2637,10 @@ fn parse_server_trusted_proxies(
         }
     }
     let path = format!("apps.http.servers.{server_name}");
-    caddy_rs_proxy::trusted_proxies::ServerTrustedProxies::from_server_json(
+    caddy_rs_proxy::trusted_proxies::ServerTrustedProxies::from_server_json_with_stock_compat(
         &serde_json::Value::Object(object),
         &path,
+        stock_compat,
     )
     .map(Arc::new)
     .map_err(Error::Http)
@@ -2682,7 +2692,8 @@ fn forwarded_trust_warnings(config: &caddy_rs_core::Config) -> Result<Vec<String
     };
     let mut warnings = Vec::new();
     for (server_name, server) in &http.servers {
-        let trusted_proxies = parse_server_trusted_proxies(server, server_name)?;
+        let trusted_proxies =
+            parse_server_trusted_proxies(server, server_name, config.stock_compat())?;
         for range in trusted_proxies.permissive_ranges() {
             warnings.push(format!(
                 "caddy-rs: warning: server `{server_name}`: `trusted_proxies` range `{range}` \

@@ -33,6 +33,10 @@ connections per listener, `0` means unlimited).
 Server-level `trusted_proxies`, `trusted_proxies_strict`, `trusted_proxies_unix` and
 `client_ip_headers` control how the proxy's forwarding headers are believed. They affect the
 resolved client address used by the `client_ip` matcher, forwarding decisions and access logs.
+When `trusted_proxies_strict` is absent the client IP is the right-most address outside the trusted
+ranges (stock Caddy takes the client-controlled left-most one); `stock_compat true` or an explicit
+`"trusted_proxies_strict": false` restores the stock behaviour
+([SEC-MEDIUM-PROXY](compatibility/SEC-MEDIUM-PROXY.md)).
 
 The derived `trusted_proxy`/`client_ip` variables are also consumed by `reverse_proxy`,
 `forward_auth` and the `acme_server` external-origin selection, and the per-request decision is
