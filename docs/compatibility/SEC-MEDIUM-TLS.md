@@ -168,3 +168,42 @@ TLS):
 > built. `stock_compat true` restores stock acceptance without acknowledgement and rejects the
 > extension field. `verify_if_given` and `require_and_verify` are unchanged. Tests:
 > `crates/tls/src/tls_server.rs`, `crates/server/tests/http_client_auth.rs`.
+
+## D3 — ACME / OCSP response bodies are bounded
+
+### Upstream
+
+Go's ACME client stack (acmez, used by certmagic) reads HTTP response bodies through bounded readers
+and `ocsp.ParseResponse` is fed a size-limited body; neither buffers an unbounded response. Exact
+upstream limits are not reproduced here.
+
+### Previous caddy-rs behaviour
+
+`HyperTransport::perform` (`crates/tls/src/acme/transport.rs`) did `body.collect().await.to_bytes()`
+with no limit. The same transport carries OCSP fetches (`HyperOcspTransport`), CA-bundle downloads
+and ACME JSON, so a hostile or compromised ACME server, an OCSP responder named by a certificate's
+AIA, or an on-path proxy could make the process buffer an unbounded body (memory exhaustion).
+
+### Implemented behaviour (unconditional, parity-neutral)
+
+Every response body is read through `http_body_util::Limited` with
+`MAX_RESPONSE_BODY_BYTES = 4 MiB`. A body of exactly the limit is accepted; one byte more (declared
+by `Content-Length` or streamed chunked with no length) fails with a located
+`AcmeError::Transport` ("response body exceeds the 4194304 byte limit") and the excess is never
+buffered. Other body read errors keep their original message. No `stock_compat` dependency.
+
+### Tests
+
+`crates/tls/src/acme/transport.rs`: `response_body_at_the_cap_is_accepted`,
+`response_body_one_byte_over_the_cap_is_rejected`, `unbounded_chunked_response_stops_at_the_cap`
+(a local server that streams chunks until the client disconnects),
+`limited_body_reader_boundaries_and_error_kinds` (limit-1/limit/limit+1 and non-limit errors).
+Mutation check: raising the limit to `usize::MAX` makes the three over-cap tests fail.
+
+### Exact program-repository text to merge
+
+No existing DIV entry. Optional note under the TLS/ACME area of `BEHAVIOR-DIVERGENCES.md`:
+
+> caddy-rs caps every ACME/OCSP/CA-bundle HTTP response body at 4 MiB and fails the request with a
+> located transport error beyond that; stock Caddy relies on bounded readers inside acmez/certmagic.
+> This is a hardening with no configuration surface and no `stock_compat` switch.
