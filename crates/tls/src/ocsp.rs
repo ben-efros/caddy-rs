@@ -76,6 +76,12 @@ pub enum OcspError {
     /// OCSP responses for this issuer.
     #[error("OCSP responder is not authorised: {0}")]
     UnauthorizedResponder(String),
+    /// A verified (authentic, fresh, matching) response says the certificate is revoked.
+    #[error("OCSP responder reports the certificate as revoked; the staple was withdrawn")]
+    Revoked,
+    /// A verified response says the responder does not know the certificate.
+    #[error("OCSP responder reports the certificate status as unknown")]
+    UnknownStatus,
     /// `nextUpdate` is not in the future: the response is stale.
     #[error("OCSP response has expired (nextUpdate is in the past)")]
     Expired,
@@ -423,9 +429,19 @@ impl OcspStapler {
         self.len() == 0
     }
 
-    /// The DER response to staple for `leaf_der`, if a fresh/cached staple exists.
+    /// The DER response to staple for `leaf_der`, if a cached staple exists AND is still fresh:
+    /// a response whose `nextUpdate` has passed is never served (clients treat it as invalid and
+    /// Must-Staple clients fail hard), so it is dropped here even if a refresh keeps failing.
     pub fn staple(&self, leaf_der: &[u8]) -> Option<Vec<u8>> {
-        self.cached(leaf_der).map(|staple| staple.response.der)
+        let now = self.clock.now();
+        self.cached(leaf_der)
+            .filter(|staple| {
+                staple
+                    .response
+                    .next_update
+                    .is_none_or(|next_update| now < next_update)
+            })
+            .map(|staple| staple.response.der)
     }
 
     /// The cached staple for `leaf_der` (regardless of freshness).
@@ -513,6 +529,13 @@ impl OcspStapler {
                 Ok(StapleOutcome::Fetched)
             }
             Err(error) => {
+                if matches!(error, OcspError::Revoked) {
+                    // A verified revocation: never keep serving the earlier "good" staple.
+                    self.staples
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(leaf_der);
+                }
                 let attempts = {
                     let mut retries = self
                         .retries
@@ -561,8 +584,10 @@ impl OcspStapler {
         // one by an attacker who wants to influence the cache.
         let issuer = ParsedCertificate::parse(issuer_der)?;
         verify_ocsp_response(&response, &leaf, &issuer, now)?;
-        if response.status != OcspCertStatus::Good {
-            return Err(OcspError::ResponderStatus(1));
+        match response.status {
+            OcspCertStatus::Good => {}
+            OcspCertStatus::Revoked => return Err(OcspError::Revoked),
+            OcspCertStatus::Unknown => return Err(OcspError::UnknownStatus),
         }
         Ok(Staple {
             response,
@@ -676,6 +701,9 @@ pub fn parse_ocsp_response(der: &[u8]) -> Result<OcspResponse, OcspError> {
             "OCSPResponse is not a SEQUENCE".to_string(),
         ));
     }
+    // The envelope is not covered by the responder's signature but is what gets stapled, so it
+    // must be strict DER with nothing appended at any level.
+    outer.finish("OCSPResponse")?;
     let mut root = DerReader::new(body);
     let (status_tag, status_value, _) = root.read_tlv_full()?;
     if status_tag != 0x0A || status_value.len() != 1 {
@@ -697,8 +725,10 @@ pub fn parse_ocsp_response(der: &[u8]) -> Result<OcspResponse, OcspError> {
             "OCSPResponse responseBytes is not [0] EXPLICIT".to_string(),
         ));
     }
+    root.finish("OCSPResponse responseBytes")?;
     let mut response_bytes = DerReader::new(response_bytes_value);
     let (seq_tag, seq_value, _) = response_bytes.read_tlv_full()?;
+    response_bytes.finish("ResponseBytes")?;
     if seq_tag != 0x30 {
         return Err(OcspError::Malformed(
             "ResponseBytes is not a SEQUENCE".to_string(),
@@ -717,6 +747,7 @@ pub fn parse_ocsp_response(der: &[u8]) -> Result<OcspResponse, OcspError> {
             "BasicOCSPResponse is not an OCTET STRING".to_string(),
         ));
     }
+    fields.finish("ResponseBytes fields")?;
     parse_basic_response(der, octet_value)
 }
 
@@ -730,6 +761,7 @@ fn parse_basic_response(full_der: &[u8], basic_der: &[u8]) -> Result<OcspRespons
             "BasicOCSPResponse is not a SEQUENCE".to_string(),
         ));
     }
+    basic.finish("BasicOCSPResponse")?;
     let mut fields = DerReader::new(sequence);
     let (tbs_tag, tbs, tbs_tlv) = fields.read_tlv_full()?;
     if tbs_tag != 0x30 {
@@ -760,6 +792,7 @@ fn parse_basic_response(full_der: &[u8], basic_der: &[u8]) -> Result<OcspRespons
         }
         let mut wrapper = DerReader::new(certs_value);
         let (list_tag, list_value, _) = wrapper.read_tlv_full()?;
+        wrapper.finish("BasicOCSPResponse certs")?;
         if list_tag != 0x30 {
             return Err(OcspError::Malformed(
                 "BasicOCSPResponse certs is not a SEQUENCE OF Certificate".to_string(),
@@ -775,6 +808,7 @@ fn parse_basic_response(full_der: &[u8], basic_der: &[u8]) -> Result<OcspRespons
             certs.push(cert_tlv.to_vec());
         }
     }
+    fields.finish("BasicOCSPResponse")?;
     let mut response = parse_response_data(full_der, tbs)?;
     response.tbs_response_data = tbs_tlv.to_vec();
     response.signature_algorithm_oid = signature_algorithm_oid;
@@ -922,6 +956,13 @@ fn parse_cert_id(cert_id: &[u8]) -> Result<ParsedCertId, OcspError> {
     if serial.is_empty() {
         return Err(OcspError::Malformed(
             "CertID serialNumber INTEGER is empty".to_string(),
+        ));
+    }
+    // DER INTEGERs are minimal (X.690 8.3.2): a redundant leading octet is a different encoding
+    // of the same number and is refused rather than normalised.
+    if serial_value(serial).len() != serial.len() {
+        return Err(OcspError::Malformed(
+            "CertID serialNumber INTEGER is not minimally encoded".to_string(),
         ));
     }
     Ok(ParsedCertId {
@@ -1076,6 +1117,9 @@ fn algorithm_oid(algorithm: &[u8]) -> Result<Vec<u8>, OcspError> {
             "AlgorithmIdentifier does not start with an OID".to_string(),
         ));
     }
+    // parameters are at most one element (NULL for RSA, absent for ECDSA/Ed25519); nothing after.
+    reader.next_tlv_optional()?;
+    reader.finish("AlgorithmIdentifier")?;
     Ok(oid.to_vec())
 }
 
@@ -1310,13 +1354,23 @@ impl<'a> DerReader<'a> {
                 ));
             }
             let mut length = 0usize;
+            let mut first_length_byte = None;
             for _ in 0..count {
                 let byte = *self
                     .bytes
                     .get(self.offset)
                     .ok_or_else(|| OcspError::Malformed("truncated DER length".to_string()))?;
                 self.offset += 1;
+                first_length_byte.get_or_insert(byte);
                 length = (length << 8) | byte as usize;
+            }
+            // DER requires the shortest length form (X.690 10.1): no long form below 128 and no
+            // leading zero length octet. A re-encoded length would change the stapled bytes
+            // without changing anything the signature covers (SEC-MEDIUM D1).
+            if length < 0x80 || first_length_byte == Some(0) {
+                return Err(OcspError::Malformed(
+                    "non-minimal DER length encoding".to_string(),
+                ));
             }
             length
         };
@@ -1330,6 +1384,18 @@ impl<'a> DerReader<'a> {
         Ok((tag, value, &self.bytes[start..end]))
     }
 
+    /// Fail unless every input byte was consumed (strict DER: no trailing data).
+    fn finish(&self, what: &str) -> Result<(), OcspError> {
+        if self.offset == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(OcspError::Malformed(format!(
+                "trailing data after {what} ({} bytes)",
+                self.bytes.len() - self.offset
+            )))
+        }
+    }
+
     fn next_tlv_optional(&mut self) -> Result<Option<(u8, &'a [u8], &'a [u8])>, OcspError> {
         if self.offset >= self.bytes.len() {
             return Ok(None);
@@ -1339,51 +1405,61 @@ impl<'a> DerReader<'a> {
 }
 
 fn parse_asn1_time(tag: u8, value: &[u8]) -> Result<u64, OcspError> {
-    let text = std::str::from_utf8(value)
-        .map_err(|error| OcspError::Malformed(format!("invalid ASN.1 time: {error}")))?;
-    let trimmed = text.strip_suffix('Z').unwrap_or(text);
-    let (year, rest) = match tag {
-        0x17 => {
-            if trimmed.len() < 12 {
-                return Err(OcspError::Malformed(format!("invalid UTCTime `{text}`")));
-            }
-            let yy: i64 = trimmed[0..2]
-                .parse()
-                .map_err(|_| OcspError::Malformed(format!("invalid UTCTime `{text}`")))?;
-            (if yy >= 50 { 1900 + yy } else { 2000 + yy }, &trimmed[2..])
-        }
-        0x18 => {
-            if trimmed.len() < 14 {
-                return Err(OcspError::Malformed(format!(
-                    "invalid GeneralizedTime `{text}`"
-                )));
-            }
-            let year: i64 = trimmed[0..4]
-                .parse()
-                .map_err(|_| OcspError::Malformed(format!("invalid GeneralizedTime `{text}`")))?;
-            (year, &trimmed[4..])
-        }
+    let (name, digits, generalized) = match tag {
+        0x17 => ("UTCTime", 12usize, false),
+        0x18 => ("GeneralizedTime", 14usize, true),
         other => {
             return Err(OcspError::Malformed(format!(
                 "unsupported ASN.1 time tag 0x{other:02x}"
             )))
         }
     };
-    let parse = |slice: &str| -> Result<u64, OcspError> {
-        slice
-            .parse()
-            .map_err(|_| OcspError::Malformed(format!("invalid ASN.1 time `{text}`")))
+    let bad = || OcspError::Malformed(format!("invalid {name}"));
+    // The value comes straight off the network: validate it as ASCII digits BEFORE any indexing so
+    // a multi-byte character can never land on a non-boundary slice (a panic).
+    let body = value.strip_suffix(b"Z").unwrap_or(value);
+    if body.len() != digits || !body.iter().all(u8::is_ascii_digit) {
+        return Err(bad());
+    }
+    let number = |from: usize, to: usize| -> u64 {
+        body[from..to]
+            .iter()
+            .fold(0u64, |acc, digit| acc * 10 + u64::from(digit - b'0'))
     };
-    let month = parse(&rest[0..2])?;
-    let day = parse(&rest[2..4])?;
-    let hour = parse(&rest[4..6])?;
-    let minute = parse(&rest[6..8])?;
-    let second = parse(&rest[8..10])?;
+    let (year, rest) = if generalized {
+        (number(0, 4) as i64, 4)
+    } else {
+        let yy = number(0, 2) as i64;
+        (if yy >= 50 { 1900 + yy } else { 2000 + yy }, 2)
+    };
+    let month = number(rest, rest + 2);
+    let day = number(rest + 2, rest + 4);
+    let hour = number(rest + 4, rest + 6);
+    let minute = number(rest + 6, rest + 8);
+    let second = number(rest + 8, rest + 10);
+    if !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return Err(bad());
+    }
     unix_seconds_from_civil(year, month, day, hour, minute, second).ok_or_else(|| {
         OcspError::Malformed(format!(
-            "ASN.1 time `{text}` is before the Unix epoch and cannot be represented"
+            "{name} is before the Unix epoch and cannot be represented"
         ))
     })
+}
+
+fn days_in_month(year: i64, month: u64) -> u64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
+        _ => 28,
+    }
 }
 
 fn time_from_unix(seconds: u64) -> SystemTime {
@@ -1421,6 +1497,10 @@ fn unix_seconds_from_civil(
     minute: u64,
     second: u64,
 ) -> Option<u64> {
+    if !(1..=12).contains(&month) || day == 0 {
+        // Callers validate; keep `day - 1` below free of underflow regardless.
+        return None;
+    }
     // Howard Hinnant's days-from-civil algorithm.
     let y = if month <= 2 { year - 1 } else { year };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -1479,14 +1559,19 @@ pub fn verify_ocsp_response(
     Ok(())
 }
 
-/// A serial's value, ignoring redundant leading zero octets (DER INTEGERs are canonical, but a
-/// responder that echoes a non-minimal encoding still names the same number).
+/// Canonical two's-complement value of a DER INTEGER: redundant leading sign-extension octets
+/// (`00` before a byte with the high bit clear, `FF` before one with it set) are dropped. A
+/// positive `00 85` (+133) and a negative `85` (-123) stay different numbers; only a genuinely
+/// redundant octet is ignored. Responses are additionally required to be minimal at parse time.
 fn serial_value(serial: &[u8]) -> &[u8] {
-    let start = serial
-        .iter()
-        .position(|byte| *byte != 0)
-        .unwrap_or(serial.len());
-    &serial[start..]
+    let mut value = serial;
+    while value.len() > 1
+        && ((value[0] == 0x00 && value[1] & 0x80 == 0)
+            || (value[0] == 0xFF && value[1] & 0x80 != 0))
+    {
+        value = &value[1..];
+    }
+    value
 }
 
 fn cert_id_hash(algorithm_oid: &[u8], data: &[u8]) -> Result<Vec<u8>, OcspError> {

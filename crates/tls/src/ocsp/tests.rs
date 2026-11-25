@@ -304,6 +304,13 @@ struct ResponseSpec<'a> {
     corrupt_signature: bool,
     signature_algorithm: Vec<u8>,
     certs: Vec<Vec<u8>>,
+    /// Envelope tampering (levels: 0 OCSPResponse, 1 `[0]`, 2 ResponseBytes, 3 OCTET STRING,
+    /// 4 BasicOCSPResponse, 5 certs `[0]` wrapper, 6 outside everything): bytes appended inside
+    /// that level's content / that level's length re-encoded in a non-minimal form.
+    extra_at: Option<(usize, Vec<u8>)>,
+    nonminimal_level: Option<usize>,
+    /// Raw SingleResponse TLVs placed BEFORE the real one.
+    leading_singles: Vec<Vec<u8>>,
 }
 
 impl ResponseSpec<'static> {
@@ -323,6 +330,9 @@ impl ResponseSpec<'static> {
             corrupt_signature: false,
             signature_algorithm: ecdsa_sha256_alg(),
             certs: Vec::new(),
+            extra_at: None,
+            nonminimal_level: None,
+            leading_singles: Vec::new(),
         }
     }
 }
@@ -350,7 +360,11 @@ impl<'a> ResponseSpec<'a> {
         let response_data = seq(&[
             self.responder_id.clone(),
             utc_time(self.this_update),
-            seq(&[seq(&single)]),
+            seq(&{
+                let mut singles = self.leading_singles.clone();
+                singles.push(seq(&single));
+                singles
+            }),
         ]);
         let signed = if self.sign_other_message {
             let mut other = response_data.clone();
@@ -370,11 +384,59 @@ impl<'a> ResponseSpec<'a> {
             self.signature_algorithm.clone(),
             bit_string(&signature),
         ];
+        let extra = |level: usize| -> Vec<u8> {
+            match &self.extra_at {
+                Some((at, bytes)) if *at == level => bytes.clone(),
+                _ => Vec::new(),
+            }
+        };
+        // `tlv` at `level`, optionally with a non-minimal (long-form) length.
+        let mk = |level: usize, tag: u8, content: &[u8]| -> Vec<u8> {
+            let mut content = content.to_vec();
+            content.extend_from_slice(&extra(level));
+            if self.nonminimal_level == Some(level) {
+                // Length octets `83 00 hh ll`: a redundant leading zero, never minimal.
+                let mut out = vec![
+                    tag,
+                    0x83,
+                    0,
+                    (content.len() >> 8) as u8,
+                    content.len() as u8,
+                ];
+                out.extend_from_slice(&content);
+                out
+            } else {
+                tlv(tag, &content)
+            }
+        };
         if !self.certs.is_empty() {
-            basic.push(tlv(0xA0, &seq(&self.certs)));
+            let mut wrapper = seq(&self.certs);
+            wrapper.extend_from_slice(&extra(5));
+            basic.push(tlv(0xA0, &wrapper));
         }
-        let response_bytes = seq(&[oid(&[1, 3, 6, 1, 5, 5, 7, 48, 1, 1]), octet(&seq(&basic))]);
-        seq(&[tlv(0x0A, &[0]), tlv(0xA0, &response_bytes)])
+        let basic_seq = {
+            let mut content = Vec::new();
+            for item in &basic {
+                content.extend_from_slice(item);
+            }
+            mk(4, 0x30, &content)
+        };
+        let response_bytes = mk(
+            2,
+            0x30,
+            &[
+                oid(&[1, 3, 6, 1, 5, 5, 7, 48, 1, 1]),
+                mk(3, 0x04, &basic_seq),
+            ]
+            .concat(),
+        );
+        let mut out = mk(
+            0,
+            0x30,
+            &[tlv(0x0A, &[0]), mk(1, 0xA0, &response_bytes)].concat(),
+        );
+        out.extend_from_slice(&extra(6));
+        out
     }
 }
 
@@ -933,7 +995,7 @@ async fn genuine_revoked_and_unknown_responses_are_never_stapled() {
         assert_rejected(
             spec.build(),
             Duration::ZERO,
-            |error| matches!(error, OcspError::ResponderStatus(_)),
+            |error| matches!(error, OcspError::Revoked | OcspError::UnknownStatus),
             "non-good status",
         )
         .await;
@@ -954,10 +1016,15 @@ async fn response_for_a_different_serial_is_rejected() {
 
 #[tokio::test]
 async fn serial_match_ignores_redundant_leading_zero_but_not_value() {
-    // 0x0007 and 0x07 are the same number; 0x0107 is not.
+    // A non-minimal `00 07` is malformed (DER INTEGERs are canonical); 0x0107 is another number.
     let spec = ResponseSpec::good(&[0, 7], START.as_secs(), Some(START.as_secs() + HOUR));
-    let (outcome, _, _) = stapling_outcome(spec.build(), Duration::ZERO).await;
-    assert_eq!(outcome.unwrap(), StapleOutcome::Fetched);
+    assert_rejected(
+        spec.build(),
+        Duration::ZERO,
+        |error| matches!(error, OcspError::Malformed(_)),
+        "non-minimal serial",
+    )
+    .await;
     let spec = ResponseSpec::good(&[1, 7], START.as_secs(), Some(START.as_secs() + HOUR));
     assert_rejected(
         spec.build(),
@@ -1300,3 +1367,5 @@ fn verify_signature_covers_every_supported_algorithm_and_rejects_mismatches() {
     // Unknown algorithm OID.
     assert!(super::verify_signature(&[0x2A, 0x03], &public, message, &signature).is_err());
 }
+
+mod hardening;

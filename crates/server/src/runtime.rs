@@ -32,8 +32,8 @@ use caddy_rs_tls::{
     plan_automatic_https, resolver_from_config, staple_for_certificate, AcmeTlsAlpnResolver,
     AcmeTransport, AutomaticHttpsIssuer, AutomaticHttpsPlan, AutomaticHttpsProvisioner,
     AutomaticHttpsRenewals, CertificateResolver, HyperOcspTransport, HyperTransport,
-    NoAcmeTransport, OcspPolicy, OcspStapler, SharedOcspStapler, TlsAlpn01TokenStore, TlsResolver,
-    TlsServerOptions, DEFAULT_HTTPS_PORT,
+    NoAcmeTransport, OcspError, OcspPolicy, OcspStapler, SharedOcspStapler, TlsAlpn01TokenStore,
+    TlsResolver, TlsServerOptions, DEFAULT_HTTPS_PORT,
 };
 use tokio::sync::watch;
 
@@ -3096,11 +3096,35 @@ async fn apply_ocsp_staples(
                 }
             }
             Ok(_) => {}
-            Err(error) => tracing::warn!(
-                subject,
-                %error,
-                "OCSP staple refresh failed; keeping the previous staple"
-            ),
+            Err(error) => {
+                // The stapler withdraws a staple on a verified revocation and never serves one
+                // past its `nextUpdate`; mirror that into the resolver so the handshake stops
+                // stapling the old response (a still-fresh previous staple is kept).
+                let current = stapler.staple(leaf.as_ref());
+                if certificate.ocsp_staple() != current.as_deref() {
+                    if let Err(insert_error) =
+                        resolver.insert(certificate.clone().with_ocsp_staple(current))
+                    {
+                        tracing::warn!(
+                            subject,
+                            %insert_error,
+                            "cannot withdraw the stale OCSP staple from the resolver"
+                        );
+                    }
+                }
+                if matches!(error, OcspError::Revoked) {
+                    tracing::error!(
+                        subject,
+                        "OCSP responder reports this certificate as REVOKED; the staple was                          withdrawn. Automatic re-issuance of revoked certificates is not                          implemented: replace the certificate"
+                    );
+                } else {
+                    tracing::warn!(
+                        subject,
+                        %error,
+                        "OCSP staple refresh failed; keeping a still-fresh previous staple, if any"
+                    );
+                }
+            }
         }
     }
 }
