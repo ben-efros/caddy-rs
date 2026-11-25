@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=../../ui/src");
 
     let manifest_dir = PathBuf::from(
         std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is always set by cargo"),
@@ -24,6 +25,13 @@ fn main() {
     let mut files: Vec<PathBuf> = Vec::new();
     if ui_dist.is_dir() {
         collect(&ui_dist, &mut files);
+        // The bundle is committed, and nothing in CI rebuilds it: the release workflow only runs
+        // `cargo build`. A `dist/` left behind by an older source tree therefore ships a UI that
+        // disagrees with `pm/ui/src` -- which is exactly how the first-run setup screen kept
+        // calling `/auth/setup` without its setup token. Warn (rather than fail) when the source
+        // is newer than the bundle, so the mistake is visible without breaking a build for
+        // anyone who is not shipping the UI.
+        warn_if_bundle_is_stale(&manifest_dir.join("../../ui"));
         // Track the directory itself (catches files added or removed) plus every file (catches
         // content changes, which is what a rebuilt bundle produces).
         println!("cargo:rerun-if-changed={}", ui_dist.display());
@@ -64,6 +72,50 @@ fn main() {
     let target = out_dir.join("ui_assets.rs");
     std::fs::write(&target, generated)
         .unwrap_or_else(|error| panic!("failed to write {}: {error}", target.display()));
+}
+
+/// Emit a build warning when any file under `ui_src` is newer than the committed bundle.
+///
+/// A build script cannot fail the release for this without also failing every local
+/// `cargo build --workspace` that touches the UI, so it warns; the committed-bundle test in this
+/// crate's test suite is what actually enforces freshness.
+fn warn_if_bundle_is_stale(ui_src: &Path) {
+    let bundle = ui_src.join("dist");
+    let Ok(bundle_mtime) = std::fs::metadata(&bundle).and_then(|meta| meta.modified()) else {
+        return;
+    };
+    let mut newest: Option<(PathBuf, std::time::SystemTime)> = None;
+    let mut sources = Vec::new();
+    // Only the hand-written sources and the config that shapes the output; `node_modules` and
+    // `dist` are not inputs to themselves.
+    for relative in [
+        "src",
+        "index.html",
+        "package.json",
+        "vite.config.ts",
+        "tsconfig.json",
+    ] {
+        let path = ui_src.join(relative);
+        if path.is_dir() {
+            collect(&path, &mut sources);
+        } else if path.is_file() {
+            sources.push(path);
+        }
+    }
+    for file in sources {
+        let Ok(modified) = std::fs::metadata(&file).and_then(|meta| meta.modified()) else {
+            continue;
+        };
+        if modified > bundle_mtime && newest.as_ref().is_none_or(|(_, seen)| modified > *seen) {
+            newest = Some((file, modified));
+        }
+    }
+    if let Some((file, _)) = newest {
+        println!(
+            "cargo:warning=pm/ui/dist is older than {}; rebuild the bundle with              `npm --prefix pm/ui run build` or the embedded UI will not match its source",
+            file.display()
+        );
+    }
 }
 
 fn collect(dir: &Path, files: &mut Vec<PathBuf>) {
