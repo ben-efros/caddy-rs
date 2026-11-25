@@ -142,6 +142,25 @@ malformed entries); `crates/proxy/src/handler.rs`
 `dynamic_client_cache_is_bounded_and_evicts_least_recently_used`,
 `dynamic_hosts_are_bounded_but_keep_the_current_pool`.
 
+## C4 — DNS resolver spoof resistance (parity with the DNS specification and Go's resolver)
+
+Go's resolver (`net/dnsclient_unix.go`, used by Caddy's `transport.resolver` and the `srv`/`a`
+dynamic-upstream sources) uses a random 16-bit id and checks the reply's id and question
+(`checkResponse`/`checkHeader`) before accepting it. caddy-rs' hand-written resolver
+(`crates/proxy/src/dns.rs`) used a sequential counter and checked only the id. Behaviour is
+spec-correct, so it is unconditional (no `stock_compat` switch).
+
+- `next_query_id` draws the id from the OS CSPRNG (`getrandom`, now a direct dependency of
+  `caddy-rs-proxy`; already in `Cargo.lock`); a CSPRNG failure fails the lookup.
+- `validate_response` accepts a reply only if the id matches, QR is set, exactly one question is
+  echoed and its name (case-insensitive), type and class equal the query's.
+- Over UDP a non-matching datagram is ignored and the wait continues until the lookup timeout; over
+  TCP (and after a TC retry) a non-matching reply is an error.
+
+Tests: `crates/proxy/src/dns.rs` `query_ids_are_not_a_predictable_sequence`,
+`responses_must_echo_the_question_that_was_asked`,
+`forged_udp_replies_with_the_wrong_question_are_ignored`, `a_forged_only_reply_is_never_accepted`.
+
 ## Proposed register entries (program repository)
 
 ```text

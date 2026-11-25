@@ -9,7 +9,6 @@
 //! (options from `/etc/resolv.conf`), tests provide a deterministic fake.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -268,9 +267,52 @@ async fn query_first_resolver(
     Err(last_error)
 }
 
-fn next_query_id() -> u16 {
-    static COUNTER: AtomicU16 = AtomicU16::new(1);
-    COUNTER.fetch_add(1, Ordering::Relaxed)
+/// A fresh unpredictable 16-bit query id from the OS CSPRNG (SEC-MEDIUM-PROXY C4). A sequential
+/// counter lets an off-path attacker predict the id of the next query and race a forged reply.
+fn next_query_id() -> Result<u16, String> {
+    let mut bytes = [0_u8; 2];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|error| format!("generating a DNS query id: {error}"))?;
+    Ok(u16::from_be_bytes(bytes))
+}
+
+/// Accept `response` only if it answers `query`: same id, QR set, exactly one question and that
+/// question's name (case-insensitively), type and class equal the query's (SEC-MEDIUM-PROXY C4).
+///
+/// The id alone is only 16 bits; also binding the reply to the question stops an off-path forger or
+/// a stale reply for another name from being parsed as the answer to this lookup.
+fn validate_response(query: &[u8], response: &[u8]) -> Result<(), String> {
+    if response.len() < 12 || query.len() < 12 {
+        return Err("DNS response is truncated".to_string());
+    }
+    if response[..2] != query[..2] {
+        return Err(format!(
+            "DNS response id {} does not match query id {}",
+            u16::from_be_bytes([response[0], response[1]]),
+            u16::from_be_bytes([query[0], query[1]])
+        ));
+    }
+    if response[2] & 0x80 == 0 {
+        return Err("DNS message is not a response (QR bit clear)".to_string());
+    }
+    let qdcount = u16::from_be_bytes([response[4], response[5]]);
+    if qdcount != 1 {
+        return Err(format!(
+            "DNS response carries {qdcount} questions; expected exactly 1"
+        ));
+    }
+    let (asked_name, asked_end) = decode_name_at(query, 12)?;
+    let (echoed_name, echoed_end) = decode_name_at(response, 12)?;
+    if !asked_name.eq_ignore_ascii_case(&echoed_name) {
+        return Err("DNS response question name does not match the query".to_string());
+    }
+    if query.len() < asked_end + 4 || response.len() < echoed_end + 4 {
+        return Err("DNS question is truncated".to_string());
+    }
+    if query[asked_end..asked_end + 4] != response[echoed_end..echoed_end + 4] {
+        return Err("DNS response question type or class does not match the query".to_string());
+    }
+    Ok(())
 }
 
 /// Build a DNS query message for `name`/`qtype`.
@@ -372,7 +414,7 @@ async fn send_query(
     qtype: u16,
     timeout: Duration,
 ) -> Result<Vec<u8>, String> {
-    let id = next_query_id();
+    let id = next_query_id()?;
     let query = encode_query(id, name, qtype)?;
     let response = match resolver.network {
         ResolverNetwork::Udp => {
@@ -386,11 +428,23 @@ async fn send_query(
                 .await
                 .map_err(|error| format!("sending DNS query: {error}"))?;
             let mut buffer = vec![0_u8; 4096];
-            let len = tokio::time::timeout(timeout, socket.recv(&mut buffer))
+            // The socket is connected, so only the resolver's address reaches `recv`. A datagram whose
+            // id or question does not match is ignored and the wait continues until the deadline
+            // (SEC-MEDIUM-PROXY C4): one forged packet must not end, or answer, the lookup.
+            let received = async {
+                loop {
+                    let len = socket
+                        .recv(&mut buffer)
+                        .await
+                        .map_err(|error| format!("receiving DNS response: {error}"))?;
+                    if validate_response(&query, &buffer[..len]).is_ok() {
+                        return Ok::<Vec<u8>, String>(buffer[..len].to_vec());
+                    }
+                }
+            };
+            let mut response = tokio::time::timeout(timeout, received)
                 .await
-                .map_err(|_| format!("DNS query timed out after {timeout:?}"))?
-                .map_err(|error| format!("receiving DNS response: {error}"))?;
-            let mut response = buffer[..len].to_vec();
+                .map_err(|_| format!("DNS query timed out after {timeout:?}"))??;
             if response.len() >= 4 && response[2] & 0x02 != 0 {
                 // TC (truncated) — retry over TCP.
                 response = send_tcp_query(&resolver.address, &query, timeout).await?;
@@ -399,15 +453,7 @@ async fn send_query(
         }
         ResolverNetwork::Tcp => send_tcp_query(&resolver.address, &query, timeout).await?,
     };
-    if response.len() < 12 {
-        return Err("DNS response is truncated".to_string());
-    }
-    let response_id = u16::from_be_bytes([response[0], response[1]]);
-    if response_id != id {
-        return Err(format!(
-            "DNS response id {response_id} does not match query id {id}"
-        ));
-    }
+    validate_response(&query, &response)?;
     Ok(response)
 }
 
@@ -1137,6 +1183,178 @@ mod tests {
         nxdomain[3] = 0x83; // rcode 3 = NXDOMAIN
         let error = parse_ip_response(&nxdomain, QTYPE_A).unwrap_err();
         assert!(error.contains("error code 3"), "{error}");
+    }
+
+    /// SEC-MEDIUM-PROXY C4: query ids must not be a predictable counter, or an off-path attacker
+    /// who can race a reply only has to guess the 16-bit space once per sequence step.
+    #[test]
+    fn query_ids_are_not_a_predictable_sequence() {
+        let ids: Vec<u16> = (0..64).map(|_| next_query_id().unwrap()).collect();
+        let sequential = ids
+            .windows(2)
+            .filter(|pair| pair[1] == pair[0].wrapping_add(1))
+            .count();
+        assert!(
+            sequential < 8,
+            "ids look like a counter ({sequential} consecutive steps): {ids:?}"
+        );
+        let distinct: std::collections::HashSet<u16> = ids.iter().copied().collect();
+        assert!(distinct.len() > 48, "ids repeat too often: {ids:?}");
+    }
+
+    fn with_id(mut message: Vec<u8>, id: u16) -> Vec<u8> {
+        message[..2].copy_from_slice(&id.to_be_bytes());
+        message
+    }
+
+    /// SEC-MEDIUM-PROXY C4: a reply is accepted only when its id AND question (name compared
+    /// case-insensitively, type, class) match the query that was sent.
+    #[test]
+    fn responses_must_echo_the_question_that_was_asked() {
+        let query = encode_query(0xBEEF, "example.com", QTYPE_A).unwrap();
+        let good = with_id(
+            response(
+                &[("example.com.", QTYPE_A)],
+                &[(QTYPE_A, vec![192, 0, 2, 1])],
+            ),
+            0xBEEF,
+        );
+        assert_eq!(validate_response(&query, &good), Ok(()));
+        // DNS names are case-insensitive (and 0x20 randomisation upstream may change the case).
+        let shouting = with_id(response(&[("ExAmPlE.CoM.", QTYPE_A)], &[]), 0xBEEF);
+        assert_eq!(validate_response(&query, &shouting), Ok(()));
+
+        let wrong_id = with_id(good.clone(), 0xBEEE);
+        assert!(validate_response(&query, &wrong_id).is_err(), "wrong id");
+        let other_name = with_id(response(&[("evil.example.", QTYPE_A)], &[]), 0xBEEF);
+        assert!(
+            validate_response(&query, &other_name).is_err(),
+            "wrong name"
+        );
+        let longer_name = with_id(response(&[("a.example.com.", QTYPE_A)], &[]), 0xBEEF);
+        assert!(
+            validate_response(&query, &longer_name).is_err(),
+            "suffix name"
+        );
+        let other_type = with_id(response(&[("example.com.", QTYPE_AAAA)], &[]), 0xBEEF);
+        assert!(
+            validate_response(&query, &other_type).is_err(),
+            "wrong type"
+        );
+        let mut other_class = good.clone();
+        let class_at = other_class.len() - 16 - 2; // question class precedes the single answer
+        other_class[class_at..class_at + 2].copy_from_slice(&3_u16.to_be_bytes());
+        assert!(
+            validate_response(&query, &other_class).is_err(),
+            "wrong class"
+        );
+        let no_question = with_id(response(&[], &[]), 0xBEEF);
+        assert!(
+            validate_response(&query, &no_question).is_err(),
+            "no question"
+        );
+        let two_questions = with_id(
+            response(&[("example.com.", QTYPE_A), ("example.com.", QTYPE_A)], &[]),
+            0xBEEF,
+        );
+        assert!(
+            validate_response(&query, &two_questions).is_err(),
+            "two questions"
+        );
+        let mut not_a_response = good.clone();
+        not_a_response[2] &= 0x7f; // QR bit clear: this is a query, not a reply
+        assert!(
+            validate_response(&query, &not_a_response).is_err(),
+            "QR clear"
+        );
+        // Truncated and malformed messages are errors, never panics.
+        assert!(validate_response(&query, &good[..11]).is_err());
+        assert!(validate_response(&query, &good[..20]).is_err());
+        let mut pointer_loop = good.clone();
+        pointer_loop[12] = 0xc0;
+        pointer_loop[13] = 12;
+        assert!(
+            validate_response(&query, &pointer_loop).is_err(),
+            "pointer loop"
+        );
+    }
+
+    /// An off-path forger that guessed the id (or a stale reply for another name) must be ignored:
+    /// the resolver keeps waiting and returns the genuine answer.
+    #[tokio::test]
+    async fn forged_udp_replies_with_the_wrong_question_are_ignored() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut buffer = [0_u8; 512];
+            let (len, peer) = socket.recv_from(&mut buffer).await.unwrap();
+            let id = u16::from_be_bytes([buffer[0], buffer[1]]);
+            assert!(len > 12);
+            // Forged: right id, wrong question, attacker address.
+            let forged = with_id(
+                response(
+                    &[("evil.example.", QTYPE_A)],
+                    &[(QTYPE_A, vec![6, 6, 6, 6])],
+                ),
+                id,
+            );
+            socket.send_to(&forged, peer).await.unwrap();
+            let genuine = with_id(
+                response(
+                    &[("example.com.", QTYPE_A)],
+                    &[(QTYPE_A, vec![192, 0, 2, 33])],
+                ),
+                id,
+            );
+            socket.send_to(&genuine, peer).await.unwrap();
+        });
+        let addresses = SystemDnsResolver
+            .lookup_ip(
+                "example.com",
+                IpVersion::V4Only,
+                &[ResolverAddress {
+                    network: ResolverNetwork::Udp,
+                    address,
+                }],
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("the genuine reply is accepted");
+        assert_eq!(addresses, vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 33))]);
+        server.await.unwrap();
+    }
+
+    /// With only a forged reply the lookup fails (times out) instead of caching attacker data.
+    #[tokio::test]
+    async fn a_forged_only_reply_is_never_accepted() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut buffer = [0_u8; 512];
+            let (_, peer) = socket.recv_from(&mut buffer).await.unwrap();
+            let id = u16::from_be_bytes([buffer[0], buffer[1]]);
+            let forged = with_id(
+                response(
+                    &[("evil.example.", QTYPE_A)],
+                    &[(QTYPE_A, vec![6, 6, 6, 6])],
+                ),
+                id,
+            );
+            socket.send_to(&forged, peer).await.unwrap();
+        });
+        let result = SystemDnsResolver
+            .lookup_ip(
+                "example.com",
+                IpVersion::V4Only,
+                &[ResolverAddress {
+                    network: ResolverNetwork::Udp,
+                    address,
+                }],
+                Duration::from_millis(300),
+            )
+            .await;
+        assert!(result.is_err(), "forged reply accepted: {result:?}");
+        server.await.unwrap();
     }
 
     #[tokio::test]
