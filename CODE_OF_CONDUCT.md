@@ -18,9 +18,9 @@ Nobody is required to be your friend. Nobody is required to agree with you. Nobo
 
 ## Things that will get you shown the door
 
-While other projects virtue signal and think open source is about only their "virtues", this one is not.  I assure you that nobody here is interested in policing personalities, opinions, humor, or the occasional heated technical disagreement.
+While other projects virtue signal and think open source is about only their "virtues", this one is not. I assure you that nobody here is interested in policing personalities, opinions, humor, or the occasional heated technical disagreement.
 
-Spam, threats, harassment, doxxing, deliberate sabotage, and other behavior that makes maintaining software more trouble than it's worth may result in repercussions you don't like.  When you are out in public and aren't hiding in Mommy's basement, follow the law.
+Spam, threats, harassment, doxxing, deliberate sabotage, and other behavior that makes maintaining software more trouble than it's worth may result in repercussions you don't like. When you are out in public and aren't hiding in Mommy's basement, follow the law.
 
 ## Enforcement
 
