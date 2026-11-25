@@ -986,24 +986,30 @@ impl AdminApi {
             .unwrap_or(Value::Null)
     }
 
-    /// Handle one request.
-    pub async fn handle(&self, request: AdminRequest) -> AdminResponse {
-        let (path, _query) = match request.path.split_once('?') {
-            Some((path, query)) => (path, Some(query)),
-            None => (request.path.as_str(), None),
-        };
-
+    /// The Host/Origin (plaintext listener) or access-control (mutual-TLS listener) decision for a
+    /// request, without its body. Transports call this *before* reading the body so a request
+    /// that will be refused never takes an upload slot or memory; stock Caddy likewise checks
+    /// host and origin before the handler reads anything. `Ok(origin)` carries the CORS origin to
+    /// echo, as in [`AdminApi::handle`].
+    fn authorize_parts(
+        &self,
+        method: &Method,
+        path_and_query: &str,
+        headers: &HeaderMap,
+        identity: &ClientIdentity,
+    ) -> Result<Option<String>, AdminResponse> {
+        let path = path_and_query
+            .split_once('?')
+            .map_or(path_and_query, |(path, _query)| path);
         // A request that arrived on the mutual-TLS remote listener carries a verified client
         // identity: Caddy replaces the origin/host policy with access-control enforcement for
         // that endpoint (`admin.go:226-229`, `admin.go:852-858`). The plaintext listener keeps
         // the origin policy unchanged.
-        let origin = match &request.client_identity {
-            ClientIdentity::NotPresented => match self.origin_policy().check(&request.headers) {
-                Ok(origin) => origin,
-                Err(violation) => {
-                    return AdminResponse::api_error(violation.status, violation.message)
-                }
-            },
+        match identity {
+            ClientIdentity::NotPresented => self
+                .origin_policy()
+                .check(headers)
+                .map_err(|violation| AdminResponse::api_error(violation.status, violation.message)),
             client => {
                 // Fail closed: an unparsable verified certificate is denied here, never handed to
                 // the plaintext origin policy, where a forged `Host`/`Origin` could pass.
@@ -1012,13 +1018,40 @@ impl AdminApi {
                     .current()
                     .and_then(|generation| generation.config().admin.clone())
                     .and_then(|admin| admin.remote);
-                if let Err(denial) =
-                    access::decide_client(remote.as_ref(), client, &request.method, path)
-                {
-                    return AdminResponse::api_error(denial.status, denial.message);
-                }
-                None
+                access::decide_client(remote.as_ref(), client, method, path)
+                    .map_err(|denial| AdminResponse::api_error(denial.status, denial.message))?;
+                Ok(None)
             }
+        }
+    }
+
+    /// Pre-body authorization; see [`AdminApi::authorize_parts`]. `Err` is the response to send.
+    pub fn authorize(
+        &self,
+        method: &Method,
+        path_and_query: &str,
+        headers: &HeaderMap,
+        identity: &ClientIdentity,
+    ) -> Result<(), AdminResponse> {
+        self.authorize_parts(method, path_and_query, headers, identity)
+            .map(|_| ())
+    }
+
+    /// Handle one request.
+    pub async fn handle(&self, request: AdminRequest) -> AdminResponse {
+        let (path, _query) = match request.path.split_once('?') {
+            Some((path, query)) => (path, Some(query)),
+            None => (request.path.as_str(), None),
+        };
+
+        let origin = match self.authorize_parts(
+            &request.method,
+            &request.path,
+            &request.headers,
+            &request.client_identity,
+        ) {
+            Ok(origin) => origin,
+            Err(response) => return response,
         };
 
         let mut response = self.dispatch(path, &request).await;

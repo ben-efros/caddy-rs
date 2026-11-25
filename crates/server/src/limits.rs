@@ -105,6 +105,21 @@ pub struct ServerLimits {
     /// Resolved server identity for the HTTP `Server` header and FastCGI `SERVER_SOFTWARE`
     /// (caddy-rs extension, T-CONF-060; ADR-0010 §3 matrix, `DIV-0132`).
     pub server_identity: caddy_rs_core::ResolvedIdentity,
+
+    /// When the per-read `read_timeout` timer runs (caddy-rs internal; not configurable).
+    pub read_timeout_scope: ReadTimeoutScope,
+}
+
+/// When the per-read `read_timeout` timer applies to a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadTimeoutScope {
+    /// On every stalled read, including the idle wait between requests (public servers; DIV-0029).
+    #[default]
+    Always,
+    /// Only while a request body is being read. Go's `ReadTimeout` is per request, and between
+    /// requests only `IdleTimeout` applies; a handler that is busy (no client bytes expected) must
+    /// not be torn down by it either. Used by the admin listeners.
+    BodyReads,
 }
 
 impl Default for ServerLimits {
@@ -118,6 +133,7 @@ impl Default for ServerLimits {
             max_request_body_size: None,
             max_connections: None,
             server_identity: caddy_rs_core::ResolvedIdentity::default(),
+            read_timeout_scope: ReadTimeoutScope::Always,
         }
     }
 }
@@ -135,6 +151,7 @@ impl ServerLimits {
             idle_timeout: Duration::from_secs(60),
             read_header_timeout: Duration::from_secs(5),
             max_header_bytes: Some(64 * 1024),
+            read_timeout_scope: ReadTimeoutScope::BodyReads,
             ..Self::default()
         }
     }
@@ -233,6 +250,7 @@ impl ServerLimits {
             max_request_body_size,
             max_connections,
             server_identity,
+            read_timeout_scope: ReadTimeoutScope::Always,
         })
     }
 }

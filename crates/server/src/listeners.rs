@@ -2626,7 +2626,17 @@ async fn serve_connection<I, S>(
     builder
         .http1()
         .timer(TokioTimer::new())
-        .header_read_timeout(Some(limits.read_header_timeout))
+        // hyper's header timer also runs while a keep-alive connection waits for its next request,
+        // where Go applies `IdleTimeout` instead. Listeners that opt into request-scoped read
+        // timers therefore give it the idle budget (their first-byte wait still uses the header
+        // budget); everyone else keeps `read_header_timeout`.
+        .header_read_timeout(Some(
+            if limits.read_timeout_scope == crate::limits::ReadTimeoutScope::BodyReads {
+                limits.idle_timeout
+            } else {
+                limits.read_header_timeout
+            },
+        ))
         .max_buf_size(
             limits
                 .max_header_bytes
@@ -2635,7 +2645,10 @@ async fn serve_connection<I, S>(
     let mut http2 = builder.http2();
     configure_h2_auto_server(&mut http2, &limits);
 
-    let io = TimedIo::new(io, limits.read_timeout, limits.write_timeout);
+    let mut io = TimedIo::new(io, limits.read_timeout, limits.write_timeout);
+    if limits.read_timeout_scope == crate::limits::ReadTimeoutScope::BodyReads {
+        io = io.with_read_gate(Arc::clone(&activity));
+    }
     let connection = builder.serve_connection_with_upgrades(TokioIo::new(io), service);
     tokio::pin!(connection);
     let idle = idle_after(activity, limits.idle_timeout);
@@ -2680,10 +2693,32 @@ async fn serve_connection<I, S>(
 #[derive(Debug, Default)]
 struct ConnectionActivity {
     in_flight: AtomicUsize,
+    /// Request bodies currently being read. With [`ReadTimeoutScope::BodyReads`] the per-read
+    /// timer runs only while this is non-zero.
+    body_reads: AtomicUsize,
     notify: tokio::sync::Notify,
 }
 
+/// Marks a request body read in flight; see [`ConnectionActivity::begin_body_read`].
+struct BodyReadGuard(Arc<ConnectionActivity>);
+
+impl Drop for BodyReadGuard {
+    fn drop(&mut self) {
+        self.0.body_reads.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl ConnectionActivity {
+    /// Mark the start of a request-body read; the guard marks its end when dropped.
+    fn begin_body_read(self: &Arc<Self>) -> BodyReadGuard {
+        self.body_reads.fetch_add(1, Ordering::AcqRel);
+        BodyReadGuard(Arc::clone(self))
+    }
+
+    fn reading_body(&self) -> bool {
+        self.body_reads.load(Ordering::Acquire) != 0
+    }
+
     /// Mark the start of one request. The returned guard marks the end when dropped.
     fn begin(self: &Arc<Self>) -> InFlightGuard {
         self.in_flight.fetch_add(1, Ordering::AcqRel);
@@ -2767,6 +2802,8 @@ struct TimedIo<I> {
     write_timeout: Option<Duration>,
     read_timer: Option<Pin<Box<tokio::time::Sleep>>>,
     write_timer: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// When set, the read timer runs only while this connection is reading a request body.
+    read_gate: Option<Arc<ConnectionActivity>>,
 }
 
 impl<I> TimedIo<I> {
@@ -2777,7 +2814,13 @@ impl<I> TimedIo<I> {
             write_timeout,
             read_timer: None,
             write_timer: None,
+            read_gate: None,
         }
+    }
+
+    fn with_read_gate(mut self, gate: Arc<ConnectionActivity>) -> Self {
+        self.read_gate = Some(gate);
+        self
     }
 }
 
@@ -2789,7 +2832,14 @@ impl<I: AsyncRead + Unpin> AsyncRead for TimedIo<I> {
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         let result = Pin::new(&mut this.inner).poll_read(cx, buf);
-        apply_io_timeout(&mut this.read_timer, this.read_timeout, cx, result)
+        let timeout = match &this.read_gate {
+            Some(gate) if !gate.reading_body() => {
+                this.read_timer = None;
+                None
+            }
+            _ => this.read_timeout,
+        };
+        apply_io_timeout(&mut this.read_timer, timeout, cx, result)
     }
 }
 
@@ -2853,7 +2903,79 @@ fn error_response() -> hyper::Response<Body> {
 struct AdminService {
     api: AdminApi,
     /// Shared by every connection of one listener: bounds the admin requests reading a body.
-    body_slots: Arc<tokio::sync::Semaphore>,
+    body_slots: Arc<AdminBodySlots>,
+    /// The connection's activity record: a body read in flight switches the read timer on.
+    activity: Arc<ConnectionActivity>,
+    /// Who is on the other end, for per-peer upload fairness.
+    peer: String,
+}
+
+/// Upload slots of one admin listener: [`ADMIN_MAX_CONCURRENT_BODIES`] in total, of which one peer
+/// may hold at most [`ADMIN_MAX_BODIES_PER_PEER`], so a single client (or certificate) that
+/// trickles bodies cannot starve everyone else.
+struct AdminBodySlots {
+    total: Arc<tokio::sync::Semaphore>,
+    per_peer: std::sync::Mutex<HashMap<String, usize>>,
+}
+
+/// One claimed upload slot; released on drop.
+struct BodySlot {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    slots: Arc<AdminBodySlots>,
+    peer: String,
+}
+
+impl AdminBodySlots {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            total: Arc::new(tokio::sync::Semaphore::new(ADMIN_MAX_CONCURRENT_BODIES)),
+            per_peer: std::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Claim a slot for `peer`, or `None` when the listener or the peer is at its limit.
+    fn try_acquire(self: &Arc<Self>, peer: &str) -> Option<BodySlot> {
+        {
+            let mut per_peer = self.per_peer.lock().unwrap_or_else(|e| e.into_inner());
+            let held = per_peer.entry(peer.to_string()).or_insert(0);
+            if *held >= ADMIN_MAX_BODIES_PER_PEER {
+                return None;
+            }
+            *held += 1;
+        }
+        match Arc::clone(&self.total).try_acquire_owned() {
+            Ok(permit) => Some(BodySlot {
+                _permit: permit,
+                slots: Arc::clone(self),
+                peer: peer.to_string(),
+            }),
+            Err(_) => {
+                self.release_peer(peer);
+                None
+            }
+        }
+    }
+
+    fn release_peer(&self, peer: &str) {
+        let mut per_peer = self.per_peer.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(held) = per_peer.get_mut(peer) {
+            *held -= 1;
+            if *held == 0 {
+                per_peer.remove(peer);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn available(&self) -> usize {
+        self.total.available_permits()
+    }
+}
+
+impl Drop for BodySlot {
+    fn drop(&mut self) {
+        self.slots.release_peer(&self.peer);
+    }
 }
 
 /// Wait up to `budget` for the first byte of a connection and hand it back unconsumed.
@@ -2892,11 +3014,6 @@ where
         .flatten()
 }
 
-/// A fresh per-listener in-flight body budget ([`ADMIN_MAX_CONCURRENT_BODIES`]).
-fn new_admin_body_slots() -> Arc<tokio::sync::Semaphore> {
-    Arc::new(tokio::sync::Semaphore::new(ADMIN_MAX_CONCURRENT_BODIES))
-}
-
 /// Largest admin request body accepted (SEC-MEDIUM-ADMIN-SERVER A2). Stock Caddy reads `/load`
 /// and `/adapt` bodies with an unbounded `io.Copy`; 64 MiB is far above any real configuration
 /// while stopping a multi-gigabyte POST from exhausting memory. `stock_compat true` lifts it.
@@ -2906,6 +3023,10 @@ pub(crate) const ADMIN_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// cap this bounds the memory a flood of trickling uploads can pin to 256 MiB; further requests
 /// with a body get `503` until one finishes (`stock_compat true` lifts the bound, like the cap).
 pub(crate) const ADMIN_MAX_CONCURRENT_BODIES: usize = 4;
+
+/// Of those, the most one peer (remote address, or certificate for the mTLS listener) may hold, so
+/// a client that stalls its uploads cannot take every slot and starve authorised callers.
+pub(crate) const ADMIN_MAX_BODIES_PER_PEER: usize = 2;
 
 /// The body cap for the next admin request: [`ADMIN_MAX_BODY_BYTES`], or none when the active
 /// generation sets `stock_compat true`.
@@ -2933,7 +3054,9 @@ const ADMIN_BODY_DEADLINE: Duration = Duration::from_secs(10);
 #[allow(clippy::result_large_err)] // the error is the ready-to-send admin response
 async fn read_admin_request_body<B>(
     api: &AdminApi,
-    slots: &Arc<tokio::sync::Semaphore>,
+    slots: &Arc<AdminBodySlots>,
+    peer: &str,
+    activity: &Arc<ConnectionActivity>,
     headers: &http::HeaderMap,
     body: B,
 ) -> Result<Bytes, caddy_rs_admin::AdminResponse>
@@ -2944,16 +3067,13 @@ where
     use caddy_rs_admin::AdminResponse;
     use http::StatusCode;
     let limit = admin_body_limit(api);
-    let announces_body = headers.contains_key(http::header::TRANSFER_ENCODING)
-        || headers
-            .get(http::header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .is_some_and(|value| value != "0");
+    // Whether a body is coming is a property of the body, not of the headers: an HTTP/2 request
+    // may carry DATA frames with no `content-length`, and chunked HTTP/1 has no length either.
+    let announces_body = !body.is_end_stream() && body.size_hint().exact() != Some(0);
     let _slot = if limit.is_some() && announces_body {
-        match Arc::clone(slots).try_acquire_owned() {
-            Ok(permit) => Some(permit),
-            Err(_) => {
+        match slots.try_acquire(peer) {
+            Some(slot) => Some(slot),
+            None => {
                 return Err(AdminResponse::api_error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "too many admin requests are uploading a body; retry shortly",
@@ -2963,6 +3083,8 @@ where
     } else {
         None
     };
+    // While a body is being read the per-read timer runs; between requests it does not.
+    let _reading = announces_body.then(|| activity.begin_body_read());
     match tokio::time::timeout(ADMIN_BODY_DEADLINE, read_admin_body(headers, body, limit)).await {
         Ok(result) => result,
         Err(_elapsed) => Err(AdminResponse::api_error(
@@ -3084,11 +3206,71 @@ fn admin_hyper_response(response: caddy_rs_admin::AdminResponse) -> hyper::Respo
         .expect("admin response is valid")
 }
 
+/// Serve one admin request on either transport, in the order stock Caddy uses: resolve `Host`,
+/// make the Host/Origin (plaintext) or access-control (mTLS) decision, and only then read the
+/// body. A request that is refused, or whose body is rejected (413/408/503), never has its body
+/// read to the end, so an HTTP/1 connection is closed after the response rather than left with
+/// unread bytes; refusing before the read also means a refused client never holds an upload slot.
+async fn serve_admin_request(
+    api: &AdminApi,
+    slots: &Arc<AdminBodySlots>,
+    activity: &Arc<ConnectionActivity>,
+    peer: &str,
+    identity: caddy_rs_admin::ClientIdentity,
+    request: hyper::Request<Incoming>,
+) -> hyper::Response<Body> {
+    // A request in flight keeps the connection from being reaped as idle (60 s `IdleTimeout`).
+    let _in_flight = activity.begin();
+    let (parts, body) = request.into_parts();
+    let http1 = matches!(
+        parts.version,
+        http::Version::HTTP_10 | http::Version::HTTP_11
+    );
+    let refuse = |response: caddy_rs_admin::AdminResponse| {
+        let mut response = admin_hyper_response(response);
+        if http1 {
+            response.headers_mut().insert(
+                http::header::CONNECTION,
+                http::HeaderValue::from_static("close"),
+            );
+        }
+        response
+    };
+    let headers = match admin_request_headers(parts.headers, &parts.uri, parts.version) {
+        Ok(headers) => headers,
+        Err(rejection) => return refuse(rejection),
+    };
+    let path = parts
+        .uri
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    if let Err(rejection) = api.authorize(&parts.method, &path, &headers, &identity) {
+        return refuse(rejection);
+    }
+    let body = match read_admin_request_body(api, slots, peer, activity, &headers, body).await {
+        Ok(body) => body,
+        Err(rejection) => return refuse(rejection),
+    };
+    let response = api
+        .handle(AdminRequest {
+            method: parts.method,
+            path,
+            headers,
+            body,
+            client_identity: identity,
+        })
+        .await;
+    admin_hyper_response(response)
+}
+
 impl Clone for AdminService {
     fn clone(&self) -> Self {
         Self {
             api: self.api.clone(),
             body_slots: Arc::clone(&self.body_slots),
+            activity: Arc::clone(&self.activity),
+            peer: self.peer.clone(),
         }
     }
 }
@@ -3101,44 +3283,18 @@ impl hyper::service::Service<hyper::Request<Incoming>> for AdminService {
     >;
 
     fn call(&self, request: hyper::Request<Incoming>) -> Self::Future {
-        let api = self.api.clone();
-        let body_slots = Arc::clone(&self.body_slots);
+        let service = self.clone();
         Box::pin(async move {
-            let (parts, body) = request.into_parts();
-            let headers = match admin_request_headers(parts.headers, &parts.uri, parts.version) {
-                Ok(headers) => headers,
-                Err(rejection) => {
-                    return Ok::<_, std::convert::Infallible>(admin_hyper_response(rejection))
-                }
-            };
-            let body = match read_admin_request_body(&api, &body_slots, &headers, body).await {
-                Ok(body) => body,
-                Err(rejection) => {
-                    return Ok::<_, std::convert::Infallible>(admin_hyper_response(rejection))
-                }
-            };
-            let path = parts
-                .uri
-                .path_and_query()
-                .map(|value| value.as_str().to_string())
-                .unwrap_or_else(|| "/".to_string());
-            let response = api
-                .handle(AdminRequest {
-                    method: parts.method,
-                    path,
-                    headers,
-                    body,
-                    client_identity: caddy_rs_admin::ClientIdentity::NotPresented,
-                })
-                .await;
-            let mut builder = hyper::Response::builder().status(response.status);
-            for (name, value) in &response.headers {
-                builder = builder.header(name, value);
-            }
             Ok::<_, std::convert::Infallible>(
-                builder
-                    .body(Body::from_bytes(response.body))
-                    .expect("admin response is valid"),
+                serve_admin_request(
+                    &service.api,
+                    &service.body_slots,
+                    &service.activity,
+                    &service.peer,
+                    caddy_rs_admin::ClientIdentity::NotPresented,
+                    request,
+                )
+                .await,
             )
         })
     }
@@ -3449,7 +3605,7 @@ async fn bind_admin_unix(
         path: socket_path.to_path_buf(),
         identity,
     };
-    let body_slots = new_admin_body_slots();
+    let body_slots = AdminBodySlots::new();
     let task = tokio::spawn(async move {
         let _cleanup = cleanup;
         loop {
@@ -3472,6 +3628,9 @@ async fn bind_admin_unix(
                     let service = AdminService {
                         api: api.clone(),
                         body_slots: Arc::clone(&body_slots),
+                        activity: Arc::new(ConnectionActivity::default()),
+                        // Every client of the socket is the same local principal.
+                        peer: "unix".to_string(),
                     };
                     tokio::spawn(async move {
                         let _tracked = tracked;
@@ -3488,7 +3647,7 @@ async fn bind_admin_unix(
                         else {
                             return;
                         };
-                        let activity = Arc::new(ConnectionActivity::default());
+                        let activity = Arc::clone(&service.activity);
                         serve_connection(
                             stream,
                             service,
@@ -3544,7 +3703,7 @@ pub(crate) async fn bind_admin(
     let (force, mut force_receiver) = watch::channel(false);
     let tracker = Arc::new(ConnectionTracker::default());
     let loop_tracker = Arc::clone(&tracker);
-    let body_slots = new_admin_body_slots();
+    let body_slots = AdminBodySlots::new();
     let task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -3559,7 +3718,7 @@ pub(crate) async fn bind_admin(
                     }
                 }
                 accepted = listener.accept() => {
-                    let Ok((stream, _peer)) = accepted else { continue };
+                    let Ok((stream, peer_addr)) = accepted else { continue };
                     let api = api.clone();
                     let mut connection_shutdown = receiver.clone();
                     let mut connection_force = force_receiver.clone();
@@ -3567,6 +3726,8 @@ pub(crate) async fn bind_admin(
                     let service = AdminService {
                         api,
                         body_slots: Arc::clone(&body_slots),
+                        activity: Arc::new(ConnectionActivity::default()),
+                        peer: format!("addr:{}", peer_addr.ip()),
                     };
                     tokio::spawn(async move {
                         let _tracked = tracked;
@@ -3582,7 +3743,7 @@ pub(crate) async fn bind_admin(
                         else {
                             return;
                         };
-                        let activity = Arc::new(ConnectionActivity::default());
+                        let activity = Arc::clone(&service.activity);
                         serve_connection(
                             stream,
                             service,
@@ -3741,7 +3902,7 @@ pub(crate) async fn bind_admin_remote(
     let (force, mut force_receiver) = watch::channel(false);
     let tracker = Arc::new(ConnectionTracker::default());
     let loop_tracker = Arc::clone(&tracker);
-    let body_slots = new_admin_body_slots();
+    let body_slots = AdminBodySlots::new();
     let task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -3756,7 +3917,7 @@ pub(crate) async fn bind_admin_remote(
                     }
                 }
                 accepted = listener.accept() => {
-                    let Ok((stream, _peer)) = accepted else { continue };
+                    let Ok((stream, peer_addr)) = accepted else { continue };
                     let api = api.clone();
                     let acceptor = acceptor.clone();
                     let mut connection_shutdown = receiver.clone();
@@ -3791,62 +3952,38 @@ pub(crate) async fn bind_admin_remote(
                         let identity = remote_admin_client_identity(
                             tls.get_ref().1.peer_certificates(),
                         );
-                        let service = service_fn(move |request: hyper::Request<Incoming>| {
-                            let api = api.clone();
-                            let identity = identity.clone();
-                            let body_slots = Arc::clone(&body_slots);
-                            async move {
-                                let (parts, body) = request.into_parts();
-                                let headers = match admin_request_headers(parts.headers, &parts.uri, parts.version)
-                                {
-                                    Ok(headers) => headers,
-                                    Err(rejection) => {
-                                        return Ok::<_, std::convert::Infallible>(
-                                            admin_hyper_response(rejection),
-                                        )
-                                    }
-                                };
-                                let body = match read_admin_request_body(
-                                    &api,
-                                    &body_slots,
-                                    &headers,
-                                    body,
-                                )
-                                .await
-                                {
-                                    Ok(body) => body,
-                                    Err(rejection) => {
-                                        return Ok::<_, std::convert::Infallible>(
-                                            admin_hyper_response(rejection),
-                                        )
-                                    }
-                                };
-                                let path = parts
-                                    .uri
-                                    .path_and_query()
-                                    .map(|value| value.as_str().to_string())
-                                    .unwrap_or_else(|| "/".to_string());
-                                let response = api
-                                    .handle(AdminRequest {
-                                        method: parts.method,
-                                        path,
-                                        headers,
-                                        body,
-                                        client_identity: identity,
-                                    })
-                                    .await;
-                                let mut builder = hyper::Response::builder().status(response.status);
-                                for (name, value) in &response.headers {
-                                    builder = builder.header(name, value);
-                                }
-                                Ok::<_, std::convert::Infallible>(
-                                    builder
-                                        .body(Body::from_bytes(response.body))
-                                        .expect("admin response is valid"),
-                                )
+                        // Upload fairness is per certificate, not per address: every client behind
+                        // one proxy shares an address, but each certificate is one principal.
+                        let peer = match &identity {
+                            caddy_rs_admin::ClientIdentity::Verified(client) => {
+                                format!("cert:{}:{}", client.issuer, client.serial)
                             }
-                        });
+                            _ => format!("addr:{}", peer_addr.ip()),
+                        };
                         let activity = Arc::new(ConnectionActivity::default());
+                        let service = {
+                            let activity = Arc::clone(&activity);
+                            service_fn(move |request: hyper::Request<Incoming>| {
+                                let api = api.clone();
+                                let identity = identity.clone();
+                                let body_slots = Arc::clone(&body_slots);
+                                let activity = Arc::clone(&activity);
+                                let peer = peer.clone();
+                                async move {
+                                    Ok::<_, std::convert::Infallible>(
+                                        serve_admin_request(
+                                            &api,
+                                            &body_slots,
+                                            &activity,
+                                            &peer,
+                                            identity,
+                                            request,
+                                        )
+                                        .await,
+                                    )
+                                }
+                            })
+                        };
                         serve_connection(
                             tls,
                             service,
@@ -4294,6 +4431,47 @@ mod remote_admin_tests {
         )
         .await;
         assert_eq!(status, 200);
+        handle.stop().await;
+    }
+
+    /// A client whose role does not allow `POST /load` is refused before its body is read, so it
+    /// cannot pin upload slots with trickling bodies and starve authorised callers.
+    #[tokio::test]
+    async fn an_unauthorised_remote_request_is_refused_without_reading_its_body() {
+        if !openssl_available() {
+            eprintln!("skipping: the `openssl` CLI is not available to mint the test certificates");
+            return;
+        }
+        let certificates = test_certificates("unread-body");
+        let (_api, port, handle) = start_remote(&certificates).await;
+        let mut stream = connect(
+            &certificates,
+            Some((&certificates.client_pem, &certificates.client_key_pem)),
+            port,
+        )
+        .await
+        .expect("valid client certificate completes the handshake");
+        stream
+            .write_all(
+                b"POST /load HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+                  Content-Length: 1000\r\n\r\n{",
+            )
+            .await
+            .expect("write");
+        stream.flush().await.expect("flush");
+        let mut buffer = [0_u8; 512];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            stream.read(&mut buffer),
+        )
+        .await
+        .expect("a refusal must arrive without waiting for the body")
+        .expect("read");
+        assert!(
+            buffer[..read].starts_with(b"HTTP/1.1 403"),
+            "{:?}",
+            String::from_utf8_lossy(&buffer[..read])
+        );
         handle.stop().await;
     }
 
@@ -4821,39 +4999,66 @@ mod admin_limits_tests {
     #[tokio::test(start_paused = true)]
     async fn a_stalled_admin_body_times_out_with_408_and_frees_its_slot() {
         let api = api();
-        let slots = super::new_admin_body_slots();
+        let slots = super::AdminBodySlots::new();
         let mut headers = http::HeaderMap::new();
         headers.insert(http::header::CONTENT_LENGTH, "10".parse().unwrap());
-        let rejected = super::read_admin_request_body(&api, &slots, &headers, Stalled)
-            .await
-            .expect_err("a body that never arrives is rejected");
+        let activity = Arc::new(super::ConnectionActivity::default());
+        let rejected =
+            super::read_admin_request_body(&api, &slots, "peer", &activity, &headers, Stalled)
+                .await
+                .expect_err("a body that never arrives is rejected");
         assert_eq!(rejected.status, http::StatusCode::REQUEST_TIMEOUT);
         assert_eq!(
-            slots.available_permits(),
+            slots.available(),
             super::ADMIN_MAX_CONCURRENT_BODIES,
             "the slot is released"
         );
+        assert!(!activity.reading_body(), "the body-read marker is cleared");
     }
 
-    #[tokio::test]
-    async fn admin_requests_beyond_the_in_flight_body_budget_get_503() {
-        let (handle, address) = listener().await;
-        // Fill every body slot with a request that announced a body and then stalls.
-        let mut holders = Vec::new();
-        for _ in 0..super::ADMIN_MAX_CONCURRENT_BODIES {
-            let mut stream = TcpStream::connect(address).await.expect("connect");
-            stream
-                .write_all(
-                    b"POST /load HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
-                      Content-Length: 1000\r\n\r\n{",
-                )
-                .await
-                .expect("write partial request");
-            holders.push(stream);
-        }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let mut extra = TcpStream::connect(address).await.expect("connect");
-        extra
+    #[test]
+    fn slots_are_capped_per_peer_and_in_total_and_released_on_drop() {
+        let slots = super::AdminBodySlots::new();
+        let a1 = slots.try_acquire("a").expect("first");
+        let _a2 = slots.try_acquire("a").expect("second");
+        assert!(slots.try_acquire("a").is_none(), "per-peer cap");
+        let _b1 = slots.try_acquire("b").expect("other peer");
+        let _b2 = slots.try_acquire("b").expect("other peer, second");
+        assert!(slots.try_acquire("c").is_none(), "global cap");
+        assert!(slots.try_acquire("a").is_none());
+        drop(a1);
+        let _c = slots.try_acquire("c").expect("a release frees a global slot");
+        assert_eq!(slots.available(), 0);
+    }
+
+    /// Connect from the loopback address `source` (127.0.0.x are all local on Linux), so tests can
+    /// act as different peers.
+    async fn connect_from(source: &str, address: SocketAddr) -> TcpStream {
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket
+            .bind(format!("{source}:0").parse().unwrap())
+            .expect("bind source");
+        socket.connect(address).await.expect("connect")
+    }
+
+    /// Start a request from `source` that announces a 1000-byte body and sends one byte, then
+    /// stalls: it holds one upload slot until the stream is dropped.
+    async fn hold_slot(source: &str, address: SocketAddr) -> TcpStream {
+        let mut stream = connect_from(source, address).await;
+        stream
+            .write_all(
+                b"POST /load HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+                  Content-Length: 1000\r\n\r\n{",
+            )
+            .await
+            .expect("write partial request");
+        stream
+    }
+
+    /// Status of a small `POST /load` from `source`.
+    async fn probe_status(source: &str, address: SocketAddr) -> u16 {
+        let mut stream = connect_from(source, address).await;
+        stream
             .write_all(
                 b"POST /load HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
                   Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
@@ -4862,13 +5067,134 @@ mod admin_limits_tests {
             .expect("write request");
         let mut response = Vec::new();
         let _ =
-            tokio::time::timeout(Duration::from_secs(3), extra.read_to_end(&mut response)).await;
-        let response = String::from_utf8_lossy(&response);
+            tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut response)).await;
+        String::from_utf8_lossy(&response)
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Poll (bounded) until a probe from `source` is refused with 503: the holders register their
+    /// slots asynchronously, so there is no fixed sleep that is both short and safe.
+    async fn eventually_503(source: &str, address: SocketAddr) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if probe_status(source, address).await == 503 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn one_peer_cannot_take_more_than_its_share_of_the_upload_slots() {
+        let (handle, address) = listener().await;
+        // 2 = ADMIN_MAX_BODIES_PER_PEER: two stalled uploads from 127.0.0.1 ...
+        let _holders = [
+            hold_slot("127.0.0.1", address).await,
+            hold_slot("127.0.0.1", address).await,
+        ];
         assert!(
-            response.starts_with("HTTP/1.1 503"),
-            "a request past the in-flight body budget must be refused: {response}"
+            eventually_503("127.0.0.1", address).await,
+            "a third upload from the same peer must be refused"
         );
-        drop(holders);
+        // ... leave the other peers' share alone.
+        assert_ne!(
+            probe_status("127.0.0.2", address).await,
+            503,
+            "another peer is not starved by the first"
+        );
+        handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn the_global_upload_budget_still_applies_across_peers() {
+        let (handle, address) = listener().await;
+        let _holders = [
+            hold_slot("127.0.0.1", address).await,
+            hold_slot("127.0.0.1", address).await,
+            hold_slot("127.0.0.2", address).await,
+            hold_slot("127.0.0.2", address).await,
+        ];
+        assert!(
+            eventually_503("127.0.0.3", address).await,
+            "with every slot busy a new peer is refused too"
+        );
+        handle.stop().await;
+    }
+
+    /// HTTP/2 streams without a `content-length` used to take no slot at all (only the headers
+    /// were inspected), so 250 streams per connection x many connections each held up to 64 MiB.
+    #[tokio::test]
+    async fn http2_streams_without_content_length_take_upload_slots() {
+        let (handle, address) = listener().await;
+        let tcp = TcpStream::connect(address).await.expect("connect");
+        let (mut sender, connection) = h2::client::handshake(tcp).await.expect("h2 handshake");
+        tokio::spawn(connection);
+        let request = || {
+            http::Request::builder()
+                .method("POST")
+                .uri("http://localhost/load")
+                .body(())
+                .unwrap()
+        };
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            sender = sender.ready().await.expect("ready");
+            let (response, stream) = sender.send_request(request(), false).expect("send");
+            held.push((response, stream)); // open, never finished
+        }
+        let mut refused = false;
+        for _ in 0..80 {
+            sender = sender.ready().await.expect("ready");
+            let (response, mut body) = sender.send_request(request(), false).expect("send");
+            body.send_data(bytes::Bytes::from_static(b"{}"), true)
+                .expect("body");
+            if let Ok(Ok(response)) =
+                tokio::time::timeout(Duration::from_secs(2), response).await
+            {
+                if response.status() == 503 {
+                    refused = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            refused,
+            "a third body-carrying HTTP/2 stream from the same peer must be refused"
+        );
+        handle.stop().await;
+    }
+
+    /// Go's `ReadTimeout` covers one request; between requests only `IdleTimeout` (60 s) applies.
+    /// The per-read timer used to run during the idle wait too, closing a keep-alive connection
+    /// after 10 s.
+    #[tokio::test]
+    async fn an_idle_keep_alive_connection_survives_past_the_read_timeout() {
+        let (handle, address) = listener().await;
+        let mut stream = TcpStream::connect(address).await.expect("connect");
+        let request = b"GET /config/ HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        stream.write_all(request).await.unwrap();
+        let mut buffer = [0_u8; 4096];
+        let read = stream.read(&mut buffer).await.expect("first response");
+        assert!(buffer[..read].starts_with(b"HTTP/1.1 200"));
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        stream
+            .write_all(request)
+            .await
+            .expect("the idle connection is still open after 12 s");
+        let read = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buffer))
+            .await
+            .expect("second response arrives")
+            .expect("read");
+        assert!(
+            buffer[..read].starts_with(b"HTTP/1.1 200"),
+            "second request on the idle connection: {:?}",
+            String::from_utf8_lossy(&buffer[..read])
+        );
         handle.stop().await;
     }
 }
@@ -4987,6 +5313,42 @@ mod admin_host_check_tests {
             200,
             "and an own absolute-form target is served whatever the header says"
         );
+        handle.stop().await;
+    }
+
+    /// A refused request must be refused *before* its body is read: no slot, no memory, and the
+    /// 403 arrives although the announced body never does. The body used to be read first, so a
+    /// rebinding page's foreign-Host `POST` pinned a slot (and up to 64 MiB) before its 403.
+    #[tokio::test]
+    async fn a_refused_request_is_answered_without_reading_its_body() {
+        let (handle, address) = listener().await;
+        let foreign = format!("Host: evil.example:{}", address.port());
+        let request = format!(
+            "POST /load HTTP/1.1\r\n{foreign}\r\nContent-Type: application/json\r\n\
+             Content-Length: 1000\r\n\r\n{{"
+        );
+        let started = std::time::Instant::now();
+        let mut stream = TcpStream::connect(address).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut buffer = [0_u8; 512];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut buffer))
+            .await
+            .expect("a 403 must arrive without waiting for the body")
+            .expect("read");
+        assert!(
+            buffer[..read].starts_with(b"HTTP/1.1 403"),
+            "{:?}",
+            String::from_utf8_lossy(&buffer[..read])
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // Nothing is left holding a slot: the connection is closed after the refusal.
+        let mut rest = Vec::new();
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_to_end(&mut rest),
+        )
+        .await;
+        assert!(closed.is_ok(), "the connection is closed after refusing an unread body");
         handle.stop().await;
     }
 
