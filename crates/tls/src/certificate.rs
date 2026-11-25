@@ -14,7 +14,7 @@ use crate::Error;
 use rustls::SignatureScheme;
 
 /// A certificate and its private key, in DER form.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Certificate {
     /// Domains this certificate is valid for (first entry is the subject name).
     pub domains: Vec<String>,
@@ -28,6 +28,21 @@ pub struct Certificate {
     pub not_after: SystemTime,
     /// Issuer summary (ACME CA URL, internal CA name, or `"loaded"`).
     pub issuer: String,
+}
+
+/// Manual `Debug` that redacts `private_key_der` (SEC-MEDIUM D4).
+impl std::fmt::Debug for Certificate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Certificate")
+            .field("domains", &self.domains)
+            .field("cert_chain_der", &self.cert_chain_der)
+            .field("private_key_der", &format_args!("<redacted>"))
+            .field("not_before", &self.not_before)
+            .field("not_after", &self.not_after)
+            .field("issuer", &self.issuer)
+            .finish()
+    }
 }
 
 impl Certificate {
@@ -399,6 +414,31 @@ impl CertificateKeySource {
         match self {
             Self::ProcessHeld => "process-held key".to_string(),
             Self::Token(key) => key.key.describe(),
+        }
+    }
+}
+
+/// SEC-MEDIUM D4 residual: `{:?}` must never print private key material.
+#[cfg(test)]
+mod debug_redaction {
+    use super::*;
+
+    #[test]
+    fn certificate_debug_never_prints_the_private_key() {
+        let certificate = Certificate {
+            domains: vec!["example.test".to_string()],
+            cert_chain_der: vec![vec![1, 2, 3]],
+            private_key_der: vec![251, 252, 253, 254],
+            not_before: SystemTime::UNIX_EPOCH,
+            not_after: SystemTime::UNIX_EPOCH,
+            issuer: "loaded".to_string(),
+        };
+        for text in [format!("{certificate:?}"), format!("{certificate:#?}")] {
+            for secret in ["251", "252", "253", "254"] {
+                assert!(!text.contains(secret), "{text}");
+            }
+            assert!(text.contains("example.test"), "{text}");
+            assert!(text.contains("<redacted>"), "{text}");
         }
     }
 }

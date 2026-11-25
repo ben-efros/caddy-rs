@@ -775,6 +775,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]

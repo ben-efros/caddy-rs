@@ -88,10 +88,14 @@ fn config_with_options(
 /// Client-auth server configuration: `mode` against the fixture client CA, mirroring
 /// `http_client_auth.rs` so the h3 assertions can be compared with the h1/h2 path.
 fn mtls_config(tcp_port: u16, udp_port: u16, mode: &str, routes: serde_json::Value) -> Config {
-    let client_authentication = serde_json::json!({
+    let mut client_authentication = serde_json::json!({
         "mode": mode,
         "ca": {"provider": "inline", "trusted_ca_certs": [client_ca_base64()]}
     });
+    if matches!(mode, "request" | "require") {
+        // Unverified modes need an explicit acknowledgement outside `stock_compat` (SEC-MEDIUM D2).
+        client_authentication["insecure_accept_any_client_cert"] = serde_json::json!(true);
+    }
     config_with_options(
         tcp_port,
         Some(udp_port),

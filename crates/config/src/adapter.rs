@@ -3335,6 +3335,7 @@ fn parse_client_auth_option(
     let mut trusted_leaf: Vec<String> = Vec::new();
     let mut ca_pool: Option<Value> = None;
     let mut saw_legacy_ca = false;
+    let mut accept_any_client_cert = false;
     for sub in &option.block {
         match sub.name.as_str() {
             "mode" => {
@@ -3511,6 +3512,18 @@ fn parse_client_auth_option(
                      (tracked as TLS-CLIENT-AUTH)",
                 ))
             }
+            // caddy-rs extension (SEC-MEDIUM D2): emits the JSON `insecure_accept_any_client_cert`
+            // acknowledgement. The runtime rejects it under `stock_compat true` (stock Caddy has
+            // no such field), so no adapt-time flag plumbing is needed here.
+            "insecure_accept_any_client_cert" => {
+                if !sub.args.is_empty() || !sub.block.is_empty() {
+                    return Err(adapter_error(
+                        sub.position.clone(),
+                        "`insecure_accept_any_client_cert` takes no arguments",
+                    ));
+                }
+                accept_any_client_cert = true;
+            }
             other => {
                 return Err(adapter_error(
                     sub.position.clone(),
@@ -3520,6 +3533,9 @@ fn parse_client_auth_option(
         }
     }
     let mut object = Map::new();
+    if accept_any_client_cert {
+        object.insert("insecure_accept_any_client_cert".to_string(), json!(true));
+    }
     if let Some(pool) = ca_pool {
         object.insert("ca".to_string(), pool);
     } else if saw_legacy_ca {

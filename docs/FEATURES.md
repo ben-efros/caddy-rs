@@ -441,6 +441,17 @@ Trust anchors come from the `ca` module — `tls.ca_pool.source.inline`, `.file`
 `trusted_ca_certs`, `trusted_ca_certs_pem_files` and `trusted_leaf_certs` fields. When a trust
 pool or leaf list is configured and no mode is given, the mode is `require_and_verify`.
 
+`request` and `require` ask for a client certificate but do **not** validate it (stock Caddy
+semantics; a configured CA pool is not consulted in these modes). Only `verify_if_given` and
+`require_and_verify` build a chain to the trust pool, so use `require_and_verify` for mutual TLS.
+Because operators routinely read `require` as mTLS, a `request`/`require` policy that pins no exact
+leaf (`trusted_leaf_certs`/`trusted_leaf_cert_file`/`verifiers`) is a **located load error** unless
+`client_authentication.insecure_accept_any_client_cert: true` (Caddyfile `client_auth` subdirective
+`insecure_accept_any_client_cert`) states the intent; a WARN log is emitted when such a listener is
+built. This is a caddy-rs extension (DIV register text in
+[`SEC-MEDIUM-TLS.md`](compatibility/SEC-MEDIUM-TLS.md)): with `stock_compat true` the policy loads
+exactly as in stock Caddy v2.11.9 without acknowledgement, and the extension field is rejected there.
+
 Caddy's implicit default `local` PKI authority is provisioned on demand (Caddy's
 `ProvisionDefaultCA`/`GetCA`): a `pki_root`/`pki_intermediate` source naming `local` without an
 `apps.pki.certificate_authorities.local` entry generates `<data-dir>/pki/authorities/local` on

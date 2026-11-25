@@ -1622,7 +1622,7 @@ pub async fn fetch_renewal_info<T: AcmeTransport + ?Sized>(
 /// Both certmagic's `key_id`/`mac_key` member names and the `kid`/`hmac_key` spelling used by some
 /// ACME tooling are accepted when reading configuration; the certmagic spelling is emitted when
 /// serialising.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalAccount {
     /// CA-assigned key identifier (`key_id` in Caddy JSON, `kid` in the EAB JWS header).
     #[serde(rename = "key_id", alias = "kid")]
@@ -1630,6 +1630,17 @@ pub struct ExternalAccount {
     /// Base64url-encoded HMAC key (`mac_key` in Caddy JSON).
     #[serde(rename = "mac_key", alias = "hmac_key")]
     pub hmac_key: String,
+}
+
+/// Manual `Debug` that redacts the EAB HMAC key (SEC-MEDIUM D4).
+impl std::fmt::Debug for ExternalAccount {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExternalAccount")
+            .field("kid", &self.kid)
+            .field("hmac_key", &format_args!("<redacted>"))
+            .finish()
+    }
 }
 
 impl ExternalAccount {
@@ -2109,9 +2120,24 @@ impl<T: AcmeStorage + ?Sized> AcmeStorage for Arc<T> {
 }
 
 /// In-memory [`AcmeStorage`], used by tests and ephemeral deployments.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MemoryAcmeStorage {
     values: RwLock<BTreeMap<String, Vec<u8>>>,
+}
+
+/// Manual `Debug`: lists the stored keys but never the values (account keys live here).
+impl std::fmt::Debug for MemoryAcmeStorage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let values = self
+            .values
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        formatter
+            .debug_struct("MemoryAcmeStorage")
+            .field("keys", &values.keys().collect::<Vec<_>>())
+            .field("values", &format_args!("<redacted>"))
+            .finish()
+    }
 }
 
 impl MemoryAcmeStorage {
@@ -3441,3 +3467,35 @@ EVdZ8IcAQzAPk1jBxj0YDC0rR5d09Q==
 }
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// SEC-MEDIUM D4 residual: `{:?}` of secret-holding ACME types.
+#[cfg(test)]
+mod debug_redaction {
+    use super::*;
+
+    #[test]
+    fn external_account_debug_hides_the_hmac_key() {
+        let account = ExternalAccount {
+            kid: "kid-123".to_string(),
+            hmac_key: "SUPER-SECRET-HMAC".to_string(),
+        };
+        for text in [format!("{account:?}"), format!("{account:#?}")] {
+            assert!(!text.contains("SUPER-SECRET-HMAC"), "{text}");
+            assert!(text.contains("kid-123"), "{text}");
+        }
+    }
+
+    #[test]
+    fn memory_storage_debug_lists_keys_but_not_values() {
+        let storage = MemoryAcmeStorage::new();
+        storage
+            .values
+            .write()
+            .unwrap()
+            .insert("acme/account.key".to_string(), vec![251, 252, 253]);
+        for text in [format!("{storage:?}"), format!("{storage:#?}")] {
+            assert!(!text.contains("251"), "{text}");
+            assert!(text.contains("acme/account.key"), "{text}");
+        }
+    }
+}
