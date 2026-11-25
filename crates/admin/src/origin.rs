@@ -11,7 +11,7 @@
 //! - A request with `Origin: null` is rejected with `400` (buggy browser mitigation).
 //! - A request with `Sec-Fetch-Mode: no-cors` or a WebSocket upgrade is rejected with `400`.
 //! - The `Host` header is checked against the allowed-origin hosts (DNS-rebinding mitigation)
-//!   whenever the admin listener is a non-wildcard TCP listener, matching Caddy's `enforceHost`.
+//!   on every request, with or without `Origin`/`Sec-Fetch-Mode`, whenever the admin listener is a non-wildcard TCP listener, matching Caddy's `enforceHost`.
 //! - A disallowed or missing origin is rejected with `403` and Caddy's message text.
 //! - `admin.origins` entries are compared by scheme (only when the configured entry has one) and
 //!   case-insensitively by host, ignoring path/query/fragment.
@@ -30,11 +30,9 @@
 //! - Caddy distinguishes `origins: null` (derive from the listen address) from `origins: []`
 //!   (allow none). The shared `AdminConfig` uses `Option<Vec<String>>` so `Some([])` (explicitly
 //!   empty) blocks all origins while `None` (absent) derives the defaults from the listen address.
-//! - The DNS-rebinding `Host` check runs only when the cross-site mitigation is active
-//!   (`enforce_origin` on, or an `Origin`/`Sec-Fetch-Mode` header present). Caddy applies it to
-//!   every request on non-wildcard local listeners; caddy-rs keeps direct non-browser clients
-//!   (and test harnesses sending synthetic `Host` headers) working, while every browser-originated
-//!   request is still Host-checked.
+//! - The DNS-rebinding `Host` check runs on every request on non-wildcard local listeners, as in
+//!   Caddy (SEC-MEDIUM-ADMIN-SERVER A1; earlier revisions skipped it for requests without
+//!   `Origin`/`Sec-Fetch-Mode`, which let a rebound page read the config).
 //! - `url.Parse` is approximated with a small scheme/authority parser; percent-encoded hosts and
 //!   userinfo are not supported.
 //! - The policy is re-evaluated from the active generation on every request. A real listener is
@@ -182,15 +180,16 @@ impl OriginPolicy {
         let has_origin_header = headers.contains_key(http::header::ORIGIN);
         let has_sec_fetch_header = headers.contains_key("sec-fetch-mode");
 
+        // Caddy's `ServeHTTP` runs `checkHost` for every request on an enforcing listener, before
+        // and independently of the cross-site mitigation. A DNS-rebinding page sends same-origin
+        // requests with neither `Origin` nor `Sec-Fetch-Mode` (plain http), so it must not be
+        // exempt (SEC-MEDIUM-ADMIN-SERVER A1).
+        self.check_host(headers)?;
+
         if !self.enforce_origin && !has_origin_header && !has_sec_fetch_header {
-            // A plain non-browser request (no Origin/Sec-Fetch and no enforcement) is not a
-            // cross-site context; Caddy still applies its Host check here, but caddy-rs keeps
-            // non-browser clients working (documented divergence) while still enforcing Host for
-            // every browser-originated request.
+            // Not a cross-site context and no origin enforcement: allowed once the Host passed.
             return Ok(None);
         }
-
-        self.check_host(headers)?;
 
         // Mirror Caddy's getOrigin: fall back to Referer when Origin is absent.
         let raw = if origin_header.is_empty() {
@@ -672,5 +671,35 @@ mod tests {
             HeaderValue::from_static("plain.example:8443"),
         );
         assert!(policy.check(&headers).is_ok());
+    }
+
+    #[test]
+    fn host_check_applies_without_origin_or_sec_fetch_headers() {
+        // DNS rebinding: a page on evil.example rebound to 127.0.0.1 issues same-origin requests
+        // that carry neither Origin nor Sec-Fetch-Mode. Caddy still applies checkHost.
+        let policy = OriginPolicy::from_admin(Some(&admin(false, &[])));
+        assert!(policy.enforce_host);
+        let mut rebinding = HeaderMap::new();
+        rebinding.insert(http::header::HOST, HeaderValue::from_static("evil.example:2019"));
+        let violation = policy.check(&rebinding).expect_err("rebinding Host must be rejected");
+        assert_eq!(violation.status, StatusCode::FORBIDDEN);
+        assert_eq!(violation.message, "host not allowed: evil.example:2019");
+        rebinding.insert(http::header::HOST, HeaderValue::from_static("evil.example"));
+        assert!(policy.check(&rebinding).is_err(), "port-less foreign Host");
+        // Legitimate non-browser clients keep working: allowed Host (with or without port),
+        // and synthetic requests with no Host header at all.
+        for host in ["localhost:2019", "127.0.0.1:2019", "[::1]:2019", "LOCALHOST:2019", "localhost"] {
+            let mut ok = HeaderMap::new();
+            ok.insert(http::header::HOST, HeaderValue::from_str(host).unwrap());
+            assert_eq!(policy.check(&ok).unwrap(), None, "{host}");
+        }
+        assert_eq!(policy.check(&HeaderMap::new()).unwrap(), None);
+        // Listener kinds without host enforcement still accept any Host.
+        for listen in ["unix//tmp/admin.sock", "0.0.0.0:2019"] {
+            let mut cfg = admin(false, &[]);
+            cfg.listen = Some(listen.to_string());
+            let policy = OriginPolicy::from_admin(Some(&cfg));
+            assert_eq!(policy.check(&rebinding).unwrap(), None, "{listen}");
+        }
     }
 }
