@@ -1430,6 +1430,21 @@ fn servers_trusted_proxies_options_match_real_caddy_v2_11_9() {
 }
 
 #[test]
+fn dial_allow_adapts_to_the_handler_field_and_accumulates() {
+    // caddy-rs extension (SEC-MEDIUM-PROXY C3): Caddyfile users can open request-derived dial
+    // targets without `stock_compat`.
+    let adapted = adapt(
+        ":8080 {\n\treverse_proxy {http.request.header.X-Backend} {\n\t\tdial_allow 127.0.0.0/8 10.0.0.1\n\t\tdial_allow unix//run/app\n\t}\n}\n",
+    )
+    .expect("adapt dial_allow");
+    assert_eq!(
+        adapted.config["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0]["dial_allow"],
+        json!(["127.0.0.0/8", "10.0.0.1", "unix//run/app"])
+    );
+    assert!(adapt(":8080 {\n\treverse_proxy a:1 {\n\t\tdial_allow\n\t}\n}\n").is_err());
+}
+
+#[test]
 fn flush_interval_adapts_like_caddy() {
     // Golden from `caddy adapt` v2.11.9: the integer form is nanoseconds (-1 = flush immediately),
     // and a duration string becomes nanoseconds too.

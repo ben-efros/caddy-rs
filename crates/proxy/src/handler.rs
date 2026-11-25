@@ -971,7 +971,14 @@ impl ReverseProxyHandler {
         if let Some(fastcgi) = &self.transport.fastcgi {
             let started = std::time::Instant::now();
             let response = fastcgi
-                .forward(upstream, request, method, &path_and_query, body)
+                .forward(
+                    upstream,
+                    request,
+                    method,
+                    &path_and_query,
+                    body,
+                    self.fastcgi_dial_guard(upstream),
+                )
                 .await?;
             let latency = started.elapsed();
             return Ok(Forwarded::Streaming(ForwardedStreamingResponse {
@@ -1332,9 +1339,19 @@ impl ReverseProxyHandler {
             },
         )?);
         // SEC-MEDIUM-PROXY C3: a request-derived Unix-socket target must be explicitly allowed.
-        // (TCP targets are checked against the resolved addresses at connect time.)
+        // (TCP targets are checked against the resolved addresses at connect time.) Only dials
+        // that can carry request data are guarded: a literal host, `{env.*}`, or a dynamic source
+        // whose name/port templates are operator-controlled keeps working against loopback.
+        let guarded = self.dial_guard_enabled
+            && if upstream.is_dynamic() {
+                crate::dial_guard::template_is_request_derived(&upstream.dial)
+            } else {
+                self.dynamic
+                    .as_ref()
+                    .is_some_and(|source| source.request_derived())
+            };
         #[cfg(unix)]
-        if self.dial_guard_enabled {
+        if guarded {
             if let Some(crate::upstream::Transport::Unix { path }) = resolved.transport() {
                 self.dial_allow.check_unix(path).map_err(|message| {
                     ProxyError::Request(format!(
@@ -1344,8 +1361,25 @@ impl ReverseProxyHandler {
                 })?;
             }
         }
-        let clients = self.dynamic_clients_for(&resolved, &expanded)?;
+        let clients = self.dynamic_clients_for(&resolved, &expanded, guarded)?;
         Ok((resolved, clients.main.clone(), clients.upgrade.clone()))
+    }
+
+    /// The egress guard to apply when dialing `target` outside the HTTP client path (FastCGI).
+    ///
+    /// `None` for fixed upstreams and for hosts that do not come from a request-derived source;
+    /// the same classification as [`Self::resolve_target`]. (Placeholder dials are rejected with
+    /// FastCGI at load, so a non-fixed target here is a discovered host.)
+    fn fastcgi_dial_guard(&self, target: &Arc<Upstream>) -> Option<&DialGuard> {
+        let fixed = self
+            .upstreams
+            .iter()
+            .any(|candidate| Arc::ptr_eq(candidate, target));
+        let request_derived = self
+            .dynamic
+            .as_ref()
+            .is_none_or(|source| source.request_derived());
+        (!fixed && self.dial_guard_enabled && request_derived).then_some(&self.dial_allow)
     }
 
     /// Build (or reuse) the per-address clients for a dynamic upstream.
@@ -1353,12 +1387,19 @@ impl ReverseProxyHandler {
         &self,
         resolved: &Arc<Upstream>,
         expanded: &str,
+        guarded: bool,
     ) -> Result<Arc<DynamicClients>, ProxyError> {
+        // Guarded and unguarded clients for the same text must not share a cache entry.
+        let cache_key = if guarded {
+            expanded.to_string()
+        } else {
+            format!("unguarded|{expanded}")
+        };
         if let Some(clients) = self
             .dynamic_clients
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(expanded)
+            .get(&cache_key)
         {
             return Ok(clients);
         }
@@ -1376,7 +1417,7 @@ impl ReverseProxyHandler {
         // Clients for request-derived dials refuse restricted resolved addresses at connect time
         // (SEC-MEDIUM-PROXY C3); fixed upstreams keep the unguarded tuning.
         let mut tuning = self.transport.tuning.clone();
-        if self.dial_guard_enabled {
+        if guarded {
             tuning.dial_guard = Some(Arc::new(self.dial_allow.clone()));
         }
         let build = |http1_only: bool| {
@@ -1406,7 +1447,7 @@ impl ReverseProxyHandler {
         self.dynamic_clients
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(expanded.to_string(), Arc::clone(&clients));
+            .insert(cache_key, Arc::clone(&clients));
         Ok(clients)
     }
 
@@ -4264,6 +4305,137 @@ mod tests {
         // `stock_compat true` (guard off) is stock Caddy: anything the expansion yields is dialed.
         let stock = ssrf_handler(serde_json::json!({}), false);
         assert_eq!(status_for(&stock, &echo).await, StatusCode::OK);
+    }
+
+    /// A `dynamic_upstreams` source stand-in that returns one fixed host.
+    #[derive(Debug)]
+    struct TestSource {
+        dial: String,
+        request_derived: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::dynamic_upstreams::DynamicUpstreamSource for TestSource {
+        async fn get_upstreams(
+            &self,
+            _request: &caddy_rs_http::Request,
+        ) -> Result<Vec<String>, String> {
+            Ok(vec![self.dial.clone()])
+        }
+        fn reset_cache(&self, _request: &caddy_rs_http::Request) {}
+        fn describe(&self) -> String {
+            "test source".to_string()
+        }
+        fn request_derived(&self) -> bool {
+            self.request_derived
+        }
+    }
+
+    fn connections(counter: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Discovery hosts are guarded only when the source's name/port templates are request-derived
+    /// (SEC-MEDIUM-PROXY C3 review): `dynamic_upstreams { name localhost }` or Consul answering
+    /// 127.0.0.1 must keep working with the guard on.
+    #[tokio::test]
+    async fn dynamic_source_hosts_are_guarded_only_when_request_derived() {
+        for (request_derived, guard, expect_connections) in [
+            (false, true, 1),
+            (true, true, 0),
+            (true, false, 1),
+            (false, false, 1),
+        ] {
+            let (broken, counter) = spawn_broken_upstream().await;
+            let handler = build_handler(serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": []
+            }))
+            .with_dynamic_source(Arc::new(TestSource {
+                dial: broken,
+                request_derived,
+            }))
+            .with_dial_guard(guard);
+            let _ = handler
+                .handle(get_request("/dyn", Some("203.0.113.7:5555")))
+                .await;
+            assert_eq!(
+                connections(&counter),
+                expect_connections,
+                "request_derived={request_derived} guard={guard}"
+            );
+        }
+    }
+
+    /// The same classification for placeholder dials: `{env.*}` and literals are operator
+    /// controlled and keep working against loopback; request data is guarded.
+    #[tokio::test]
+    async fn placeholder_dials_are_guarded_only_when_request_derived() {
+        let (broken, counter) = spawn_broken_upstream().await;
+        let port = broken.rsplit_once(':').unwrap().1.to_string();
+        std::env::set_var("CADDY_RS_C3_BACKEND", &broken);
+        std::env::set_var("CADDY_RS_C3_PORT", &port);
+        for (dial, request_derived) in [
+            ("{env.CADDY_RS_C3_BACKEND}", false),
+            ("127.0.0.1:{env.CADDY_RS_C3_PORT}", false),
+            ("{http.request.header.X-Backend}", true),
+            ("127.0.0.1:{http.request.header.X-Port}", true),
+            (
+                "{env.CADDY_RS_C3_BACKEND}{http.request.header.X-Empty}",
+                true,
+            ),
+        ] {
+            let before = connections(&counter);
+            let handler = build_handler(serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": dial}]
+            }))
+            .with_dial_guard(true);
+            let mut request = get_request("/p", Some("203.0.113.7:5555"));
+            request.headers.insert("x-backend", broken.parse().unwrap());
+            request.headers.insert("x-port", port.parse().unwrap());
+            let _ = handler.handle(request).await;
+            let reached = connections(&counter) - before;
+            assert_eq!(
+                reached,
+                usize::from(!request_derived),
+                "`{dial}` request_derived={request_derived}"
+            );
+        }
+    }
+
+    /// FastCGI with `dynamic_upstreams` used to dial through a bare `TcpStream::connect`, skipping
+    /// the guard (SEC-MEDIUM-PROXY C3 review).
+    #[tokio::test]
+    async fn fastcgi_dynamic_hosts_go_through_the_dial_guard() {
+        for (request_derived, guard, expect_connections) in
+            [(true, true, 0), (true, false, 1), (false, true, 1)]
+        {
+            let (broken, counter) = spawn_broken_upstream().await;
+            let handler = build_handler(serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [],
+                "transport": {"protocol": "fastcgi"}
+            }))
+            .with_dynamic_source(Arc::new(TestSource {
+                dial: broken,
+                request_derived,
+            }))
+            .with_dial_guard(guard);
+            let Outcome::Respond(response) = handler
+                .handle(get_request("/index.php", Some("203.0.113.7:5555")))
+                .await
+                .unwrap()
+            else {
+                panic!("expected a response");
+            };
+            assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                connections(&counter),
+                expect_connections,
+                "request_derived={request_derived} guard={guard}"
+            );
+        }
     }
 
     /// The refusal must not echo the attacker-chosen target (or the configured template) back.

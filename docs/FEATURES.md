@@ -250,10 +250,17 @@ requests may run against that upstream at once.
 A dial that contains placeholders (`{http.request.header.X-Backend}:80`) is chosen partly by the
 client, and `dynamic_upstreams` names may be request-derived too. By default such connections are refused when the resolved address is loopback, unspecified, link-local (including
 `169.254.169.254`), multicast, broadcast, `100.64.0.0/10`, `192.0.0.192` or `fd00:ec2::/32`, and
-`unix/` targets are refused. The handler field `dial_allow` is the placeholder-free allow list:
+`unix/` targets are refused (NAT64 `64:ff9b::/96` and 6to4 `2002::/16` forms are judged by the
+embedded IPv4 address). Only dials that can carry request data are guarded: literals, `{env.*}`,
+`{system.*}`, `{time.*}` and dynamic sources with such names are not, and every other placeholder
+(including `{vars.*}`) is. **RFC 1918 and ULA ranges stay reachable**, so a client who controls the
+whole dial can still reach `10.x`, `172.16/12` (for example a Docker API on `172.17.0.1`) or the
+host's LAN address: do not put request data in a dial that must not be client-influenced. The same
+guard covers FastCGI dials of discovered hosts. `dial_allow` (a handler field, or the Caddyfile
+`reverse_proxy { dial_allow <ip|cidr|unix//path>... }` subdirective) is the allow list:
 IP addresses or CIDR ranges that may be dialled despite the rule (`["127.0.0.0/8"]`) and
-`unix/<absolute path>` prefixes (`["unix//run/app"]`). `dial_allow` is JSON-only (no Caddyfile
-syntax) and a malformed entry fails at load with the JSON path. `stock_compat true` disables the
+`unix/<absolute path>` prefixes (`["unix//run/app"]`). A malformed entry fails at load with the
+JSON path. `stock_compat true` disables the
 guard (stock Caddy dials whatever the expansion yields). The per-expansion client cache is capped
 at 1024 entries (least recently used evicted). See
 [SEC-MEDIUM-PROXY](compatibility/SEC-MEDIUM-PROXY.md).

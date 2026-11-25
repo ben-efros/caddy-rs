@@ -128,9 +128,42 @@ were never evicted, so a client choosing the expansion could grow memory without
   Directly constructed handlers (tests/embedders) also default to the guard off, like the security
   profile; the router factories pass `!stock_compat`.
 
-Known limits: a DNS name can change between the guard's resolution and the dial only inside the one
-`dial_tcp` call (the same resolved list is dialled), so there is no rebind window; NAT64/6to4 spellings
-of restricted IPv4 addresses are not recognised; `dial_allow` has no host-name entries.
+- **Only request-derived dials are guarded (review fix).** `template_is_request_derived` classifies
+  the `dial` template (and, for `dynamic_upstreams`, the `name`/`service`/`proto`/`port` templates of
+  each source; `multi` is guarded if any member is). A template is operator-controlled, and so
+  unguarded, only if it is a literal or every placeholder is in `env.*`, `system.*`, `time.*` or
+  `$VAR`; any other placeholder (`http.request.*`, `http.vars.*`, `vars.*`, `http.regexp.*`,
+  `http.matchers.*`, unknown) or an unbalanced brace counts as request-derived. So
+  `dynamic_upstreams { name localhost }`, Consul/Nomad SRV answering 127.0.0.1 and
+  `dial localhost:{env.PORT}` keep working with the guard on. A `map` or `vars` handler that copies
+  request data into `{vars.backend}` stays guarded (it is "unknown"); put its loopback targets in
+  `dial_allow`. Custom `DynamicUpstreamSource` implementations default to guarded.
+- **FastCGI (review fix).** FastCGI used to dial through a bare `TcpStream::connect`, so
+  `transport fastcgi` + `dynamic_upstreams` with a request-derived name reached loopback/metadata
+  unguarded. FastCGI dials of discovered hosts now resolve the name, check every address with the
+  same `DialGuard` and connect to a checked address; unix targets need a `unix/` allow entry. Static
+  placeholder dials remain rejected with FastCGI at load. Audit of every other
+  `TcpStream::connect`/`UnixStream::connect` in `crates/proxy` and `crates/l4`: the HTTP clients
+  (`dial_tcp`, unix connects behind `resolve_target`), DNS (resolver addresses are operator
+  configuration), websocket (test code only) and the L4 proxy (fixed operator-configured upstream,
+  not request-derived) are not reachable with request-derived addresses.
+- **Caddyfile (review fix).** `reverse_proxy { dial_allow <ip|cidr|unix//path>... }` is a
+  caddy-rs subdirective that sets the handler field (repeatable), so Caddyfile users need not use
+  `stock_compat`.
+- **NAT64 and 6to4 (review fix).** `64:ff9b::/96` and `2002::/16` addresses are classified by the
+  embedded IPv4 address (`64:ff9b::a9fe:a9fe` and `2002:a9fe:a9fe::` are metadata).
+
+### Design limit, stated bluntly
+
+The guard is a deny-list of well-known dangerous ranges, not an allow-list. RFC 1918 and ULA
+addresses stay reachable on purpose, so a client that controls the dial can still reach
+`10.96.0.1:443` (a Kubernetes API server), `172.17.0.1:2375` (a Docker API on the bridge) or the
+host's LAN address. If a request-derived dial must never be client-influenced, do not put request
+data in it: map the client's choice to a fixed set of upstreams (a `map` or matchers selecting among
+static `reverse_proxy` handlers) instead. `dial_allow` has no host-name entries.
+
+A DNS name can change between the guard's resolution and the dial only inside the one `dial_tcp`
+call (the same resolved list is dialled), so there is no rebind window.
 
 ### Tests that pin it
 
@@ -140,7 +173,14 @@ malformed entries); `crates/proxy/src/handler.rs`
 `dial_allow_and_stock_compat_permit_what_the_guard_denies`, `unix_expansions_need_a_dial_allow_prefix`,
 `factory_enables_the_dial_guard_unless_stock_compat`, `dial_allow_is_validated_at_load`,
 `dynamic_client_cache_is_bounded_and_evicts_least_recently_used`,
-`dynamic_hosts_are_bounded_but_keep_the_current_pool`.
+`dynamic_hosts_are_bounded_but_keep_the_current_pool`,
+`dynamic_source_hosts_are_guarded_only_when_request_derived`,
+`placeholder_dials_are_guarded_only_when_request_derived`,
+`fastcgi_dynamic_hosts_go_through_the_dial_guard`; `dial_guard.rs`
+`template_classification_is_conservative`, `nat64_and_6to4_forms_are_classified_by_the_embedded_ipv4`;
+`client.rs` `the_dial_guard_refuses_restricted_literals_before_connecting` (asserts the guard's own
+`PermissionDenied` refusal, so it does not depend on the metadata address being unreachable);
+`crates/config/tests/upstream_adapt.rs` `dial_allow_adapts_to_the_handler_field_and_accumulates`.
 
 ## C4 — DNS resolver spoof resistance (parity with the DNS specification and Go's resolver)
 

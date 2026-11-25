@@ -44,6 +44,7 @@ use tokio::sync::mpsc;
 use caddy_rs_http::body::{BodyError, RequestBody, StreamingBody};
 use caddy_rs_http::{Error as HttpError, Request, Result as HttpResult};
 
+use crate::dial_guard::DialGuard;
 use crate::template::{Template, TemplateContext};
 use crate::upstream::{Transport, Upstream};
 
@@ -312,6 +313,7 @@ impl FastCgiTransport {
         method: Method,
         path_and_query: &str,
         body: RequestBody,
+        dial_guard: Option<&DialGuard>,
     ) -> Result<FastCgiResponse, FastCgiError> {
         let content_length = body.exact_size().ok_or_else(|| {
             FastCgiError::Request(
@@ -322,7 +324,7 @@ impl FastCgiTransport {
         })?;
         let params = self.build_params(request, &method, path_and_query, content_length)?;
 
-        let stream = self.dial(upstream).await?;
+        let stream = self.dial(upstream, dial_guard).await?;
         // Caddy sets absolute connection deadlines once, right after dialing: they are not
         // refreshed per read/write, so `read_timeout`/`write_timeout` bound the whole exchange.
         let write_deadline = deadline_after(self.write_timeout);
@@ -617,7 +619,14 @@ impl FastCgiTransport {
         Ok(env)
     }
 
-    async fn dial(&self, upstream: &Upstream) -> Result<FastCgiStream, FastCgiError> {
+    /// Dial the backend. `dial_guard` (SEC-MEDIUM-PROXY C3) is set for hosts discovered from a
+    /// request-derived `dynamic_upstreams` source: the name is resolved here, every resolved
+    /// address is checked and the connection goes to a checked address (no second lookup).
+    async fn dial(
+        &self,
+        upstream: &Upstream,
+        dial_guard: Option<&DialGuard>,
+    ) -> Result<FastCgiStream, FastCgiError> {
         let Some(transport) = upstream.transport() else {
             return Err(FastCgiError::Request(
                 "FastCGI upstreams require a fixed dial address; placeholder dials are rejected at configuration time"
@@ -626,10 +635,30 @@ impl FastCgiTransport {
         };
         match transport {
             Transport::Tcp { address } => {
-                // Exempt from the ADR-0043 egress helper: FastCgiTransport carries no local_address,
-                // so the pinned-source defect (DIV-0153) is unreachable here. See
-                // crates/proxy/EGRESS-CONNECT-SITES.md.
-                let connect = tokio::net::TcpStream::connect(address);
+                let connect = async {
+                    // Resolve first so the guard (when set) sees every address and the
+                    // connection goes to a checked one, with no second lookup to race.
+                    let mut allowed = Vec::new();
+                    let mut refusal = None;
+                    for resolved in tokio::net::lookup_host(address).await? {
+                        match dial_guard.map_or(Ok(()), |guard| guard.check_ip(resolved.ip())) {
+                            Ok(()) => allowed.push(resolved),
+                            Err(message) => {
+                                refusal.get_or_insert(message);
+                            }
+                        }
+                    }
+                    if allowed.is_empty() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            refusal.unwrap_or_else(|| "no address resolved".to_string()),
+                        ));
+                    }
+                    // Exempt from the ADR-0043 egress helper: FastCgiTransport carries no local_address,
+                    // so the pinned-source defect (DIV-0153) is unreachable here. See
+                    // crates/proxy/EGRESS-CONNECT-SITES.md.
+                    tokio::net::TcpStream::connect(&allowed[..]).await
+                };
                 match tokio::time::timeout(self.dial_timeout, connect).await {
                     Ok(Ok(stream)) => Ok(FastCgiStream::Tcp(stream)),
                     Ok(Err(error)) => Err(FastCgiError::Connect(format!("{address}: {error}"))),
@@ -641,6 +670,9 @@ impl FastCgiTransport {
             }
             #[cfg(unix)]
             Transport::Unix { path } => {
+                if let Some(guard) = dial_guard {
+                    guard.check_unix(path).map_err(FastCgiError::Connect)?;
+                }
                 let connect = tokio::net::UnixStream::connect(path);
                 match tokio::time::timeout(self.dial_timeout, connect).await {
                     Ok(Ok(stream)) => Ok(FastCgiStream::Unix(stream)),

@@ -1403,6 +1403,41 @@ pub fn build_upstream_client_for_tuned(
 
 #[cfg(test)]
 mod tests {
+    /// SEC-MEDIUM-PROXY C3: a refusal by the guard is distinguishable from a failed connect (it is
+    /// `PermissionDenied`, produced before any socket is opened), so these cases cannot pass merely
+    /// because a metadata address is unreachable from the test host. Without the guard the same
+    /// literal would be dialed (not asserted: it may hang or even succeed on a cloud runner).
+    #[tokio::test]
+    async fn the_dial_guard_refuses_restricted_literals_before_connecting() {
+        let tuning = TransportTuning {
+            dial_guard: Some(Arc::new(DialGuard::default())),
+            ..TransportTuning::default()
+        };
+        let started = std::time::Instant::now();
+        for target in [
+            "169.254.169.254:80",
+            "[::1]:80",
+            "[fe80::1]:80",
+            "0.0.0.0:80",
+            "100.100.100.200:80",
+            "[fd00:ec2::254]:80",
+            "[::ffff:169.254.169.254]:80",
+            "[64:ff9b::a9fe:a9fe]:80",
+            "[2002:a9fe:a9fe::]:80",
+        ] {
+            let error = dial_tcp(target, &tuning)
+                .await
+                .expect_err("restricted literal must be refused");
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied,
+                "{target}: {error}"
+            );
+            assert!(error.to_string().contains("dial_allow"), "{error}");
+        }
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
     /// Read an `IPPROTO_IP`/`IP_BIND_ADDRESS_NO_PORT` int option back off a live socket.
     ///
     /// Test-only: the crate's `deny(unsafe_code)` is relaxed for this one read the same way the

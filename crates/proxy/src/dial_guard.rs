@@ -96,6 +96,34 @@ impl DialGuard {
     }
 }
 
+/// Whether a dial / name / port template can carry request-controlled text.
+///
+/// Conservative: a template is operator-controlled only when every `{placeholder}` in it is in
+/// the `env.*`, `system.*`, `time.*` or `$VAR` namespaces (set by whoever wrote the config, not by
+/// the client); a literal with no placeholder is operator-controlled too. Any other placeholder
+/// (`http.request.*`, `http.vars.*`, `vars.*`, `http.regexp.*`, `http.matchers.*`, unknown names)
+/// and any unbalanced brace is treated as request-derived, so the guard applies.
+pub fn template_is_request_derived(template: &str) -> bool {
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else {
+            return true;
+        };
+        let name = &after[..close];
+        let operator_controlled = name.starts_with('$')
+            || ["env.", "system.", "time."]
+                .iter()
+                .any(|prefix| name.starts_with(prefix));
+        if !operator_controlled {
+            return true;
+        }
+        rest = &after[close + 1..];
+    }
+    // A stray closing brace carries no placeholder.
+    false
+}
+
 /// Addresses a request-derived dial may not reach unless `dial_allow` lists them.
 pub fn is_restricted_ip(ip: IpAddr) -> bool {
     match ip.to_canonical() {
@@ -111,6 +139,17 @@ pub fn is_restricted_ip(ip: IpAddr) -> bool {
                 || ip == Ipv4Addr::new(192, 0, 0, 192)
         }
         IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            // NAT64 (64:ff9b::/96) and 6to4 (2002::/16) embed the IPv4 address that a translator
+            // or tunnel would deliver to: classify by that address.
+            if segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                let [a, b] = [segments[6].to_be_bytes(), segments[7].to_be_bytes()];
+                return is_restricted_ip(IpAddr::V4(Ipv4Addr::new(a[0], a[1], b[0], b[1])));
+            }
+            if segments[0] == 0x2002 {
+                let [a, b] = [segments[1].to_be_bytes(), segments[2].to_be_bytes()];
+                return is_restricted_ip(IpAddr::V4(Ipv4Addr::new(a[0], a[1], b[0], b[1])));
+            }
             ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_multicast()
@@ -220,6 +259,79 @@ mod tests {
         assert!(guard
             .check_unix(Path::new("/run/app/../docker.sock"))
             .is_err());
+    }
+
+    /// SEC-MEDIUM-PROXY C3 (review): only templates that can carry request data are guarded.
+    /// Literals and operator-controlled sources (`env.*`, `system.*`, `time.*`, `$VAR`) are not;
+    /// everything else (request, vars, regexp, matchers, unknown) is.
+    #[test]
+    fn template_classification_is_conservative() {
+        for operator_controlled in [
+            "localhost:8080",
+            "10.0.0.1:80",
+            "[::1]:80",
+            "unix//run/app.sock",
+            "",
+            "{env.BACKEND_PORT}",
+            "localhost:{env.PORT}",
+            "{env.HOST}:{env.PORT}",
+            "{system.hostname}:80",
+            "{time.now.unix}",
+            "{$PORT}",
+            "{env.HOST:localhost}:80",
+        ] {
+            assert!(
+                !template_is_request_derived(operator_controlled),
+                "`{operator_controlled}` is operator-controlled"
+            );
+        }
+        for request_derived in [
+            "{http.request.header.X-Backend}",
+            "{http.request.host}:80",
+            "{http.request.uri.query.b}",
+            "{http.vars.backend}",
+            "{vars.backend}",
+            "{http.regexp.name.1}:80",
+            "{http.matchers.file.relative}",
+            "{http.request.cookie.x}",
+            "{something.unknown}:80",
+            "{env.HOST}:{http.request.header.X-Port}",
+            "{http.request.header.X-A}{env.B}",
+            "{}",
+            "{env.UNCLOSED",
+            "backend-{http.request.header.X}.internal:80",
+        ] {
+            assert!(
+                template_is_request_derived(request_derived),
+                "`{request_derived}` is request-derived or unknown"
+            );
+        }
+    }
+
+    /// NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`) forms embed an IPv4 address that a
+    /// translator or tunnel would deliver to: classify by the embedded address.
+    #[test]
+    fn nat64_and_6to4_forms_are_classified_by_the_embedded_ipv4() {
+        let guard = DialGuard::default();
+        for denied in [
+            "64:ff9b::a9fe:a9fe", // 169.254.169.254
+            "64:ff9b::7f00:1",    // 127.0.0.1
+            "2002:a9fe:a9fe::",   // 169.254.169.254
+            "2002:7f00:1::1",     // 127.0.0.1
+            "2002:6464:c8::5",    // 100.100.0.200 (100.64/10)
+            "::ffff:169.254.169.254",
+        ] {
+            assert!(
+                guard.check_ip(ip(denied)).is_err(),
+                "{denied} must be denied"
+            );
+        }
+        for allowed in ["64:ff9b::cb00:7107", "2002:cb00:7107::1", "2001:db8::1"] {
+            assert!(
+                guard.check_ip(ip(allowed)).is_ok(),
+                "{allowed} embeds a public address"
+            );
+        }
     }
 
     #[test]
