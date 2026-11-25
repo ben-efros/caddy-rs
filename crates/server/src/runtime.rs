@@ -1407,7 +1407,13 @@ impl ServerRuntime {
         let current_admin = self.admin.as_ref().map(|handle| handle.bound.clone());
         if desired_admin != current_admin {
             if let Some(handle) = self.admin.take() {
+                let moved_from = handle.unix_socket.as_ref().map(|(path, _)| path.clone());
                 handle.stop().await;
+                // The listener removed its own socket; the exit path must not keep a path that
+                // no longer (or never again) belongs to this process.
+                if let Some(path) = moved_from {
+                    self.shutdown_latch.disown_socket_path(&path);
+                }
             }
             if let Some(listen) = &desired_admin {
                 // Both inputs come from the generation being applied and this process's role,
@@ -1427,8 +1433,9 @@ impl ServerRuntime {
                 // The `/stop` exit path removes this file itself if the runtime has not finished
                 // shutting down within its budget: `process::exit` skips the listener task's
                 // `Drop` guard, and a stale socket would survive the process.
-                if let Some(path) = listen.strip_prefix("unix/") {
-                    self.shutdown_latch.own_socket_path(path);
+                if let Some((path, identity)) = &handle.unix_socket {
+                    self.shutdown_latch
+                        .own_socket_path(path, identity.device, identity.inode);
                 }
                 self.admin = Some(handle);
             }
