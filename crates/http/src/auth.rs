@@ -1326,23 +1326,36 @@ impl BasicAuthHandler {
     /// unknown-user fake hash) and argon2id take 100 ms to seconds of CPU; the constant-time
     /// plaintext extension is trivially cheap and stays inline. Repeated pairs are answered from
     /// the hash cache. `None` means the hash pool stayed saturated past the secure-default wait.
+    ///
+    /// `username` is `Some` only for a real account: the verdict for the fake hash of an unknown
+    /// user is never cached (a cached unknown-user verdict would make a repeat probe cheaper than
+    /// the same probe of a real account, a user-existence oracle), and the username is part of
+    /// every cache key.
     async fn verify_offloaded(
         &self,
+        username: Option<&str>,
         hash: std::sync::Arc<PasswordHash>,
         password: Vec<u8>,
     ) -> Option<bool> {
         if matches!(*hash, PasswordHash::Plaintext(_)) {
             return Some(verify_password(&hash, &password));
         }
-        let key = self.cache.key(&hash.cache_identity(), &password);
-        if let Some(matched) = self.cache.get(&key) {
+        let key = username.map(|username| {
+            let mut identity = (username.len() as u64).to_be_bytes().to_vec();
+            identity.extend_from_slice(username.as_bytes());
+            identity.extend_from_slice(&hash.cache_identity());
+            self.cache.key(&identity, &password)
+        });
+        if let Some(matched) = key.as_ref().and_then(|key| self.cache.get(key)) {
             return Some(matched);
         }
         let cache = std::sync::Arc::clone(&self.cache);
         run_limited_within(&self.limiter, self.max_wait, move || {
             let matched = verify_password(&hash, &password);
             // Cached from inside the job so a hash whose request was cancelled still pays off.
-            cache.insert(key, matched);
+            if let Some(key) = key {
+                cache.insert(key, matched);
+            }
             matched
         })
         .await
@@ -1480,7 +1493,11 @@ impl Handler for BasicAuthHandler {
             || std::sync::Arc::clone(&self.fake_hash),
             |account| std::sync::Arc::clone(&account.hash),
         );
-        let Some(matches) = self.verify_offloaded(hash, password.into_bytes()).await else {
+        let cache_user = account.is_some().then_some(username.as_str());
+        let Some(matches) = self
+            .verify_offloaded(cache_user, hash, password.into_bytes())
+            .await
+        else {
             return Ok(overloaded());
         };
         if !matches || account.is_none() {
@@ -2556,6 +2573,29 @@ mod tests {
         );
     }
 
+    /// B1 round 2: the cache must not turn into a user-existence oracle. A verdict for an unknown
+    /// username (fake hash) is never cached, so probing `(candidate, P)` after `(nonexistent, P)`
+    /// costs the same hash path for unknown and real accounts. Proven with the pool exhausted:
+    /// both must need a permit (503), neither may be answered instantly from the cache.
+    #[tokio::test]
+    async fn unknown_user_probes_cost_the_same_hash_path_as_real_accounts() {
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let handler = cached_handler(false, &limiter);
+        // Warm: the unknown-user pair is computed once.
+        assert_eq!(
+            status_of(&attempt(&handler, "zz-nonexistent", "P").await),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        let _held = Arc::clone(&limiter).acquire_owned().await.unwrap();
+        for user in ["zz-nonexistent", "alice"] {
+            assert_eq!(
+                status_of(&attempt(&handler, user, "P").await),
+                Some(StatusCode::SERVICE_UNAVAILABLE),
+                "{user} must need a hash permit on every attempt (no cached verdict)"
+            );
+        }
+    }
+
     /// Secure default: waiting for a hash permit is capped; the overload answer is 503 with
     /// `Retry-After`, not an unbounded queue.
     #[tokio::test]
@@ -2627,18 +2667,22 @@ mod tests {
         );
         let handler = basic_auth_handler(serde_json::json!({"handler": "basic_auth"}));
         let accept = handler
-            .verify_offloaded(bcrypt.clone(), b"pw".to_vec())
+            .verify_offloaded(Some("u"), bcrypt.clone(), b"pw".to_vec())
             .await;
         assert_eq!(accept, Some(true));
-        let reject = handler.verify_offloaded(bcrypt, b"nope".to_vec()).await;
+        let reject = handler
+            .verify_offloaded(Some("u"), bcrypt, b"nope".to_vec())
+            .await;
         assert_eq!(reject, Some(false));
 
         let plain = std::sync::Arc::new(PasswordHash::Plaintext(b"pw".to_vec()));
         let accept = handler
-            .verify_offloaded(plain.clone(), b"pw".to_vec())
+            .verify_offloaded(Some("u"), plain.clone(), b"pw".to_vec())
             .await;
         assert_eq!(accept, Some(true));
-        let reject = handler.verify_offloaded(plain, b"px".to_vec()).await;
+        let reject = handler
+            .verify_offloaded(Some("u"), plain, b"px".to_vec())
+            .await;
         assert_eq!(reject, Some(false));
     }
 }
