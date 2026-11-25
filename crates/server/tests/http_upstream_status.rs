@@ -90,7 +90,7 @@ async fn request(address: SocketAddr, path: &str) -> (u16, Bytes) {
     let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
     let request = hyper::Request::builder()
         .uri(format!("http://{address}{path}"))
-        .header(http::header::HOST, "example.com")
+        .header(http::header::HOST, address.to_string())
         .body(Full::new(Bytes::new()))
         .unwrap();
     let response = client.request(request).await.expect("request succeeds");

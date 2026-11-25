@@ -680,15 +680,26 @@ mod tests {
         let policy = OriginPolicy::from_admin(Some(&admin(false, &[])));
         assert!(policy.enforce_host);
         let mut rebinding = HeaderMap::new();
-        rebinding.insert(http::header::HOST, HeaderValue::from_static("evil.example:2019"));
-        let violation = policy.check(&rebinding).expect_err("rebinding Host must be rejected");
+        rebinding.insert(
+            http::header::HOST,
+            HeaderValue::from_static("evil.example:2019"),
+        );
+        let violation = policy
+            .check(&rebinding)
+            .expect_err("rebinding Host must be rejected");
         assert_eq!(violation.status, StatusCode::FORBIDDEN);
         assert_eq!(violation.message, "host not allowed: evil.example:2019");
         rebinding.insert(http::header::HOST, HeaderValue::from_static("evil.example"));
         assert!(policy.check(&rebinding).is_err(), "port-less foreign Host");
         // Legitimate non-browser clients keep working: allowed Host (with or without port),
         // and synthetic requests with no Host header at all.
-        for host in ["localhost:2019", "127.0.0.1:2019", "[::1]:2019", "LOCALHOST:2019", "localhost"] {
+        for host in [
+            "localhost:2019",
+            "127.0.0.1:2019",
+            "[::1]:2019",
+            "LOCALHOST:2019",
+            "localhost",
+        ] {
             let mut ok = HeaderMap::new();
             ok.insert(http::header::HOST, HeaderValue::from_str(host).unwrap());
             assert_eq!(policy.check(&ok).unwrap(), None, "{host}");

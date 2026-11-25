@@ -2827,12 +2827,16 @@ where
         )
     };
     let Some(limit) = limit else {
-        return body.collect().await.map(|collected| collected.to_bytes()).map_err(|error| {
-            AdminResponse::api_error(
-                StatusCode::BAD_REQUEST,
-                format!("reading request body: {error}"),
-            )
-        });
+        return body
+            .collect()
+            .await
+            .map(|collected| collected.to_bytes())
+            .map_err(|error| {
+                AdminResponse::api_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("reading request body: {error}"),
+                )
+            });
     };
     let declared = headers
         .get(http::header::CONTENT_LENGTH)
@@ -2843,7 +2847,11 @@ where
     }
     match http_body_util::Limited::new(body, limit).collect().await {
         Ok(collected) => Ok(collected.to_bytes()),
-        Err(error) if error.downcast_ref::<http_body_util::LengthLimitError>().is_some() => {
+        Err(error)
+            if error
+                .downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some() =>
+        {
             Err(too_large())
         }
         Err(error) => Err(AdminResponse::api_error(
@@ -3004,8 +3012,8 @@ async fn bind_admin_unix(
     api: AdminApi,
 ) -> Result<ListenerHandle, Error> {
     let socket_path = std::path::Path::new(path);
-    let listener = bind_admin_unix_private(socket_path)
-        .map_err(|error| Error::bind(configured, error))?;
+    let listener =
+        bind_admin_unix_private(socket_path).map_err(|error| Error::bind(configured, error))?;
     let (shutdown, mut receiver) = watch::channel(false);
     let (force, mut force_receiver) = watch::channel(false);
     let tracker = Arc::new(ConnectionTracker::default());
@@ -4022,12 +4030,18 @@ mod admin_body_tests {
     async fn body_within_the_limit_is_returned_and_the_boundary_is_inclusive() {
         let headers = HeaderMap::new();
         assert_eq!(
-            read_admin_body(&headers, body_of(10), Some(10)).await.unwrap().len(),
+            read_admin_body(&headers, body_of(10), Some(10))
+                .await
+                .unwrap()
+                .len(),
             10,
             "exactly the limit is accepted"
         );
         assert_eq!(
-            read_admin_body(&headers, body_of(0), Some(10)).await.unwrap().len(),
+            read_admin_body(&headers, body_of(0), Some(10))
+                .await
+                .unwrap()
+                .len(),
             0
         );
         let rejected = read_admin_body(&headers, body_of(11), Some(10))
@@ -4047,17 +4061,24 @@ mod admin_body_tests {
             .expect_err("declared length over the cap");
         assert_eq!(rejected.status, StatusCode::PAYLOAD_TOO_LARGE);
         headers.insert(http::header::CONTENT_LENGTH, "10".parse().unwrap());
-        assert!(read_admin_body(&headers, body_of(10), Some(10)).await.is_ok());
+        assert!(read_admin_body(&headers, body_of(10), Some(10))
+            .await
+            .is_ok());
         // A malformed Content-Length is ignored here (hyper rejects it before the service runs).
         headers.insert(http::header::CONTENT_LENGTH, "abc".parse().unwrap());
-        assert!(read_admin_body(&headers, body_of(3), Some(10)).await.is_ok());
+        assert!(read_admin_body(&headers, body_of(3), Some(10))
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
     async fn unbounded_read_accepts_any_size() {
         let headers = HeaderMap::new();
         assert_eq!(
-            read_admin_body(&headers, body_of(4096), None).await.unwrap().len(),
+            read_admin_body(&headers, body_of(4096), None)
+                .await
+                .unwrap()
+                .len(),
             4096
         );
     }
@@ -4066,9 +4087,13 @@ mod admin_body_tests {
     async fn read_failures_are_400_not_an_empty_body() {
         let headers = HeaderMap::new();
         for limit in [Some(1024), None] {
-            let rejected = read_admin_body(&headers, Failing(Some(Bytes::from_static(b"{\"a\":"))), limit)
-                .await
-                .expect_err("a failed read must not become an empty body");
+            let rejected = read_admin_body(
+                &headers,
+                Failing(Some(Bytes::from_static(b"{\"a\":"))),
+                limit,
+            )
+            .await
+            .expect_err("a failed read must not become an empty body");
             assert_eq!(rejected.status, StatusCode::BAD_REQUEST, "limit {limit:?}");
         }
     }
@@ -4083,10 +4108,16 @@ mod admin_body_tests {
             "no active generation: capped"
         );
         for (stock_compat, expected) in [(false, Some(ADMIN_MAX_BODY_BYTES)), (true, None)] {
-            let config = caddy_rs_core::Config::from_value(serde_json::json!({"stock_compat": stock_compat}))
+            let config = caddy_rs_core::Config::from_value(
+                serde_json::json!({"stock_compat": stock_compat}),
+            )
             .expect("config");
             store.load(config).expect("load");
-            assert_eq!(admin_body_limit(&api), expected, "stock_compat {stock_compat}");
+            assert_eq!(
+                admin_body_limit(&api),
+                expected,
+                "stock_compat {stock_compat}"
+            );
         }
     }
 }
@@ -4261,7 +4292,11 @@ mod admin_unix_tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
-        assert_eq!(names, vec![std::ffi::OsString::from("admin.sock")], "{names:?}");
+        assert_eq!(
+            names,
+            vec![std::ffi::OsString::from("admin.sock")],
+            "{names:?}"
+        );
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -4274,7 +4309,11 @@ mod admin_unix_tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
-        assert_eq!(names, vec![std::ffi::OsString::from("admin.sock")], "{names:?}");
+        assert_eq!(
+            names,
+            vec![std::ffi::OsString::from("admin.sock")],
+            "{names:?}"
+        );
     }
 }
 
