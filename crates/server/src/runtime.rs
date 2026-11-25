@@ -1555,7 +1555,12 @@ impl ServerRuntime {
         mut shutdown: watch::Receiver<bool>,
         force: Option<watch::Receiver<bool>>,
     ) -> Result<()> {
-        let mut seen_active_generation = self.store.current().is_some();
+        // Seeded from the store's lifetime counter, not from `current()`: a `/stop` can empty the
+        // store before this loop's first pass observes a generation, and the empty store then looks
+        // identical to a store that never had one. `loaded_count()` cannot be raced that way, so a
+        // `/stop` during startup still ends the loop instead of spinning until the exit latch times
+        // out (which skipped the whole graceful shutdown).
+        let mut seen_active_generation = self.store.loaded_count() > 0;
         let mut store_stopped = false;
         // Track the generation that has already been applied. Re-applying an unchanged generation
         // every heartbeat would tear down and restart its renewal schedulers, cancelling any
@@ -3277,6 +3282,50 @@ mod shutdown_latch_tests {
         );
         // Release is idempotent, because `run_loop`'s exit path may reach it too.
         runtime.release_shutdown_latch();
+    }
+
+    /// A `/stop` that empties the store before the run loop's first pass must still end the loop.
+    ///
+    /// This is the regression test for a lost-wakeup race: `seen_active_generation` used to be
+    /// seeded from `store.current()`, so a stop landing between construction and the loop's first
+    /// iteration left the flag `false` forever. The loop then never reached `graceful_stop` and only
+    /// died when the `/stop` exit latch timed out, which skipped the shutdown delay, the grace
+    /// period and the listener/socket teardown. Seeding from the store's monotonic `loaded_count()`
+    /// is what makes the emptied store distinguishable from a store that never had a generation.
+    ///
+    /// The store here has a generation loaded and then stopped *before* `run` is called, so the race
+    /// window is hit every time rather than occasionally.
+    #[tokio::test]
+    async fn a_stop_before_the_first_loop_pass_still_ends_the_run_loop() {
+        let store = Arc::new(GenerationStore::with_builtin_registry());
+        store
+            .load(
+                Config::from_value(serde_json::json!({
+                    "admin": {"listen": "127.0.0.1:0"},
+                    "apps": {"http": {"servers": {"srv0": {"listen": ["127.0.0.1:0"]}}}}
+                }))
+                .expect("configuration decodes"),
+            )
+            .expect("configuration loads");
+        // The `/stop` lands before `run` gets a chance to observe the generation.
+        store.stop().expect("stopped generation");
+        assert!(
+            store.current().is_none(),
+            "the store is empty when the loop starts"
+        );
+        assert_eq!(
+            store.loaded_count(),
+            1,
+            "the store has a generation in its history, which is what the loop must notice"
+        );
+
+        let runtime = ServerRuntime::new(Arc::clone(&store));
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+        let finished =
+            tokio::time::timeout(std::time::Duration::from_secs(5), runtime.run(shutdown))
+                .await
+                .expect("the run loop must end, not wait for a generation that will never come");
+        finished.expect("the run loop reports a clean stop");
     }
 
     /// A Unix admin socket must be registered on the latch, so the `/stop` exit path can remove
