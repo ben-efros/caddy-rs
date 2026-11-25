@@ -264,13 +264,8 @@ environment variables through clap's `env`).
 
 ### Behaviour
 
-- The URI is shown once by `announce_bootstrap_totp`, and the structured log only says where it
-  went. On a terminal it is printed to stderr. Without one (under systemd both streams reach the
-  journal, the shared retained sink) it is written to an owner-only (0600) file
-  `bootstrap-totp-uri.txt` in the data directory and only the path is logged; if that write fails
-  startup fails. The fatal-error path logs the error with every `secret=` value redacted and prints
-  the full text to a terminal only (a non-terminal stderr gets the redacted text; a fresh start
-  enrols a fresh secret, so nothing usable is lost).
+- **Superseded by the second review round (see below):** the bootstrap no longer generates a TOTP
+  secret, so there is no enrolment URI to show and `bootstrap-totp-uri.txt` no longer exists.
 - The credential flags keep working (removing them would break existing invocations); `main` logs a
   warning naming the flag (never the value) when either is present on the command line, steering
   operators to the environment variables / the 0600 environment file. Not changed: the bootstrap
@@ -287,6 +282,43 @@ tracing output; with the old `warn!(totp_uri = ...)` it fails with the secret in
 `a_failure_to_place_the_uri_is_reported_not_swallowed`,
 `the_fatal_error_shown_without_a_terminal_carries_no_secret`. The wiring in `main`
 (`error!`/`eprintln!` and the flag warning) is not unit-tested.
+
+## Second review round
+
+- **Epoch binding (high).** `refresh` never compared the consumed record's epoch with the user's,
+  and `update_role` bumped the epoch without revoking refresh tokens: a thief who rotated first kept
+  a live descendant across a role change and, because the real client's replay of the old token was
+  then epoch-stale, no reuse response ever fired. `refresh` now refuses a record from an older epoch,
+  `update_role` revokes refresh tokens, and `UserStore::store_refresh_token` must refuse an insert
+  whose epoch no longer matches the user's, atomically with the insert. That closes the two races
+  (a token minted between the reuse response's bump and its revoke; a `login` straddling an
+  `update_password`). Tests: `a_thiefs_descendant_token_dies_when_the_role_changes`,
+  `a_refresh_token_from_an_older_epoch_is_refused_even_if_never_revoked`,
+  `a_token_minted_while_the_reuse_response_runs_does_not_survive_it` and
+  `a_login_racing_a_password_change_does_not_outlive_it` (the last two inject the interleaving
+  through a store wrapper).
+- **Eviction (medium).** An adaptive attacker could push invented names to a penalty, then evict the
+  victim. Entries are now kept for 24 hours after their last activity and a full table fails closed:
+  unknown names are turned away, known accounts displace only unknown entries
+  (`an_adaptive_flood_cannot_evict_a_penalised_victim`). Trade-offs are in `docs/AUTHN.md`.
+- **Daily budget (low).** Idling to reset the count allowed about 240 guesses a day, and the TOTP
+  key was an independent second allowance. Each key now totals failures over a rolling 24 hours (over
+  20, every failure earns the full `max_lockout`: about 116 a day), and TOTP failures spend the login
+  budget as well (`guesses_per_key_per_day_stay_bounded_whatever_the_waiting_strategy`,
+  `totp_failures_spend_the_login_budget_too`).
+- **Bootstrap TOTP (medium).** `PM_BOOTSTRAP_ADMIN_TOTP` asked for a code for a secret generated at
+  start, which can never succeed. It now needs `PM_BOOTSTRAP_ADMIN_TOTP_SECRET` (validated base32,
+  never logged) alongside it, new `AuthnService::totp_setup_with_secret`, and the normal path is
+  `POST /auth/totp/setup`. The URI file and its helpers are removed (less secret at rest), which
+  also makes the symlink/O_EXCL concern moot. Tests: `a_secret_and_a_matching_code_enrol_the_bootstrap_factor`,
+  `a_code_without_a_secret_or_the_reverse_is_refused_before_creating_anything`,
+  `a_wrong_code_or_a_malformed_secret_rolls_the_admin_back_without_echoing_the_secret`,
+  `an_operator_chosen_totp_secret_is_validated_and_enrols_like_setup`.
+- **Smaller items.** `modify_user` documents that implementations must hold a row lock (the closure
+  is `FnOnce`) and restores `id` as well as `username`. The reuse-detection grace period is not
+  implemented and the retry trade-off is documented. pm-api's own limiter now keys on the exact
+  username like authn (the `ALICE` test flipped). Whitespace-only passwords are refused; Unicode
+  NFC normalisation is documented as not applied because the crate is not a dependency.
 
 ## Exact program-repository text to merge
 

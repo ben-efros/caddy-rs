@@ -86,7 +86,12 @@ Limits enforced by the service:
   `MIN_PASSWORD_CHARS` (8 characters, counted as characters) and at most `MAX_PASSWORD_BYTES`, else
   `AuthError::PasswordTooShort` / `PasswordTooLong`; `POST /auth/setup` answers `400` with
   `location: "password"`. A too-short `PM_BOOTSTRAP_ADMIN_PASSWORD` makes `serve` fail at startup
-  naming the variable.
+  naming the variable. A password of only whitespace is refused (`AuthError::PasswordBlank`).
+  **No Unicode normalisation is applied:** passwords are hashed as the exact bytes submitted, so the
+  same text typed as precomposed and as decomposed characters (NFC vs NFD) is two different
+  passwords. (Normalising needs the `unicode-normalization` crate, which is not a dependency of this
+  workspace, and doing it now would also change how stored hashes verify.) Legacy bcrypt hashes
+  silently ignore everything past 72 bytes; they are upgraded only on a password change.
 
 `login` spends the same password-verification work (a dummy hash) when the username does not exist,
 so response time does not reveal whether an account exists.
@@ -119,8 +124,22 @@ so response time does not reveal whether an account exists.
   `RefreshTokenRevoked` with **no side effect**, as are unknown and expired tokens (expiry is
   checked before revocation), so old tokens cannot be used to keep forcing logouts and a reset on
   one device does not cascade through the others.
-- **Atomic user updates.** `UserStore::modify_user` applies a closure to one stored record under
-  the store's own exclusion; the service uses it for every field-level change (epoch bumps,
+- **Epoch binding.** `refresh` also refuses a record whose epoch differs from the user's current
+  `auth_epoch` (so a thief's descendant cannot keep minting tokens after a password, factor or role
+  change moved the epoch; records stored before epochs were recorded count as epoch 0 and must log
+  in again once the account's epoch is above 0), and `update_role` now revokes refresh tokens like
+  the other epoch-bumping operations. Every session-retiring operation bumps the epoch *first* and
+  revokes second, and `UserStore::store_refresh_token` must refuse (`RefreshTokenRevoked`) an insert
+  whose epoch no longer matches the user's, atomically with the insert, so a login or refresh that
+  straddled the bump cannot leave a token that survives the revoke.
+- **No grace period (trade-off).** Re-presenting a just-rotated token is reuse: a client that
+  retries a refresh after losing the response (timeout, dropped connection) ends all of the user's
+  sessions and must log in again. A grace window that returned the same successor would avoid that
+  but would also hand a stolen token's successor to a second presenter, so it is deliberately not
+  implemented; clients should treat a failed refresh as "log in again" and not retry blindly.
+- **Atomic user updates.** `UserStore::modify_user` applies a `FnOnce` closure exactly once to one
+  stored record, so a persistent backend must hold a row lock for the duration (it cannot retry
+  optimistically); `id` and `username` are restored if the closure changes them; the service uses it for every field-level change (epoch bumps,
   passwords, roles, TOTP state) so a concurrent `accept_totp_step` is never overwritten by a stale
   whole-record write. Custom `UserStore` implementations must provide it (breaking change), and
   `consume_refresh_token` now takes the `RevokeReason`.
@@ -141,18 +160,33 @@ API, the CLI enrolment flow, any future caller) inherits it. `AuthnConfig::login
   counted.
 - After `max_failures` consecutive failures the key is locked for `base_lockout`; once served, each
   further failure re-locks for twice as long (capped at `max_lockout`): one guess per lockout
-  period. A key idle for `2 * max_lockout` has its failure count restarted but its backoff level
-  only decays by one per idle period, and a key that still has a level re-locks on its first
-  further failure, so waiting does not hand back a fresh budget. `max_lockout` must not exceed one
-  day (`AuthError::InvalidConfig`).
+  period while the backoff level is non-zero. A key idle for `2 * max_lockout` has its failure count
+  restarted but its backoff level only decays by one per idle period, and a key that still has a
+  level re-locks on its first further failure. On top of that every key totals its failures over a
+  rolling 24 hours: past 20 the full `max_lockout` applies to every further failure however long
+  the key was idle, which bounds the guesses per key to about 116 a day with the defaults (idling
+  to reset the count used to allow about 240). `max_lockout` must not exceed one day
+  (`AuthError::InvalidConfig`).
 - Password failures and TOTP failures during `login` share one per-username budget. Direct
-  `totp_verify` calls use a separate per-account budget (`totp:<user id>`).
+  `totp_verify` calls (confirm, disable, re-enrol) spend a per-account budget (`totp:<user id>`)
+  *and* the account's login budget, so a session holder guessing codes does not get an allowance
+  independent of password guessing; a correct code clears both.
 - Keys are the exact *submitted* username, counted whether or not the account exists, so lockout
   state does not reveal which usernames are real. The store matches names case-sensitively (`Bob`
   and `bob` are two accounts), so the key is not case-folded: a store that folds case must fold
-  here too. Keys over 128 bytes are replaced by a SHA-256 digest. At `max_tracked` entries the
-  entry carrying the least penalty is evicted first (unlocked, lowest backoff level, fewest
-  failures, oldest), so flooding the tracker with made-up usernames cannot reset a victim's count.
+  here too. Keys over 128 bytes are replaced by a SHA-256 digest.
+- **A full table fails closed, it does not evict.** Entries are retained for 24 hours after their
+  last activity (a sweep, at most once a second while the table is full, drops older ones), so an
+  attacker cannot push invented names to a penalty and then evict the victim. When `max_tracked`
+  is reached: a key for an account that exists (`login` looks the name up first) may displace the
+  least penalised entry of an *unknown* name; a key for an unknown name is turned away with
+  `TooManyAttempts` for `base_lockout`; when only known entries remain, a new known key is turned
+  away as well. Consequences, accepted deliberately: during a flood of invented usernames a
+  mistyped username is refused rather than reported as bad credentials, so for the duration of
+  the flood an observer can tell existing names (admitted) from invented ones (refused), and the
+  flood can pin the unknown-name slots for as long as it lasts. It cannot lock out existing
+  accounts, which always have a slot unless more than `max_tracked` real accounts are under attack
+  at once.
 - `update_password` verifies the current password through the same per-username budget, so a stolen
   access token cannot guess the password at line speed.
 - Counters are in-process and shared by clones of the service; they reset on restart.

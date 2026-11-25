@@ -155,18 +155,18 @@ makes a missing file non-fatal, so a plain install starts without credentials. I
 credentials deletes a stale file left by an earlier install. Supply the email and password together:
 `serve` creates no administrator unless both are set.
 
-`PM_BOOTSTRAP_ADMIN_TOTP` also works (fixed in T-AUTH-002). The bootstrap enrols a TOTP secret and
-then confirms the supplied code against it, so the code must come from the same enrolment. Because
-the secret is minted at bootstrap time, the enrolment URI is shown once, and where depends on
-whether a person is watching. On a terminal it is printed to stderr. Under a service manager (where
-both stdout and stderr go to the journal) it is written to an owner-only (0600) file,
-`bootstrap-totp-uri.txt` in the data directory (`/var/lib/caddy-rs/` by default), and only the path
-is logged; scan it and delete the file. If the file cannot be written the start fails. The URI embeds
-the secret, so it is never put in the structured log, and a fatal error shown without a terminal has
-every `secret=` value replaced by `[redacted]`. A rejected code removes the administrator it created
-rather than leaving an account with an unconfirmed factor (the next start enrols a fresh secret).
-Where even a file is unacceptable, enrol TOTP through `POST /api/v1/auth/totp/setup` after first
-login instead of using `PM_BOOTSTRAP_ADMIN_TOTP`.
+The normal way to enrol a second factor is `POST /api/v1/auth/totp/setup` (then `/confirm`) after the
+first login: the server returns the secret and the `otpauth://` URI over the authenticated session.
+For unattended provisioning, `PM_BOOTSTRAP_ADMIN_TOTP_SECRET` (a base32 secret you generated and
+already added to your authenticator) **together with** `PM_BOOTSTRAP_ADMIN_TOTP` (a code it
+currently shows) enrols that factor at start: the secret is enrolled pending, the code proves it, and
+a wrong code or malformed secret removes the administrator again. Setting only one of the two is
+refused with an error before anything is created. Earlier versions let `PM_BOOTSTRAP_ADMIN_TOTP`
+stand alone and generated the secret at start, which could never work because no one can know a code
+for a secret that does not exist yet. Neither value is ever logged or echoed in an error, and
+`install` stores them in the 0600 environment file with the password. The code is only valid for its
+30-second step, so start the service immediately after generating it (the bootstrap only runs when
+no users exist).
 
 `PM_BOOTSTRAP_ADMIN_PASSWORD` must be at least 8 characters; a shorter one makes the service fail to
 start with an error naming the variable.
