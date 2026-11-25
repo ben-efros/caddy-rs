@@ -521,13 +521,11 @@ impl FileServerHandler {
         // the path checks cannot be served under another file's validators, and a final symlink
         // swapped in is refused by the open itself (`O_NOFOLLOW`).
         let (original_file, original_metadata) = match open_regular(filename).await {
-            Ok(opened) => opened,
-            Err(error) if is_symlink_refusal(&error) => return Ok(forbidden()),
+            Ok(Opened::Regular(file, metadata)) => (file, metadata),
+            Ok(Opened::Symlink) => return Ok(forbidden()),
+            Ok(Opened::NotRegular) => return self.not_found(request),
             Err(error) => return Err(Error::Io(error)),
         };
-        if !original_metadata.is_file() {
-            return self.not_found(request);
-        }
         let modtime = mod_time(&original_metadata);
         let useful_modtime = modtime.is_some_and(|time| time.unix != 0 && time.unix != 1);
 
@@ -559,13 +557,10 @@ impl FileServerHandler {
                 )));
             }
             let (sidecar_file, info) = match open_regular(&sidecar).await {
-                Ok(opened) => opened,
-                Err(error) if is_symlink_refusal(&error) => return Ok(forbidden()),
-                Err(_) => continue,
+                Ok(Opened::Regular(file, metadata)) => (file, metadata),
+                Ok(Opened::Symlink) => return Ok(forbidden()),
+                Ok(Opened::NotRegular) | Err(_) => continue,
             };
-            if !info.is_file() {
-                continue;
-            }
             representation = sidecar;
             representation_metadata = info;
             representation_file = sidecar_file;
@@ -1223,15 +1218,32 @@ async fn path_contains_symlink(path: &Path, root: &Path) -> Result<bool> {
     }
 }
 
+/// Largest ETag sidecar read; real ETags are a few dozen bytes.
+const MAX_ETAG_SIDECAR: u64 = 1024;
+
 /// Read an ETag from a sidecar file (`etag_file_extensions`), removing newlines like Caddy.
 async fn read_etag_sidecar(filename: &Path, suffixes: &[String]) -> Result<Option<String>> {
+    use tokio::io::AsyncReadExt;
     for suffix in suffixes {
         let candidate = PathBuf::from(format!("{}{suffix}", filename.display()));
-        match fs::read(&candidate).await {
-            Ok(bytes) => {
+        // Opened like the served file: a symlinked or special sidecar is ignored (never followed),
+        // and at most `MAX_ETAG_SIDECAR + 1` bytes are read; a longer one is ignored too.
+        let read = async {
+            let Opened::Regular(file, _) = open_regular(&candidate).await? else {
+                return Ok(None);
+            };
+            let mut bytes = Vec::new();
+            file.take(MAX_ETAG_SIDECAR + 1)
+                .read_to_end(&mut bytes)
+                .await?;
+            Ok::<_, std::io::Error>(Some(bytes))
+        };
+        match read.await {
+            Ok(Some(bytes)) if bytes.len() as u64 <= MAX_ETAG_SIDECAR => {
                 let text = String::from_utf8_lossy(&bytes).replace('\n', "");
                 return Ok(Some(text));
             }
+            Ok(_) => continue,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
                 return Err(Error::Handler {
@@ -1930,31 +1942,75 @@ fn forbidden() -> Outcome {
     Outcome::Respond(Response::text(StatusCode::FORBIDDEN, "403 Forbidden"))
 }
 
-/// Open `path` for reading and return the handle with its own `fstat` metadata. On unix the final
-/// component is opened with `O_NOFOLLOW` (the crate's symlink policy is "refuse", so a symlink
-/// swapped in after [`path_contains_symlink`] fails with `ELOOP` instead of being followed) and
-/// `O_NONBLOCK` (so a FIFO swapped in cannot hang the open; it is rejected as not-a-file).
+/// Result of [`open_regular`].
+enum Opened {
+    /// A regular file, opened, with its own `fstat` metadata.
+    Regular(fs::File, std::fs::Metadata),
+    /// The path is not a regular file (directory, FIFO, device, socket): never opened.
+    NotRegular,
+    /// The final component is a symlink: the crate's policy is to refuse (403).
+    Symlink,
+}
+
+/// Open `path` for reading. The path's own `lstat` type is checked first, so a special file
+/// (device, FIFO, socket) or symlink is never opened at all. On unix the open then uses
+/// `O_NOFOLLOW` (a symlink swapped in after [`path_contains_symlink`] fails instead of being
+/// followed) and `O_NONBLOCK` (a FIFO swapped in cannot hang the open); the handle's `fstat` is
+/// re-checked to be a regular file.
 ///
 /// Residual: `O_NOFOLLOW` covers only the last component; an intermediate directory swapped for a
-/// symlink inside the same window is not caught by the open. Closing that needs `openat2`
-/// (`RESOLVE_NO_SYMLINKS`) or a per-component `openat` walk, which this crate does not do.
-async fn open_regular(path: &Path) -> std::io::Result<(fs::File, std::fs::Metadata)> {
+/// symlink inside the same window is not caught by the open. Closing that needs
+/// `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` or a per-component `openat` walk (for example
+/// via `rustix`, present in the lock file only as a transitive dependency); this crate does not
+/// add a direct dependency for it. Exploiting it needs write access inside the web root.
+async fn open_regular(path: &Path) -> std::io::Result<Opened> {
+    if let Ok(link) = fs::symlink_metadata(path).await {
+        let kind = link.file_type();
+        if kind.is_symlink() {
+            return Ok(Opened::Symlink);
+        }
+        if !kind.is_file() {
+            return Ok(Opened::NotRegular);
+        }
+    }
     #[cfg(test)]
     run_before_open_hook(path);
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    let file = options.open(path).await?;
+    let file = match options.open(path).await {
+        Ok(file) => file,
+        Err(error) if is_symlink_refusal(&error) => return Ok(Opened::Symlink),
+        Err(error) => return Err(error),
+    };
     let metadata = file.metadata().await?;
-    Ok((file, metadata))
+    if !metadata.is_file() {
+        return Ok(Opened::NotRegular);
+    }
+    Ok(Opened::Regular(file, metadata))
 }
 
-/// Whether an open failed because the final component is a symlink (`O_NOFOLLOW` reports `ELOOP`).
+/// Whether an open failed because the final component is a symlink: `O_NOFOLLOW` reports `ELOOP`
+/// on Linux/macOS/OpenBSD, `EMLINK` on FreeBSD and `EFTYPE` on NetBSD.
 fn is_symlink_refusal(error: &std::io::Error) -> bool {
     #[cfg(unix)]
     {
-        error.raw_os_error() == Some(libc::ELOOP)
+        let Some(code) = error.raw_os_error() else {
+            return false;
+        };
+        if code == libc::ELOOP {
+            return true;
+        }
+        #[cfg(target_os = "freebsd")]
+        if code == libc::EMLINK {
+            return true;
+        }
+        #[cfg(target_os = "netbsd")]
+        if code == libc::EFTYPE {
+            return true;
+        }
+        false
     }
     #[cfg(not(unix))]
     {
@@ -3297,6 +3353,99 @@ mod tests {
             .insert(header::IF_NONE_MATCH, "\"custom-etag\"".parse().unwrap());
         let response = respond(&handler, request).await;
         assert_eq!(response.status, StatusCode::NOT_MODIFIED);
+    }
+
+    fn etag_handler(root: &Path) -> FileServerHandler {
+        FileServerHandler::from_json(
+            &serde_json::json!({
+                "handler": "file_server", "root": root, "etag_file_extensions": [".etag"]
+            }),
+            "handler",
+        )
+        .unwrap()
+    }
+
+    /// B2 round 2: the ETag sidecar is opened like the file (no final symlink followed), so a
+    /// planted `x.txt.etag -> /outside/secret` cannot copy the target's bytes into the ETag.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn etag_sidecar_symlink_is_not_followed() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), b"\"LEAKED-SECRET\"").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.txt");
+        std::fs::write(&file, b"0123456789").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), dir.path().join("x.txt.etag"))
+            .unwrap();
+        let response = respond(
+            &etag_handler(dir.path()),
+            make_request(Method::GET, "/x.txt"),
+        )
+        .await;
+        let etag = header(&response, header::ETAG);
+        assert!(
+            !etag.contains("LEAKED"),
+            "the symlinked sidecar was followed: {etag}"
+        );
+        assert_eq!(etag, calculate_etag(&std::fs::metadata(&file).unwrap()));
+    }
+
+    /// An absurdly large sidecar is ignored (read capped at 1 KiB), not loaded into memory and
+    /// echoed into a header.
+    #[tokio::test]
+    async fn oversized_etag_sidecar_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.txt");
+        std::fs::write(&file, b"0123456789").unwrap();
+        std::fs::write(dir.path().join("x.txt.etag"), vec![b'a'; 5000]).unwrap();
+        let response = respond(
+            &etag_handler(dir.path()),
+            make_request(Method::GET, "/x.txt"),
+        )
+        .await;
+        assert_eq!(
+            header(&response, header::ETAG),
+            calculate_etag(&std::fs::metadata(&file).unwrap())
+        );
+    }
+
+    /// B2 round 2: a special file is rejected from the path's `lstat` type BEFORE any `open` is
+    /// attempted (opening a device or FIFO can have side effects), and without hanging.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn special_files_are_rejected_before_they_are_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if !made.is_ok_and(|status| status.success()) {
+            eprintln!("skipping: mkfifo is not available");
+            return;
+        }
+        let opened = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&opened);
+        install_open_hook(fifo.clone(), move || {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let handler = handler(dir.path()).await;
+        for method in [Method::GET, Method::HEAD] {
+            let outcome = handler
+                .serve_file(
+                    make_request(method, "/pipe"),
+                    &fifo,
+                    &fifo.to_string_lossy(),
+                    dir.path(),
+                )
+                .await
+                .unwrap();
+            let Outcome::Respond(response) = outcome else {
+                panic!("expected a response");
+            };
+            assert_eq!(response.status, StatusCode::NOT_FOUND);
+        }
+        assert!(
+            !opened.load(std::sync::atomic::Ordering::SeqCst),
+            "a FIFO must be rejected from its lstat type before open() is attempted"
+        );
     }
 
     #[tokio::test]
