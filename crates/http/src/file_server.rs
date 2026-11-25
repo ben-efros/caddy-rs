@@ -15,9 +15,10 @@ use bytes::Bytes;
 use http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use tokio::fs;
 
+use crate::body::StreamingResponse;
 use crate::handlers::clean_path;
 use crate::matchers::{glob_match, percent_decode};
-use crate::types::{Error, Handler, Outcome, Request, Response, Result};
+use crate::types::{Error, Handler, Outcome, Request, Response, Result, StreamingOutcome};
 
 fn invalid(path: &str, message: impl Into<String>) -> Error {
     Error::InvalidConfig {
@@ -460,9 +461,16 @@ impl FileServerHandler {
     /// absolute filename. Automatic entries from [`auto_hide_entries`] are absolute, so this is
     /// where the relative app data/config directories become effective.
     fn hidden(&self, filename: &str, request: &Request) -> bool {
+        self.hide_matcher(request).is_hidden(filename)
+    }
+
+    /// Expand the `hide` entries (placeholders, absolute paths) once, so a directory listing does
+    /// not redo that work for every entry and pattern.
+    fn hide_matcher(&self, request: &Request) -> HideMatcher {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         // On Windows `PathBuf` yields `\` separators, which the `/`-based matching below would never
         // split on (so `hide .env` never matched a basename); compare in `/` form, case-insensitively.
+        // Normalising here, once per entry, keeps that behaviour while still expanding only once.
         let normalise = |path: String| -> String {
             if cfg!(windows) {
                 path.replace('\\', "/").to_ascii_lowercase()
@@ -470,16 +478,28 @@ impl FileServerHandler {
                 path
             }
         };
-        let filename_abs = normalise(
-            fast_abs(Path::new(filename), &cwd)
-                .to_string_lossy()
-                .into_owned(),
-        );
-        self.hide.iter().any(|pattern| {
-            // Caddy: `hide[i] = repl.ReplaceAll(fsrv.Hide[i], "")` (staticfiles.go).
-            let expanded = request.replace_all(pattern);
-            hide_entry_matches(&expanded, &filename_abs, &cwd, cfg!(windows))
-        })
+        let patterns: Vec<String> = self
+            .hide
+            .iter()
+            .filter_map(|pattern| {
+                // Caddy: `hide[i] = repl.ReplaceAll(fsrv.Hide[i], "")` (staticfiles.go).
+                let expanded = request.replace_all(pattern);
+                // An empty expansion (for example a missing placeholder) never hides anything.
+                if expanded.is_empty() {
+                    return None;
+                }
+                Some(if expanded.contains('/') || expanded.contains('\\') {
+                    normalise(
+                        fast_abs(Path::new(&expanded), &cwd)
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                } else {
+                    expanded
+                })
+            })
+            .collect();
+        HideMatcher { cwd, patterns }
     }
 
     /// Serve one regular file through Caddy's `ServeContent` pipeline.
@@ -496,9 +516,16 @@ impl FileServerHandler {
                 "403 Forbidden",
             )));
         }
-        let original_metadata = fs::metadata(filename)
-            .await
-            .map_err(|error| Error::Io(error))?;
+        // Open once. Every validator below (ETag, Last-Modified, size, is_file) comes from this
+        // handle's `fstat`, and the bytes are read from the same handle, so a file swapped after
+        // the path checks cannot be served under another file's validators, and a final symlink
+        // swapped in is refused by the open itself (`O_NOFOLLOW`).
+        let (original_file, original_metadata) = match open_regular(filename).await {
+            Ok(Opened::Regular(file, metadata)) => (file, metadata),
+            Ok(Opened::Symlink) => return Ok(forbidden()),
+            Ok(Opened::NotRegular) => return self.not_found(request),
+            Err(error) => return Err(Error::Io(error)),
+        };
         let modtime = mod_time(&original_metadata);
         let useful_modtime = modtime.is_some_and(|time| time.unix != 0 && time.unix != 1);
 
@@ -510,6 +537,7 @@ impl FileServerHandler {
         // Precompressed sidecar selection (Caddy's `AcceptedEncodings` loop).
         let mut representation = filename.to_path_buf();
         let mut representation_metadata = original_metadata;
+        let mut representation_file = original_file;
         let mut content_encoding: Option<&str> = None;
         for encoding in accepted_encodings(&request, &self.precompressed_order) {
             if !self.precompressed.iter().any(|format| format == &encoding) {
@@ -528,14 +556,14 @@ impl FileServerHandler {
                     "403 Forbidden",
                 )));
             }
-            let Ok(info) = fs::metadata(&sidecar).await else {
-                continue;
+            let (sidecar_file, info) = match open_regular(&sidecar).await {
+                Ok(Opened::Regular(file, metadata)) => (file, metadata),
+                Ok(Opened::Symlink) => return Ok(forbidden()),
+                Ok(Opened::NotRegular) | Err(_) => continue,
             };
-            if info.is_dir() {
-                continue;
-            }
             representation = sidecar;
             representation_metadata = info;
+            representation_file = sidecar_file;
             content_encoding = Some(match encoding.as_str() {
                 "gzip" => "gzip",
                 "br" => "br",
@@ -618,7 +646,10 @@ impl FileServerHandler {
             }
         }
 
-        let body = Bytes::from(fs::read(&representation).await.map_err(Error::Io)?);
+        // SEC-MEDIUM-HTTP B2: nothing is read from disk yet. Preconditions (304/412), HEAD and
+        // Range responses are decided from `stat` alone, and only the bytes a response actually
+        // carries are read afterwards, so a 1-byte range, a HEAD or a 304 of a multi-GiB file
+        // costs no memory.
         let size = representation_metadata.len();
 
         // Conditional requests, following Go's `checkPreconditions` (RFC 7232 section 6).
@@ -657,20 +688,18 @@ impl FileServerHandler {
             .get(header::RANGE)
             .and_then(|value| value.to_str().ok());
         let if_range_ok = check_if_range(&request, &etag, modtime, useful_modtime);
+        let head = request.method == http::Method::HEAD;
+        // `size` is the open handle's length (see above); the handle is also what the bytes are
+        // read from. A HEAD drops it without reading (it still proved the file is readable).
+        let available = size;
+        let file = (!head).then_some(representation_file);
         let RangePlan {
             status,
             mut headers,
-            body,
+            segments,
             send_size,
             ranged,
-        } = match apply_ranges(
-            request.method == http::Method::HEAD,
-            headers,
-            range_header,
-            if_range_ok,
-            size,
-            body,
-        ) {
+        } = match apply_ranges(head, headers, range_header, if_range_ok, size, available) {
             RangeOutcome::Serve(plan) => plan,
             RangeOutcome::Reject(response) => return Ok(Outcome::Respond(response)),
         };
@@ -686,6 +715,18 @@ impl FileServerHandler {
             );
         }
 
+        // Materialise the body: nothing for HEAD; a large body is handed to the streaming path
+        // (when the caller runs one) instead of being read into memory.
+        let mut body = Bytes::new();
+        if let Some(mut file) = file {
+            if streaming_requested() && file_bytes(&segments) > STREAM_THRESHOLD {
+                stash_streamed_file(StreamedFile { file, segments });
+            } else {
+                body = read_segments(&mut file, &segments)
+                    .await
+                    .map_err(Error::Io)?;
+            }
+        }
         let mut response = Response {
             status,
             headers,
@@ -693,9 +734,6 @@ impl FileServerHandler {
         };
         if let Some(override_status) = self.status_override(&request)? {
             response.status = override_status;
-        }
-        if request.method == http::Method::HEAD {
-            response.body = Bytes::new();
         }
         Ok(Outcome::Respond(response))
     }
@@ -841,7 +879,12 @@ impl Handler for FileServerHandler {
                 )));
             }
             if let Some(browse) = &self.browse {
-                let body = browse_html(&filename, request.uri.clone(), relative, browse).await?;
+                let matcher = self.hide_matcher(&request);
+                let body =
+                    browse_html(&filename, request.uri.clone(), relative, browse, &|entry| {
+                        matcher.is_hidden(entry)
+                    })
+                    .await?;
                 return Ok(Outcome::Respond(Response::bytes(
                     StatusCode::OK,
                     "text/html; charset=utf-8",
@@ -888,6 +931,30 @@ impl Handler for FileServerHandler {
         let original_name = filename.to_string_lossy().to_string();
         self.serve_file(request, &filename, &original_name, &root)
             .await
+    }
+
+    /// The streaming path runs the same request logic as [`Handler::handle`] (so every header,
+    /// precondition and range rule is shared) but lets `serve_file` hand a large body over as an
+    /// open file to stream in chunks instead of reading it into memory (SEC-MEDIUM-HTTP B2).
+    async fn handle_streaming(&self, request: Request) -> Result<StreamingOutcome> {
+        let (outcome, streamed) = STREAMED_FILE
+            .scope(std::cell::RefCell::new(None), async {
+                let outcome = self.handle(request).await;
+                let streamed = STREAMED_FILE.with(|slot| slot.borrow_mut().take());
+                (outcome, streamed)
+            })
+            .await;
+        Ok(match outcome? {
+            Outcome::Continue(request) => StreamingOutcome::Continue(request),
+            Outcome::Respond(response) => match streamed {
+                Some(streamed) => StreamingOutcome::Respond(StreamingResponse::new(
+                    response.status,
+                    response.headers,
+                    stream_file(streamed),
+                )),
+                None => StreamingOutcome::Respond(StreamingResponse::from_buffered(response)),
+            },
+        })
     }
 }
 
@@ -1151,15 +1218,39 @@ async fn path_contains_symlink(path: &Path, root: &Path) -> Result<bool> {
     }
 }
 
+/// Largest ETag sidecar read; real ETags are a few dozen bytes.
+const MAX_ETAG_SIDECAR: u64 = 1024;
+
 /// Read an ETag from a sidecar file (`etag_file_extensions`), removing newlines like Caddy.
 async fn read_etag_sidecar(filename: &Path, suffixes: &[String]) -> Result<Option<String>> {
+    use tokio::io::AsyncReadExt;
     for suffix in suffixes {
         let candidate = PathBuf::from(format!("{}{suffix}", filename.display()));
-        match fs::read(&candidate).await {
-            Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes).replace('\n', "");
+        // Opened like the served file: a symlinked or special sidecar is ignored (never followed),
+        // and at most `MAX_ETAG_SIDECAR + 1` bytes are read; a longer one is ignored too.
+        let read = async {
+            let Opened::Regular(file, _) = open_regular(&candidate).await? else {
+                return Ok(None);
+            };
+            let mut bytes = Vec::new();
+            file.take(MAX_ETAG_SIDECAR + 1)
+                .read_to_end(&mut bytes)
+                .await?;
+            Ok::<_, std::io::Error>(Some(bytes))
+        };
+        match read.await {
+            Ok(Some(bytes)) if bytes.len() as u64 <= MAX_ETAG_SIDECAR => {
+                // Newlines are removed like Caddy; a CR (CRLF files) and surrounding whitespace
+                // are stripped too. A value that still is not a valid header value (control
+                // characters) is ignored, so the computed ETag is used instead of a 500.
+                let text = String::from_utf8_lossy(&bytes).replace(['\r', '\n'], "");
+                let text = text.trim().to_string();
+                if HeaderValue::from_str(&text).is_err() {
+                    continue;
+                }
                 return Ok(Some(text));
             }
+            Ok(_) => continue,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
                 return Err(Error::Handler {
@@ -1492,25 +1583,56 @@ enum RangeOutcome {
     Reject(Response),
 }
 
+/// One piece of a response body, described without reading the file: either literal bytes
+/// (multipart framing) or a byte span of the representation read from disk when it is sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BodySegment {
+    Literal(Bytes),
+    File { start: u64, length: u64 },
+}
+
+/// Bytes of the representation the segments will read from disk.
+fn file_bytes(segments: &[BodySegment]) -> u64 {
+    segments
+        .iter()
+        .map(|segment| match segment {
+            BodySegment::File { length, .. } => *length,
+            BodySegment::Literal(_) => 0,
+        })
+        .sum()
+}
+
+/// Total length of the response body the segments describe.
+fn segments_len(segments: &[BodySegment]) -> u64 {
+    segments
+        .iter()
+        .map(|segment| match segment {
+            BodySegment::File { length, .. } => *length,
+            BodySegment::Literal(bytes) => bytes.len() as u64,
+        })
+        .sum()
+}
+
 /// The representation slice a successful `Range` request resolved to.
 struct RangePlan {
     status: StatusCode,
     headers: HeaderMap,
-    body: Bytes,
+    segments: Vec<BodySegment>,
     send_size: u64,
     /// Whether a byte range was applied (Go always sets `Content-Length` for range responses).
     ranged: bool,
 }
 
 /// Apply the request's `Range` header to a representation whose `size` was staged from `stat` and
-/// whose contents were read into `body`, following Go's `parseRange`/`serveContent`.
+/// of which `available` bytes exist on the open handle, following Go's `parseRange`/`serveContent`.
+/// No file content is read here: the plan only describes which spans to read.
 fn apply_ranges(
     head: bool,
     mut headers: HeaderMap,
     range_header: Option<&str>,
     if_range_ok: bool,
     size: u64,
-    body: Bytes,
+    available: u64,
 ) -> RangeOutcome {
     let mut ranges = match range_header {
         Some(header) if if_range_ok => parse_range(header, size as i64),
@@ -1522,7 +1644,10 @@ fn apply_ranges(
         .unwrap_or("")
         .to_string();
     let mut status = StatusCode::OK;
-    let mut body = body;
+    let mut segments = vec![BodySegment::File {
+        start: 0,
+        length: size,
+    }];
     let mut send_size = size;
     match ranges {
         Err(RangeError::NoOverlap) if size == 0 => {
@@ -1565,7 +1690,7 @@ fn apply_ranges(
                 .expect("content range is a valid header value"),
         );
         send_size = range.length as u64;
-        let Some((range_start, range_end)) = range_bounds(&range, body.len()) else {
+        let Some((range_start, range_end)) = range_bounds(&range, available) else {
             // The file shrank between `stat` and `read`: the `Content-Range` staged above is
             // stale, so replace it with RFC 7233's unsatisfied form (`bytes */<complete-length>`)
             // rather than advertising a range the representation no longer has.
@@ -1576,11 +1701,15 @@ fn apply_ranges(
                 "invalid range: the file changed while it was being served",
             ));
         };
-        body = Bytes::copy_from_slice(&body[range_start..range_end]);
+        segments = vec![BodySegment::File {
+            start: range_start,
+            length: range_end - range_start,
+        }];
     } else if ranges.len() > 1 {
         status = StatusCode::PARTIAL_CONTENT;
         let boundary = multipart_boundary();
-        let Some(multipart) = multipart_body(&ranges, &content_type, size as i64, &boundary, &body)
+        let Some(multipart) =
+            multipart_segments(&ranges, &content_type, size as i64, &boundary, available)
         else {
             // Same stale-range condition as the single-range arm above: answer 416 with the
             // unsatisfied `Content-Range` instead of failing the request with a 500.
@@ -1596,8 +1725,8 @@ fn apply_ranges(
             HeaderValue::from_str(&format!("multipart/byteranges; boundary={boundary}"))
                 .expect("multipart content type is a valid header value"),
         );
-        send_size = multipart.len() as u64;
-        body = Bytes::from(multipart);
+        send_size = segments_len(&multipart);
+        segments = multipart;
         if !content_encoding_present(&headers) {
             headers.remove(header::CONTENT_RANGE);
         }
@@ -1605,7 +1734,7 @@ fn apply_ranges(
     RangeOutcome::Serve(RangePlan {
         status,
         headers,
-        body,
+        segments,
         send_size,
         ranged: !ranges.is_empty(),
     })
@@ -1702,42 +1831,290 @@ fn multipart_boundary() -> String {
     output
 }
 
-/// Clamp a parsed byte range to the bytes actually read from disk. Returns `None` when the range
-/// does not fit, which happens when the file changed between `stat` and `read`; callers must turn
-/// that into a rejection instead of slicing out of bounds.
-fn range_bounds(range: &ByteRange, available: usize) -> Option<(usize, usize)> {
-    let start = usize::try_from(range.start).ok()?;
-    let length = usize::try_from(range.length).ok()?;
+/// Clamp a parsed byte range to the bytes that exist on the open handle. Returns `None` when the
+/// range does not fit, which happens when the file changed between `stat` and `open`; callers must
+/// turn that into a rejection instead of reading past the end.
+fn range_bounds(range: &ByteRange, available: u64) -> Option<(u64, u64)> {
+    let start = u64::try_from(range.start).ok()?;
+    let length = u64::try_from(range.length).ok()?;
     let end = start.checked_add(length)?;
     (end <= available).then_some((start, end))
 }
 
-/// Build a `multipart/byteranges` body, or `None` when a range no longer fits the bytes actually
-/// read from disk (the file shrank between `stat` and `read`).
-fn multipart_body(
+/// Describe a `multipart/byteranges` body, or `None` when a range no longer fits the bytes that
+/// exist on the open handle (the file shrank between `stat` and `open`). Only the framing is
+/// materialised; each part's content stays a [`BodySegment::File`] span read when sent.
+fn multipart_segments(
     ranges: &[ByteRange],
     content_type: &str,
     size: i64,
     boundary: &str,
-    representation: &[u8],
-) -> Option<Vec<u8>> {
-    let mut body = Vec::new();
+    available: u64,
+) -> Option<Vec<BodySegment>> {
+    let mut segments = Vec::with_capacity(ranges.len() * 2 + 1);
     for range in ranges {
-        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-        body.extend_from_slice(
+        let mut framing = Vec::new();
+        framing.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        framing.extend_from_slice(
             format!("Content-Range: {}\r\n", range.content_range(size)).as_bytes(),
         );
-        body.extend_from_slice(format!("Content-Type: {content_type}\r\n").as_bytes());
-        body.extend_from_slice(b"\r\n");
-        let Some((start, end)) = range_bounds(range, representation.len()) else {
-            return None;
-        };
-        // INFEASIBLE: `range_bounds` proved `start..end` lies inside `representation`.
-        body.extend_from_slice(&representation[start..end]);
-        body.extend_from_slice(b"\r\n");
+        framing.extend_from_slice(format!("Content-Type: {content_type}\r\n").as_bytes());
+        framing.extend_from_slice(b"\r\n");
+        segments.push(BodySegment::Literal(Bytes::from(framing)));
+        let (start, end) = range_bounds(range, available)?;
+        segments.push(BodySegment::File {
+            start,
+            length: end - start,
+        });
+        segments.push(BodySegment::Literal(Bytes::from_static(b"\r\n")));
     }
-    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-    Some(body)
+    segments.push(BodySegment::Literal(Bytes::from(format!(
+        "--{boundary}--\r\n"
+    ))));
+    Some(segments)
+}
+
+/// Bodies whose file content exceeds this are streamed from the file handle instead of read into
+/// memory first (when the caller runs the streaming path). Smaller bodies are read inline, which
+/// keeps small-file latency and framing exactly as before.
+const STREAM_THRESHOLD: u64 = 256 * 1024;
+
+/// Chunk size of a streamed file body.
+const STREAM_CHUNK: usize = 64 * 1024;
+
+/// Read the file spans of `segments` (and splice the literals) into one buffer. Only used for
+/// bodies at or below [`STREAM_THRESHOLD`] and by the buffered compatibility path.
+async fn read_segments(file: &mut fs::File, segments: &[BodySegment]) -> std::io::Result<Bytes> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut body = Vec::with_capacity(usize::try_from(segments_len(segments)).unwrap_or(0));
+    for segment in segments {
+        match segment {
+            BodySegment::Literal(bytes) => body.extend_from_slice(bytes),
+            BodySegment::File { start, length } => {
+                file.seek(std::io::SeekFrom::Start(*start)).await?;
+                let read = file.take(*length).read_to_end(&mut body).await?;
+                if (read as u64) < *length {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "the file changed while it was being served",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(Bytes::from(body))
+}
+
+/// `hide` entries after placeholder and absolute-path expansion (see
+/// [`FileServerHandler::hide_matcher`]).
+struct HideMatcher {
+    cwd: PathBuf,
+    patterns: Vec<String>,
+}
+
+impl HideMatcher {
+    /// Caddy's `fileHidden` against one filesystem path.
+    fn is_hidden(&self, filename: &str) -> bool {
+        // The basename comparison below splits on `/`, and glob matching is case-insensitive on
+        // Windows, so the filename is put in the same normalised form as the expanded patterns.
+        let filename_abs = {
+            let path = fast_abs(Path::new(filename), &self.cwd)
+                .to_string_lossy()
+                .into_owned();
+            if cfg!(windows) {
+                path.replace('\\', "/").to_ascii_lowercase()
+            } else {
+                path
+            }
+        };
+        self.patterns.iter().any(|pattern| {
+            if !pattern.contains('/') {
+                if filename_abs
+                    .split('/')
+                    .any(|component| glob_match(pattern, component, cfg!(windows)))
+                {
+                    return true;
+                }
+            } else if let Some(rest) = filename_abs.strip_prefix(pattern.as_str()) {
+                if rest.starts_with('/') {
+                    return true;
+                }
+            }
+            glob_match(pattern, &filename_abs, cfg!(windows))
+        })
+    }
+}
+
+fn forbidden() -> Outcome {
+    Outcome::Respond(Response::text(StatusCode::FORBIDDEN, "403 Forbidden"))
+}
+
+/// Result of [`open_regular`].
+enum Opened {
+    /// A regular file, opened, with its own `fstat` metadata.
+    Regular(fs::File, std::fs::Metadata),
+    /// The path is not a regular file (directory, FIFO, device, socket): never opened.
+    NotRegular,
+    /// The final component is a symlink: the crate's policy is to refuse (403).
+    Symlink,
+}
+
+/// Open `path` for reading. The path's own `lstat` type is checked first, so a special file
+/// (device, FIFO, socket) or symlink is never opened at all. On unix the open then uses
+/// `O_NOFOLLOW` (a symlink swapped in after [`path_contains_symlink`] fails instead of being
+/// followed) and `O_NONBLOCK` (a FIFO swapped in cannot hang the open); the handle's `fstat` is
+/// re-checked to be a regular file.
+///
+/// Residual: `O_NOFOLLOW` covers only the last component; an intermediate directory swapped for a
+/// symlink inside the same window is not caught by the open. Closing that needs
+/// `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` or a per-component `openat` walk (for example
+/// via `rustix`, present in the lock file only as a transitive dependency); this crate does not
+/// add a direct dependency for it. Exploiting it needs write access inside the web root.
+async fn open_regular(path: &Path) -> std::io::Result<Opened> {
+    if let Ok(link) = fs::symlink_metadata(path).await {
+        let kind = link.file_type();
+        if kind.is_symlink() {
+            return Ok(Opened::Symlink);
+        }
+        if !kind.is_file() {
+            return Ok(Opened::NotRegular);
+        }
+    }
+    #[cfg(test)]
+    run_before_open_hook(path);
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = match options.open(path).await {
+        Ok(file) => file,
+        Err(error) if is_symlink_refusal(&error) => return Ok(Opened::Symlink),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata().await?;
+    if !metadata.is_file() {
+        return Ok(Opened::NotRegular);
+    }
+    Ok(Opened::Regular(file, metadata))
+}
+
+/// Whether an open failed because the final component is a symlink: `O_NOFOLLOW` reports `ELOOP`
+/// on Linux/macOS/OpenBSD, `EMLINK` on FreeBSD and `EFTYPE` on NetBSD.
+fn is_symlink_refusal(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        let Some(code) = error.raw_os_error() else {
+            return false;
+        };
+        if code == libc::ELOOP {
+            return true;
+        }
+        #[cfg(target_os = "freebsd")]
+        if code == libc::EMLINK {
+            return true;
+        }
+        #[cfg(target_os = "netbsd")]
+        if code == libc::EFTYPE {
+            return true;
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+/// Test seam: runs between the path-based checks and the single `open`, so a test can swap the
+/// file deterministically (the window a real attacker races).
+#[cfg(test)]
+type OpenHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+#[cfg(test)]
+static BEFORE_OPEN_HOOKS: std::sync::Mutex<Vec<(PathBuf, OpenHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn run_before_open_hook(path: &Path) {
+    let hook = BEFORE_OPEN_HOOKS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(hooked, _)| hooked == path)
+        .map(|(_, hook)| hook.clone());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// A response body to stream from an open file.
+struct StreamedFile {
+    file: fs::File,
+    segments: Vec<BodySegment>,
+}
+
+tokio::task_local! {
+    /// Set by [`FileServerHandler::handle_streaming`] around the shared request logic. When it is
+    /// present, `serve_file` parks large bodies here instead of buffering them.
+    static STREAMED_FILE: std::cell::RefCell<Option<StreamedFile>>;
+}
+
+/// Whether the current request is being served on the streaming path.
+fn streaming_requested() -> bool {
+    STREAMED_FILE.try_with(|_| ()).is_ok()
+}
+
+fn stash_streamed_file(streamed: StreamedFile) {
+    // INFEASIBLE: only called when `streaming_requested()` held in the same task.
+    let _ = STREAMED_FILE.try_with(|slot| *slot.borrow_mut() = Some(streamed));
+}
+
+/// Turn a parked file into a chunked body. The producer task stops as soon as the client goes away
+/// (the receiver is dropped), and a file that shrinks mid-transfer ends the body with an I/O error
+/// so the connection is aborted instead of delivering a silently truncated representation.
+fn stream_file(streamed: StreamedFile) -> crate::body::Body {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let (sender, receiver) = tokio::sync::mpsc::channel(2);
+    // Exact length of everything the producer below will send, so `Content-Length` survives the
+    // server's framing policy (Go's `ServeContent` always sets it).
+    let total = segments_len(&streamed.segments);
+    tokio::spawn(async move {
+        let StreamedFile { mut file, segments } = streamed;
+        for segment in segments {
+            match segment {
+                BodySegment::Literal(bytes) => {
+                    if sender.send(Ok(bytes)).await.is_err() {
+                        return;
+                    }
+                }
+                BodySegment::File { start, length } => {
+                    if let Err(error) = file.seek(std::io::SeekFrom::Start(start)).await {
+                        let _ = sender.send(Err(error.into())).await;
+                        return;
+                    }
+                    let mut remaining = length;
+                    while remaining > 0 {
+                        let want = remaining.min(STREAM_CHUNK as u64) as usize;
+                        let mut chunk = vec![0u8; want];
+                        match file.read_exact(&mut chunk).await {
+                            Ok(_) => {}
+                            Err(error) => {
+                                let _ = sender.send(Err(error.into())).await;
+                                return;
+                            }
+                        }
+                        remaining -= want as u64;
+                        if sender.send(Ok(Bytes::from(chunk))).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    crate::body::Body::from_stream(crate::body::StreamingBody::from_chunks_with_len(
+        receiver, total,
+    ))
 }
 
 async fn browse_html(
@@ -1745,12 +2122,19 @@ async fn browse_html(
     uri: Uri,
     relative: &str,
     options: &BrowseOptions,
+    is_hidden: &(dyn Fn(&str) -> bool + Sync),
 ) -> Result<Vec<u8>> {
     let mut entries = fs::read_dir(root).await?;
     let mut names = Vec::new();
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name().to_string_lossy().to_string();
         let path = entry.path();
+        // SEC-MEDIUM-HTTP B3: an entry the `hide` setting makes unfetchable (404) must not be
+        // listed either; names and mtimes of `.env`/`.git` would otherwise leak. Caddy's
+        // `directoryListing` skips `fileHidden` entries the same way.
+        if is_hidden(&path.to_string_lossy()) {
+            continue;
+        }
         let file_type = entry.file_type().await.ok();
         let is_dir = file_type
             .map(|file_type| file_type.is_dir())
@@ -2129,6 +2513,140 @@ mod tests {
         );
     }
 
+    /// SEC-MEDIUM-HTTP B3 review: stock Caddy's `fileHidden` matches a name-only pattern against
+    /// every component of the filesystem path. A root below a matching directory (`hide [".*"]`
+    /// with root `/home/u/.www`) therefore 404s the request itself before any listing is built, so
+    /// the listing can never be "emptied" by an ancestor match; and below an unrelated root a
+    /// name-only pattern hides exactly the entries whose own name matches.
+    #[tokio::test]
+    async fn browse_hide_matches_entry_names_and_an_ancestor_match_404s_the_request() {
+        let base = tempfile::Builder::new().prefix("site").tempdir().unwrap();
+        let hidden_root = base.path().join(".www");
+        std::fs::create_dir(&hidden_root).unwrap();
+        std::fs::write(hidden_root.join("a.txt"), b"a").unwrap();
+        let visible_root = base.path().join("www");
+        std::fs::create_dir(&visible_root).unwrap();
+        std::fs::write(visible_root.join("a.txt"), b"a").unwrap();
+        std::fs::write(visible_root.join(".env"), b"SECRET=1").unwrap();
+
+        let build = |root: &Path| {
+            FileServerHandler::from_json(
+                &serde_json::json!({
+                    "handler": "file_server", "root": root, "browse": {}, "hide": [".*"]
+                }),
+                "handler",
+            )
+            .unwrap()
+        };
+        let under_hidden = build(&hidden_root);
+        for path in ["/", "/a.txt"] {
+            let response = respond(&under_hidden, make_request(Method::GET, path)).await;
+            assert_eq!(response.status, StatusCode::NOT_FOUND, "{path}");
+        }
+        let response = respond(&build(&visible_root), make_request(Method::GET, "/")).await;
+        let listing = String::from_utf8(response.body.to_vec()).unwrap();
+        assert!(listing.contains("a.txt"), "{listing}");
+        assert!(!listing.contains(".env"), "{listing}");
+    }
+
+    fn install_open_hook(path: PathBuf, hook: impl Fn() + Send + Sync + 'static) {
+        BEFORE_OPEN_HOOKS
+            .lock()
+            .unwrap()
+            .push((path, std::sync::Arc::new(hook)));
+    }
+
+    /// SEC-MEDIUM-HTTP B2 review: the symlink policy is checked on the path, so a regular file
+    /// swapped for a symlink between that check and the `open` must still be refused (the open
+    /// itself must not follow a final symlink), not served from outside the root.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_swapped_in_after_the_path_check_is_refused() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), b"TOP SECRET").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let served = dir.path().join("file.txt");
+        std::fs::write(&served, b"public").unwrap();
+        let secret = outside.path().join("secret.txt");
+        let target = served.clone();
+        install_open_hook(served.clone(), move || {
+            std::fs::remove_file(&target).unwrap();
+            std::os::unix::fs::symlink(&secret, &target).unwrap();
+        });
+        let handler = handler(dir.path()).await;
+        let outcome = handler.handle(make_request(Method::GET, "/file.txt")).await;
+        let leaked = matches!(
+            &outcome,
+            Ok(Outcome::Respond(response)) if response.body.starts_with(b"TOP")
+        );
+        assert!(!leaked, "a symlink swapped in after the check was followed");
+        let Ok(Outcome::Respond(response)) = outcome else {
+            panic!("expected a response");
+        };
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+    }
+
+    /// The validators (ETag, Content-Length) must describe the file that is actually served, taken
+    /// from the open handle, not from a `stat` of the path that a swap can invalidate.
+    #[tokio::test]
+    async fn validators_come_from_the_opened_file_not_a_stale_stat() {
+        let dir = tempfile::tempdir().unwrap();
+        let served = dir.path().join("swap.txt");
+        std::fs::write(&served, b"old").unwrap();
+        let replacement = dir.path().join("replacement.tmp");
+        std::fs::write(&replacement, b"a much longer replacement body").unwrap();
+        set_mtime(&replacement, 1_700_000_123);
+        let (target, source) = (served.clone(), replacement.clone());
+        install_open_hook(served.clone(), move || {
+            std::fs::rename(&source, &target).unwrap();
+        });
+        let handler = handler(dir.path()).await;
+        let response = respond(&handler, make_request(Method::GET, "/swap.txt")).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response.body,
+            Bytes::from_static(b"a much longer replacement body")
+        );
+        assert_eq!(
+            header(&response, header::ETAG),
+            calculate_etag(&std::fs::metadata(&served).unwrap()),
+            "the ETag must describe the served (swapped-in) file"
+        );
+        assert_eq!(
+            header(&response, header::CONTENT_LENGTH),
+            "30",
+            "Content-Length must be the served file's size"
+        );
+    }
+
+    /// HEAD must behave like GET for a file the process cannot read: Caddy opens the file first,
+    /// so it never answers 200 headers for something GET would fail on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn head_of_an_unreadable_file_fails_like_get() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("locked.txt");
+        std::fs::write(&file, b"secret").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&file).is_ok() {
+            eprintln!("skipping: running with privileges that bypass file permissions");
+            return;
+        }
+        let handler = handler(dir.path()).await;
+        let get = handler
+            .handle(make_request(Method::GET, "/locked.txt"))
+            .await;
+        let head = handler
+            .handle(make_request(Method::HEAD, "/locked.txt"))
+            .await;
+        assert!(get.is_err(), "GET of an unreadable file must fail");
+        assert!(
+            head.is_err(),
+            "HEAD of an unreadable file must fail like GET, not return 200 headers"
+        );
+    }
+
     #[tokio::test]
     async fn serves_directory_index() {
         let dir = tempfile::tempdir().unwrap();
@@ -2226,6 +2744,225 @@ mod tests {
             header(&response, header::CONTENT_LENGTH),
             response.body.len().to_string()
         );
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|index| (index % 251) as u8).collect()
+    }
+
+    async fn streamed(handler: &FileServerHandler, request: Request) -> (Response, bool) {
+        let StreamingOutcome::Respond(response) = handler.handle_streaming(request).await.unwrap()
+        else {
+            panic!("expected a response");
+        };
+        let was_stream = matches!(response.body, crate::body::Body::Stream(_));
+        let body = response.body.into_bytes().await.unwrap();
+        (
+            Response {
+                status: response.status,
+                headers: response.headers,
+                body,
+            },
+            was_stream,
+        )
+    }
+
+    /// Streamed bodies (above the threshold) are byte-identical to the buffered path, for full,
+    /// single-range and multipart responses.
+    #[tokio::test]
+    async fn streamed_bodies_match_the_content_and_buffered_framing() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = pattern(1_000_000);
+        std::fs::write(dir.path().join("big.txt"), &content).unwrap();
+        let handler = handler(dir.path()).await;
+
+        let (response, was_stream) =
+            streamed(&handler, make_request(Method::GET, "/big.txt")).await;
+        assert!(was_stream, "a large body must be streamed");
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, content);
+        assert_eq!(header(&response, header::CONTENT_LENGTH), "1000000");
+
+        let mut request = make_request(Method::GET, "/big.txt");
+        request
+            .headers
+            .insert(header::RANGE, "bytes=100-599999".parse().unwrap());
+        let (response, was_stream) = streamed(&handler, request).await;
+        assert!(was_stream);
+        assert_eq!(response.status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.body, content[100..600_000]);
+        assert_eq!(
+            header(&response, header::CONTENT_RANGE),
+            "bytes 100-599999/1000000"
+        );
+
+        let mut request = make_request(Method::GET, "/big.txt");
+        request.headers.insert(
+            header::RANGE,
+            "bytes=0-299999,400000-699999".parse().unwrap(),
+        );
+        let (response, was_stream) = streamed(&handler, request).await;
+        assert!(was_stream);
+        assert_eq!(response.status, StatusCode::PARTIAL_CONTENT);
+        let boundary = header(&response, header::CONTENT_TYPE)
+            .strip_prefix("multipart/byteranges; boundary=")
+            .expect("multipart")
+            .to_string();
+        let mut expected = Vec::new();
+        for (start, end) in [(0usize, 299_999usize), (400_000, 699_999)] {
+            expected.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Range: bytes {start}-{end}/1000000\r\n\
+                     Content-Type: text/plain; charset=utf-8\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            expected.extend_from_slice(&content[start..=end]);
+            expected.extend_from_slice(b"\r\n");
+        }
+        expected.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        assert_eq!(response.body.len(), expected.len());
+        assert!(response.body == expected, "multipart body differs");
+        assert_eq!(
+            header(&response, header::CONTENT_LENGTH),
+            expected.len().to_string()
+        );
+    }
+
+    /// Small bodies keep the inline read (no producer task, same framing as before).
+    #[tokio::test]
+    async fn small_bodies_are_not_streamed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("small.txt"), pattern(1000)).unwrap();
+        let handler = handler(dir.path()).await;
+        let (response, was_stream) =
+            streamed(&handler, make_request(Method::GET, "/small.txt")).await;
+        assert!(!was_stream);
+        assert_eq!(response.body, pattern(1000));
+    }
+
+    /// Range correctness at the start, middle and end, suffix and open-ended ranges, multiple
+    /// ranges, and `If-Range` (validator match serves the range; mismatch serves the full file).
+    #[tokio::test]
+    async fn range_variants_read_exactly_the_requested_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = pattern(100);
+        std::fs::write(dir.path().join("f.bin"), &content).unwrap();
+        set_mtime(&dir.path().join("f.bin"), 1_700_000_000);
+        let handler = handler(dir.path()).await;
+
+        let cases: [(&str, usize, usize); 6] = [
+            ("bytes=0-0", 0, 1),
+            ("bytes=50-59", 50, 60),
+            ("bytes=99-99", 99, 100),
+            ("bytes=-10", 90, 100),
+            ("bytes=90-", 90, 100),
+            ("bytes=95-1000", 95, 100),
+        ];
+        for (spec, start, end) in cases {
+            let mut request = make_request(Method::GET, "/f.bin");
+            request.headers.insert(header::RANGE, spec.parse().unwrap());
+            let response = respond(&handler, request).await;
+            assert_eq!(response.status, StatusCode::PARTIAL_CONTENT, "{spec}");
+            assert_eq!(response.body, content[start..end], "{spec}");
+            assert_eq!(
+                header(&response, header::CONTENT_RANGE),
+                format!("bytes {}-{}/100", start, end - 1),
+                "{spec}"
+            );
+            assert_eq!(
+                header(&response, header::CONTENT_LENGTH),
+                (end - start).to_string(),
+                "{spec}"
+            );
+        }
+
+        let mut request = make_request(Method::GET, "/f.bin");
+        request
+            .headers
+            .insert(header::RANGE, "bytes=0-9,20-29".parse().unwrap());
+        let response = respond(&handler, request).await;
+        assert_eq!(response.status, StatusCode::PARTIAL_CONTENT);
+        let text = response.body.to_vec();
+        for window in [&content[0..10], &content[20..30]] {
+            assert!(text.windows(10).any(|candidate| candidate == window));
+        }
+
+        // If-Range with the current ETag keeps the range; a stale one serves everything.
+        let head = respond(&handler, make_request(Method::HEAD, "/f.bin")).await;
+        let etag = header(&head, header::ETAG);
+        let mut request = make_request(Method::GET, "/f.bin");
+        request
+            .headers
+            .insert(header::RANGE, "bytes=10-19".parse().unwrap());
+        request
+            .headers
+            .insert(header::IF_RANGE, etag.parse().unwrap());
+        let response = respond(&handler, request).await;
+        assert_eq!(response.status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.body, content[10..20]);
+
+        let mut request = make_request(Method::GET, "/f.bin");
+        request
+            .headers
+            .insert(header::RANGE, "bytes=10-19".parse().unwrap());
+        request
+            .headers
+            .insert(header::IF_RANGE, "\"stale\"".parse().unwrap());
+        let response = respond(&handler, request).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, content);
+
+        // Past the end is still a 416 and a HEAD with a range reports the range without a body.
+        let mut request = make_request(Method::GET, "/f.bin");
+        request
+            .headers
+            .insert(header::RANGE, "bytes=100-".parse().unwrap());
+        assert_eq!(
+            respond(&handler, request).await.status,
+            StatusCode::RANGE_NOT_SATISFIABLE
+        );
+        let mut request = make_request(Method::HEAD, "/f.bin");
+        request
+            .headers
+            .insert(header::RANGE, "bytes=10-19".parse().unwrap());
+        let response = respond(&handler, request).await;
+        assert_eq!(response.status, StatusCode::PARTIAL_CONTENT);
+        assert!(response.body.is_empty());
+        assert_eq!(header(&response, header::CONTENT_LENGTH), "10");
+    }
+
+    /// A file that shrinks between `stat` and the read must not deliver a truncated 200 or panic:
+    /// the buffered read reports it as an I/O error.
+    #[tokio::test]
+    async fn read_segments_reports_a_file_shorter_than_planned() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("short.bin"), b"abc").unwrap();
+        let mut file = fs::File::open(dir.path().join("short.bin")).await.unwrap();
+        let error = read_segments(
+            &mut file,
+            &[BodySegment::File {
+                start: 0,
+                length: 10,
+            }],
+        )
+        .await
+        .expect_err("short file");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        let body = read_segments(
+            &mut file,
+            &[
+                BodySegment::Literal(Bytes::from_static(b"[")),
+                BodySegment::File {
+                    start: 1,
+                    length: 2,
+                },
+                BodySegment::Literal(Bytes::from_static(b"]")),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(body, Bytes::from_static(b"[bc]"));
     }
 
     #[tokio::test]
@@ -2623,6 +3360,131 @@ mod tests {
             .insert(header::IF_NONE_MATCH, "\"custom-etag\"".parse().unwrap());
         let response = respond(&handler, request).await;
         assert_eq!(response.status, StatusCode::NOT_MODIFIED);
+    }
+
+    fn etag_handler(root: &Path) -> FileServerHandler {
+        FileServerHandler::from_json(
+            &serde_json::json!({
+                "handler": "file_server", "root": root, "etag_file_extensions": [".etag"]
+            }),
+            "handler",
+        )
+        .unwrap()
+    }
+
+    /// B2 round 2: the ETag sidecar is opened like the file (no final symlink followed), so a
+    /// planted `x.txt.etag -> /outside/secret` cannot copy the target's bytes into the ETag.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn etag_sidecar_symlink_is_not_followed() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), b"\"LEAKED-SECRET\"").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.txt");
+        std::fs::write(&file, b"0123456789").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), dir.path().join("x.txt.etag"))
+            .unwrap();
+        let response = respond(
+            &etag_handler(dir.path()),
+            make_request(Method::GET, "/x.txt"),
+        )
+        .await;
+        let etag = header(&response, header::ETAG);
+        assert!(
+            !etag.contains("LEAKED"),
+            "the symlinked sidecar was followed: {etag}"
+        );
+        assert_eq!(etag, calculate_etag(&std::fs::metadata(&file).unwrap()));
+    }
+
+    /// B2 round 3: editors write CRLF; the CR is stripped (not a 500), and a sidecar whose content
+    /// is not a valid header value falls back to the computed ETag instead of failing the request.
+    #[tokio::test]
+    async fn etag_sidecar_crlf_is_stripped_and_invalid_values_fall_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.txt");
+        std::fs::write(&file, b"0123456789").unwrap();
+        let sidecar = dir.path().join("x.txt.etag");
+        let handler = etag_handler(dir.path());
+
+        std::fs::write(&sidecar, b"\"v1\"\r\n").unwrap();
+        let response = respond(&handler, make_request(Method::GET, "/x.txt")).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(header(&response, header::ETAG), "\"v1\"");
+
+        std::fs::write(&sidecar, b"\"v2\"  \n\n").unwrap();
+        let response = respond(&handler, make_request(Method::GET, "/x.txt")).await;
+        assert_eq!(header(&response, header::ETAG), "\"v2\"");
+
+        std::fs::write(&sidecar, b"\"bad\x01etag\"\n").unwrap();
+        let response = respond(&handler, make_request(Method::GET, "/x.txt")).await;
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "an invalid sidecar must not 500"
+        );
+        assert_eq!(
+            header(&response, header::ETAG),
+            calculate_etag(&std::fs::metadata(&file).unwrap())
+        );
+    }
+
+    /// An absurdly large sidecar is ignored (read capped at 1 KiB), not loaded into memory and
+    /// echoed into a header.
+    #[tokio::test]
+    async fn oversized_etag_sidecar_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.txt");
+        std::fs::write(&file, b"0123456789").unwrap();
+        std::fs::write(dir.path().join("x.txt.etag"), vec![b'a'; 5000]).unwrap();
+        let response = respond(
+            &etag_handler(dir.path()),
+            make_request(Method::GET, "/x.txt"),
+        )
+        .await;
+        assert_eq!(
+            header(&response, header::ETAG),
+            calculate_etag(&std::fs::metadata(&file).unwrap())
+        );
+    }
+
+    /// B2 round 2: a special file is rejected from the path's `lstat` type BEFORE any `open` is
+    /// attempted (opening a device or FIFO can have side effects), and without hanging.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn special_files_are_rejected_before_they_are_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if !made.is_ok_and(|status| status.success()) {
+            eprintln!("skipping: mkfifo is not available");
+            return;
+        }
+        let opened = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&opened);
+        install_open_hook(fifo.clone(), move || {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let handler = handler(dir.path()).await;
+        for method in [Method::GET, Method::HEAD] {
+            let outcome = handler
+                .serve_file(
+                    make_request(method, "/pipe"),
+                    &fifo,
+                    &fifo.to_string_lossy(),
+                    dir.path(),
+                )
+                .await
+                .unwrap();
+            let Outcome::Respond(response) = outcome else {
+                panic!("expected a response");
+            };
+            assert_eq!(response.status, StatusCode::NOT_FOUND);
+        }
+        assert!(
+            !opened.load(std::sync::atomic::Ordering::SeqCst),
+            "a FIFO must be rejected from its lstat type before open() is attempted"
+        );
     }
 
     #[tokio::test]
@@ -3227,7 +4089,7 @@ mod tests {
             length: 10,
         }];
         assert!(
-            multipart_body(&ranges, "text/plain", 100, "boundary", b"short").is_none(),
+            multipart_segments(&ranges, "text/plain", 100, "boundary", 5).is_none(),
             "range beyond the read bytes must be rejected"
         );
     }
@@ -3237,14 +4099,7 @@ mod tests {
     /// `Content-Range: bytes */<complete-length>`, not the stale `bytes <start>-<end>/<size>`.
     #[test]
     fn stale_single_range_is_416_with_unsatisfied_content_range() {
-        let outcome = apply_ranges(
-            false,
-            HeaderMap::new(),
-            Some("bytes=5-9"),
-            true,
-            10,
-            Bytes::from_static(b"short"),
-        );
+        let outcome = apply_ranges(false, HeaderMap::new(), Some("bytes=5-9"), true, 10, 5);
         let RangeOutcome::Reject(response) = outcome else {
             panic!("a stale single range must be rejected");
         };
@@ -3266,14 +4121,7 @@ mod tests {
     /// arm: 416 with `Content-Range: bytes */<complete-length>`, never a 500.
     #[test]
     fn stale_multipart_range_is_416_with_unsatisfied_content_range() {
-        let outcome = apply_ranges(
-            false,
-            HeaderMap::new(),
-            Some("bytes=0-1,4-5"),
-            true,
-            10,
-            Bytes::from_static(b"short"),
-        );
+        let outcome = apply_ranges(false, HeaderMap::new(), Some("bytes=0-1,4-5"), true, 10, 5);
         let RangeOutcome::Reject(response) = outcome else {
             panic!("a stale multipart range must be rejected");
         };
@@ -3298,14 +4146,7 @@ mod tests {
     /// `Content-Range`.
     #[test]
     fn valid_single_range_still_returns_206_with_its_content_range() {
-        let outcome = apply_ranges(
-            false,
-            HeaderMap::new(),
-            Some("bytes=0-1"),
-            true,
-            10,
-            Bytes::from_static(b"0123456789"),
-        );
+        let outcome = apply_ranges(false, HeaderMap::new(), Some("bytes=0-1"), true, 10, 10);
         let RangeOutcome::Serve(plan) = outcome else {
             panic!("a valid range must be served");
         };
@@ -3317,7 +4158,13 @@ mod tests {
             Some("bytes 0-1/10")
         );
         assert_eq!(plan.send_size, 2);
-        assert_eq!(plan.body, Bytes::from_static(b"01"));
+        assert_eq!(
+            plan.segments,
+            vec![BodySegment::File {
+                start: 0,
+                length: 2
+            }]
+        );
         assert!(plan.ranged);
     }
 
@@ -3325,14 +4172,7 @@ mod tests {
     /// top-level `Content-Range`.
     #[test]
     fn valid_multipart_range_still_returns_206() {
-        let outcome = apply_ranges(
-            false,
-            HeaderMap::new(),
-            Some("bytes=0-1,4-5"),
-            true,
-            10,
-            Bytes::from_static(b"0123456789"),
-        );
+        let outcome = apply_ranges(false, HeaderMap::new(), Some("bytes=0-1,4-5"), true, 10, 10);
         let RangeOutcome::Serve(plan) = outcome else {
             panic!("a valid multipart range must be served");
         };
@@ -3343,11 +4183,105 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with("multipart/byteranges; boundary=")));
         assert!(plan.headers.get(header::CONTENT_RANGE).is_none());
-        assert_eq!(plan.send_size, plan.body.len() as u64);
+        assert_eq!(plan.send_size, segments_len(&plan.segments));
+        assert_eq!(file_bytes(&plan.segments), 4);
         assert!(plan.ranged);
     }
 
     // --- the two honoured options change what is SERVED (T-BROWSE-OPTIONS-SILENTLY-DROPPED) ------
+
+    // --- SEC-MEDIUM-HTTP B3: the browse listing honours `hide` -----------------------------------
+
+    fn hidden_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("visible.txt"), "v").unwrap();
+        std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
+        std::fs::write(dir.path().join("notes.bak"), "b").unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/.env"), "SECRET=2").unwrap();
+        std::fs::write(dir.path().join("sub/ok.txt"), "o").unwrap();
+        dir
+    }
+
+    /// Names, mtimes and existence of hidden files must not leak through a directory listing that
+    /// the same `hide` setting makes unfetchable (Caddy's `directoryListing` skips `fileHidden`).
+    #[tokio::test]
+    async fn browse_listing_omits_hidden_entries_in_the_root_and_in_subdirectories() {
+        let dir = hidden_fixture();
+        let handler = configured_handler(
+            dir.path(),
+            serde_json::json!({
+                "browse": {"plain_time_format": " UTC"},
+                "hide": [".env", ".git", "*.bak"]
+            }),
+        );
+        for path in ["/", "/sub/"] {
+            let response = respond(&handler, make_request(Method::GET, path)).await;
+            assert_eq!(response.status, StatusCode::OK, "{path}");
+            let body = String::from_utf8(response.body.to_vec()).unwrap();
+            assert!(!body.contains(".env"), "{path} leaked .env: {body}");
+            assert!(!body.contains(".git"), "{path} leaked .git: {body}");
+            assert!(!body.contains("notes.bak"), "{path} leaked *.bak: {body}");
+        }
+        let root = String::from_utf8(
+            respond(&handler, make_request(Method::GET, "/"))
+                .await
+                .body
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            root.contains("visible.txt") && root.contains("sub/"),
+            "{root}"
+        );
+        let sub = String::from_utf8(
+            respond(&handler, make_request(Method::GET, "/sub/"))
+                .await
+                .body
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(sub.contains("ok.txt"), "{sub}");
+
+        // The hidden entry is also not fetchable, so listing and fetch now agree.
+        let response = respond(&handler, make_request(Method::GET, "/.env")).await;
+        assert_eq!(response.status, StatusCode::NOT_FOUND);
+    }
+
+    /// Without `hide` the listing is unchanged (dotfiles are served by default, like Caddy), and a
+    /// path-style hide entry (absolute path) hides that entry from the listing too.
+    #[tokio::test]
+    async fn browse_listing_is_unchanged_without_hide_and_honours_path_entries() {
+        let dir = hidden_fixture();
+        let handler =
+            configured_handler(dir.path(), serde_json::json!({"browse": true, "hide": []}));
+        let body = String::from_utf8(
+            respond(&handler, make_request(Method::GET, "/"))
+                .await
+                .body
+                .to_vec(),
+        )
+        .unwrap();
+        for name in [".env", ".git", "notes.bak", "visible.txt"] {
+            assert!(body.contains(name), "{name} missing without hide: {body}");
+        }
+
+        let absolute = dir.path().join("notes.bak");
+        let handler = configured_handler(
+            dir.path(),
+            serde_json::json!({"browse": true, "hide": [absolute.to_string_lossy()]}),
+        );
+        let body = String::from_utf8(
+            respond(&handler, make_request(Method::GET, "/"))
+                .await
+                .body
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!body.contains("notes.bak"), "{body}");
+        assert!(body.contains(".env"), "{body}");
+    }
 
     fn browse_fixture() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();

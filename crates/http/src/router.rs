@@ -892,7 +892,9 @@ impl RouterBuilder {
             "templates" => Arc::new(TemplatesHandler::from_json(value, path)?),
             "file_server" => Arc::new(FileServerHandler::from_json(value, path)?),
             "forward_auth" => Arc::new(ForwardAuthHandler::from_json(value, path)?),
-            "authentication" | "basic_auth" => Arc::new(BasicAuthHandler::from_json(value, path)?),
+            "authentication" | "basic_auth" => Arc::new(
+                BasicAuthHandler::from_json_with_stock_compat(value, path, context.stock_compat)?,
+            ),
             "subroute" => {
                 // Caddy's `subroute.routes` is optional (`json:"routes,omitempty"`): absent,
                 // `null` and an empty array all mean "no routes", which compiles to a no-op that

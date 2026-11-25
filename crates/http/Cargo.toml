@@ -56,6 +56,11 @@ tokio-rustls = { version = "0.26.6", default-features = false, features = [
 zstd = { version = "0.14", optional = true }
 maxminddb = "0.33.0"
 
+# Only for the `O_NOFOLLOW`/`O_NONBLOCK`/`ELOOP` constants used when opening served files
+# (no unsafe code; the crate stays `forbid(unsafe_code)`).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+
 [dev-dependencies]
 caddy-rs-config = { workspace = true }
 tempfile = "3.27.0"
