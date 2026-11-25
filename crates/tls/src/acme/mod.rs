@@ -3082,7 +3082,12 @@ EVdZ8IcAQzAPk1jBxj0YDC0rR5d09Q==
         let mut parent = files[0].parent().unwrap().to_path_buf();
         while parent != directory.path() {
             let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o700, "{} must be 0700, got {mode:o}", parent.display());
+            assert_eq!(
+                mode,
+                0o700,
+                "{} must be 0700, got {mode:o}",
+                parent.display()
+            );
             parent = parent.parent().unwrap().to_path_buf();
         }
     }
@@ -3182,7 +3187,11 @@ EVdZ8IcAQzAPk1jBxj0YDC0rR5d09Q==
         let pid = std::process::id();
         std::fs::create_dir_all(directory.path().join("acme")).unwrap();
         let stale: Vec<PathBuf> = (0..4)
-            .map(|counter| directory.path().join(format!("acme/k.{pid}.0.{counter}.tmp")))
+            .map(|counter| {
+                directory
+                    .path()
+                    .join(format!("acme/k.{pid}.0.{counter}.tmp"))
+            })
             .chain((0..4).map(|counter| directory.path().join(format!("acme/k.{counter}.tmp"))))
             .collect();
         for path in &stale {
@@ -3199,17 +3208,24 @@ EVdZ8IcAQzAPk1jBxj0YDC0rR5d09Q==
 
     #[tokio::test]
     async fn keys_that_do_not_name_a_file_are_rejected() {
-        let directory = tempfile::tempdir().unwrap();
-        let storage = FileStorage::new(directory.path());
+        // Own the enclosing directory rather than using the system temp root: the check below
+        // looks for escaped temporary files beside the storage root, and the system temp root is
+        // shared with every other test (and process) on the machine, so a `.tmp` file created by
+        // something unrelated would fail this test spuriously -- and a real leak into a
+        // per-test directory would not be observed by scanning a shared one.
+        let enclosing = tempfile::tempdir().unwrap();
+        let directory = enclosing.path().join("storage");
+        std::fs::create_dir(&directory).unwrap();
+        let storage = FileStorage::new(&directory);
         for key in [".", "acme/.", "acme/x/", "acme/"] {
             assert!(
                 matches!(storage.store(key, b"x").await, Err(Error::InvalidKey(_))),
                 "{key:?} must be rejected"
             );
         }
-        // Nothing was created beside the root by the rejected writes.
-        let parent = directory.path().parent().unwrap();
-        let leaked = std::fs::read_dir(parent)
+        // Nothing was created beside the root by the rejected writes. The root's parent is this
+        // test's own directory, so only files this storage could have written are visible.
+        let leaked = std::fs::read_dir(enclosing.path())
             .unwrap()
             .filter_map(|entry| entry.ok())
             .any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"));
