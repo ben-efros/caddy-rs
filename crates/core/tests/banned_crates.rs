@@ -289,36 +289,23 @@ fn audit_policy_does_not_ignore_the_banned_advisories() {
         eprintln!("banned-crates guard: no {}", audit_toml.display());
         return;
     };
-    // The ban is delete-don't-ignore for a crate banned OUTRIGHT: an ignore entry would re-admit
-    // it silently, so those advisories may never appear in the policy.
+    // Every entry is delete-don't-ignore, and T-SEC-141 is what made that uniform: replacing
+    // `axum-test` removed the only route to `chrono`, so `chrono` moved to `allowed: false` and
+    // the `CHRONO_ALLOWANCE` special case went with it. For a crate banned OUTRIGHT an ignore
+    // entry would re-admit it silently, so its advisory may never appear in the policy at all.
     //
-    // A crate carrying `allowed: true` is the opposite case, and the distinction is load-bearing:
-    // it is permitted to stay in the lockfile precisely because no version can ever satisfy the
-    // audit gate, which means the ONLY way to pass that gate is an explicit, reasoned ignore.
-    // Forbidding the ignore for an allowed crate would not remove the dependency -- it would just
-    // make the gate unpassable, and the pressure would move to weakening the gate itself. So the
-    // rule is derived from the same table that decides the lockfile ban, rather than from a
-    // second hardcoded list that can drift out of agreement with it. Each allowed ignore is still
-    // checked: it must be an advisory this table knows about, and the audit policy must state a
-    // reason for it rather than listing a bare id.
+    // The table still carries an `allowed` flag, and if it ever gains a `true` entry again the
+    // rule for it is the one this loop used to implement: an allowed crate stays in the lockfile
+    // because no version can satisfy the audit gate, so an explicit, reasoned ignore is the only
+    // way to pass, and forbidding it would not remove the dependency -- it would make the gate
+    // unpassable and move the pressure to weakening the gate itself. That branch is gone rather
+    // than left dead, because it cannot be exercised while every entry is banned outright.
     for banned in &BANNED {
         let id = banned.advisory;
-        if banned.allowed {
-            if let Some(line) = contents.lines().find(|l| l.contains(id)) {
-                assert!(
-                    !line.trim_start().starts_with(&format!("\"{id}\"")),
-                    "{} ignores {id} ({}) with no reason on the line. An allowance is permitted \
-                     only with its justification, so a reviewer sees why: {}",
-                    audit_toml.display(),
-                    banned.name,
-                    CHRONO_ALLOWANCE
-                );
-            }
-            continue;
-        }
         assert!(
             !contents.contains(id),
-            "{} must not ignore {id} ({}); the banned crates are banned outright",
+            "{} must not mention {id} ({}); every banned crate is banned outright, so an ignore \
+             entry would silently re-admit one whose advisory can never be satisfied",
             audit_toml.display(),
             banned.name
         );
