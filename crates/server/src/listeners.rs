@@ -2777,6 +2777,81 @@ struct AdminService {
     api: AdminApi,
 }
 
+/// Largest admin request body accepted (SEC-MEDIUM-ADMIN-SERVER A2). Stock Caddy reads `/load`
+/// and `/adapt` bodies with an unbounded `io.Copy`; 64 MiB is far above any real configuration
+/// while stopping a multi-gigabyte POST from exhausting memory. `stock_compat true` lifts it.
+pub(crate) const ADMIN_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// The body cap for the next admin request: [`ADMIN_MAX_BODY_BYTES`], or none when the active
+/// generation sets `stock_compat true`.
+fn admin_body_limit(api: &AdminApi) -> Option<usize> {
+    let stock_compat = api
+        .store()
+        .current()
+        .is_some_and(|generation| generation.config().stock_compat());
+    (!stock_compat).then_some(ADMIN_MAX_BODY_BYTES)
+}
+
+/// Read an admin request body under `limit` (`None` = unbounded).
+///
+/// An over-cap body (declared by `Content-Length` or streamed) is `413`; a transport failure
+/// mid-body is `400` rather than the empty body the listeners used to substitute, which ran
+/// `/load` and friends against a silently truncated request.
+async fn read_admin_body<B>(
+    headers: &http::HeaderMap,
+    body: B,
+    limit: Option<usize>,
+) -> Result<Bytes, caddy_rs_admin::AdminResponse>
+where
+    B: hyper::body::Body<Data = Bytes>,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    use caddy_rs_admin::AdminResponse;
+    use http::StatusCode;
+    let too_large = || {
+        AdminResponse::api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body exceeds the admin API size limit",
+        )
+    };
+    let Some(limit) = limit else {
+        return body.collect().await.map(|collected| collected.to_bytes()).map_err(|error| {
+            AdminResponse::api_error(
+                StatusCode::BAD_REQUEST,
+                format!("reading request body: {error}"),
+            )
+        });
+    };
+    let declared = headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    if declared.is_some_and(|length| length > limit as u64) {
+        return Err(too_large());
+    }
+    match http_body_util::Limited::new(body, limit).collect().await {
+        Ok(collected) => Ok(collected.to_bytes()),
+        Err(error) if error.downcast_ref::<http_body_util::LengthLimitError>().is_some() => {
+            Err(too_large())
+        }
+        Err(error) => Err(AdminResponse::api_error(
+            StatusCode::BAD_REQUEST,
+            format!("reading request body: {error}"),
+        )),
+    }
+}
+
+/// Convert an admin response to the hyper response the connection serves.
+fn admin_hyper_response(response: caddy_rs_admin::AdminResponse) -> hyper::Response<Body> {
+    let mut builder = hyper::Response::builder().status(response.status);
+    for (name, value) in &response.headers {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(Body::from_bytes(response.body))
+        .expect("admin response is valid")
+}
+
 impl Clone for AdminService {
     fn clone(&self) -> Self {
         Self {
@@ -2796,9 +2871,11 @@ impl hyper::service::Service<hyper::Request<Incoming>> for AdminService {
         let api = self.api.clone();
         Box::pin(async move {
             let (parts, body) = request.into_parts();
-            let body = match body.collect().await {
-                Ok(collected) => collected.to_bytes(),
-                Err(_) => Bytes::new(),
+            let body = match read_admin_body(&parts.headers, body, admin_body_limit(&api)).await {
+                Ok(body) => body,
+                Err(rejection) => {
+                    return Ok::<_, std::convert::Infallible>(admin_hyper_response(rejection))
+                }
             };
             let path = parts
                 .uri
@@ -3180,9 +3257,19 @@ pub(crate) async fn bind_admin_remote(
                             let identity = identity.clone();
                             async move {
                                 let (parts, body) = request.into_parts();
-                                let body = match body.collect().await {
-                                    Ok(collected) => collected.to_bytes(),
-                                    Err(_) => Bytes::new(),
+                                let body = match read_admin_body(
+                                    &parts.headers,
+                                    body,
+                                    admin_body_limit(&api),
+                                )
+                                .await
+                                {
+                                    Ok(body) => body,
+                                    Err(rejection) => {
+                                        return Ok::<_, std::convert::Infallible>(
+                                            admin_hyper_response(rejection),
+                                        )
+                                    }
                                 };
                                 let path = parts
                                     .uri
@@ -3834,6 +3921,113 @@ mod client_certificate_tests {
     }
 }
 
+/// Unit tests for the bounded admin request-body read (SEC-MEDIUM-ADMIN-SERVER A2).
+#[cfg(test)]
+mod admin_body_tests {
+    use super::{admin_body_limit, read_admin_body, ADMIN_MAX_BODY_BYTES};
+    use bytes::Bytes;
+    use caddy_rs_admin::AdminApi;
+    use caddy_rs_core::GenerationStore;
+    use http::{HeaderMap, StatusCode};
+    use http_body_util::Full;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    /// A body that yields `data` and then fails, like a connection dropped mid-request.
+    struct Failing(Option<Bytes>);
+
+    impl hyper::body::Body for Failing {
+        type Data = Bytes;
+        type Error = std::io::Error;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+            match self.0.take() {
+                Some(data) => Poll::Ready(Some(Ok(hyper::body::Frame::data(data)))),
+                None => Poll::Ready(Some(Err(std::io::Error::other("connection reset")))),
+            }
+        }
+    }
+
+    fn body_of(length: usize) -> Full<Bytes> {
+        Full::new(Bytes::from(vec![b'a'; length]))
+    }
+
+    #[tokio::test]
+    async fn body_within_the_limit_is_returned_and_the_boundary_is_inclusive() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            read_admin_body(&headers, body_of(10), Some(10)).await.unwrap().len(),
+            10,
+            "exactly the limit is accepted"
+        );
+        assert_eq!(
+            read_admin_body(&headers, body_of(0), Some(10)).await.unwrap().len(),
+            0
+        );
+        let rejected = read_admin_body(&headers, body_of(11), Some(10))
+            .await
+            .expect_err("one byte over");
+        assert_eq!(rejected.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(String::from_utf8_lossy(&rejected.body).contains("\"error\""));
+    }
+
+    #[tokio::test]
+    async fn declared_content_length_over_the_limit_is_rejected_before_reading() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CONTENT_LENGTH, "11".parse().unwrap());
+        // The body itself is empty: only the header can trigger the rejection.
+        let rejected = read_admin_body(&headers, body_of(0), Some(10))
+            .await
+            .expect_err("declared length over the cap");
+        assert_eq!(rejected.status, StatusCode::PAYLOAD_TOO_LARGE);
+        headers.insert(http::header::CONTENT_LENGTH, "10".parse().unwrap());
+        assert!(read_admin_body(&headers, body_of(10), Some(10)).await.is_ok());
+        // A malformed Content-Length is ignored here (hyper rejects it before the service runs).
+        headers.insert(http::header::CONTENT_LENGTH, "abc".parse().unwrap());
+        assert!(read_admin_body(&headers, body_of(3), Some(10)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn unbounded_read_accepts_any_size() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            read_admin_body(&headers, body_of(4096), None).await.unwrap().len(),
+            4096
+        );
+    }
+
+    #[tokio::test]
+    async fn read_failures_are_400_not_an_empty_body() {
+        let headers = HeaderMap::new();
+        for limit in [Some(1024), None] {
+            let rejected = read_admin_body(&headers, Failing(Some(Bytes::from_static(b"{\"a\":"))), limit)
+                .await
+                .expect_err("a failed read must not become an empty body");
+            assert_eq!(rejected.status, StatusCode::BAD_REQUEST, "limit {limit:?}");
+        }
+    }
+
+    #[test]
+    fn stock_compat_lifts_the_admin_body_cap() {
+        let store = Arc::new(GenerationStore::with_builtin_registry());
+        let api = AdminApi::new(Arc::clone(&store));
+        assert_eq!(
+            admin_body_limit(&api),
+            Some(ADMIN_MAX_BODY_BYTES),
+            "no active generation: capped"
+        );
+        for (stock_compat, expected) in [(false, Some(ADMIN_MAX_BODY_BYTES)), (true, None)] {
+            let config = caddy_rs_core::Config::from_value(serde_json::json!({"stock_compat": stock_compat}))
+            .expect("config");
+            store.load(config).expect("load");
+            assert_eq!(admin_body_limit(&api), expected, "stock_compat {stock_compat}");
+        }
+    }
+}
+
 /// Tests for the Unix-domain-socket admin listener (`admin.listen: "unix/<path>"`).
 #[cfg(test)]
 mod admin_unix_tests {
@@ -3894,6 +4088,39 @@ mod admin_unix_tests {
             !path.exists(),
             "the socket file is removed when the listener stops"
         );
+    }
+
+    /// Send raw request bytes to a unix admin listener and return the response head, giving up
+    /// after a short deadline (an unfixed server waits forever for the announced body).
+    async fn raw_exchange(path: &Path, request: &[u8]) -> String {
+        let mut stream = UnixStream::connect(path).await.expect("connect");
+        stream.write_all(request).await.expect("write request");
+        let mut response = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            stream.read_to_end(&mut response),
+        )
+        .await;
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    #[tokio::test]
+    async fn oversized_admin_request_bodies_are_rejected_with_413() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (configured, path) = unix_listen(directory.path());
+        let handle = bind_admin(&configured, api(), None).await.expect("bind");
+        // Announced length beyond the cap: rejected from the header, without reading a byte.
+        let response = raw_exchange(
+            &path,
+            b"POST /load HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+              Content-Type: application/json\r\nContent-Length: 4294967296\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 413"),
+            "an over-cap Content-Length must be answered 413: {response}"
+        );
+        handle.stop().await;
     }
 
     #[tokio::test]
