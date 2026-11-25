@@ -209,6 +209,76 @@ enum StatusOverride {
     Template(String),
 }
 
+/// Is `path` absolute for the given target's path semantics?
+///
+/// A drive-letter path (`c:/site/x`) is absolute on Windows and merely relative on Unix, so the
+/// host's `Path::is_absolute` cannot answer this when the code is being exercised for another
+/// target (a test, or a cross-compiled build).
+fn is_absolute_for(path: &str, windows: bool) -> bool {
+    windows && {
+        let bytes = path.as_bytes();
+        bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'/' || bytes[2] == b'\\')
+    }
+}
+
+/// Does one hide entry (already placeholder-expanded) hide `filename_abs`?
+///
+/// `filename_abs` is supplied in normalised form: `/` separators, and on Windows lower-cased.
+/// `windows` controls the same normalisation for the entry, so the behaviour can be exercised for
+/// a target that is not the host (a Linux CI run can still prove the Windows path).
+fn hide_entry_matches(expanded: &str, filename_abs: &str, cwd: &Path, windows: bool) -> bool {
+    if expanded.is_empty() {
+        // An empty expansion (for example a missing placeholder) never hides anything.
+        return false;
+    }
+    let normalise = |path: String| -> String {
+        if windows {
+            path.replace('\\', "/").to_ascii_lowercase()
+        } else {
+            path
+        }
+    };
+    // Normalise the separator form BEFORE deciding whether the entry contains a path separator.
+    // A native Windows entry (`C:\\site\\secret.txt`) has no `/` in it, so testing
+    // `contains('/')` on the raw text sent it down the no-separator branch, where it was matched
+    // only as a bare path component and could never match the normalised filename -- turning a
+    // hidden file into a served one.
+    let expanded = normalise(expanded.to_owned());
+    let pattern = if expanded.contains('/') {
+        // Only make the entry absolute when the host's own path semantics say it is relative.
+        // A Windows drive entry (`c:/site/secret.txt`) is absolute for the Windows target but NOT
+        // for `Path::is_absolute` on a Unix host, so probing with the host's `Path` would prefix
+        // the cwd and produce an entry that can never match. Judge absoluteness for the target.
+        if is_absolute_for(expanded.as_str(), windows) || Path::new(&expanded).is_absolute() {
+            expanded
+        } else {
+            normalise(
+                fast_abs(Path::new(&expanded), cwd)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        }
+    } else {
+        expanded
+    };
+    if !pattern.contains('/') {
+        if filename_abs
+            .split('/')
+            .any(|component| glob_match(&pattern, component, windows))
+        {
+            return true;
+        }
+    } else if let Some(rest) = filename_abs.strip_prefix(pattern.as_str()) {
+        if rest.starts_with('/') {
+            return true;
+        }
+    }
+    glob_match(&pattern, filename_abs, windows)
+}
+
 impl FileServerHandler {
     /// Build from Caddy JSON.
     pub fn from_json(value: &serde_json::Value, path: &str) -> Result<Self> {
@@ -408,32 +478,7 @@ impl FileServerHandler {
         self.hide.iter().any(|pattern| {
             // Caddy: `hide[i] = repl.ReplaceAll(fsrv.Hide[i], "")` (staticfiles.go).
             let expanded = request.replace_all(pattern);
-            if expanded.is_empty() {
-                // An empty expansion (for example a missing placeholder) never hides anything.
-                return false;
-            }
-            let pattern = if expanded.contains('/') {
-                normalise(
-                    fast_abs(Path::new(&expanded), &cwd)
-                        .to_string_lossy()
-                        .into_owned(),
-                )
-            } else {
-                expanded
-            };
-            if !pattern.contains('/') {
-                if filename_abs
-                    .split('/')
-                    .any(|component| glob_match(&pattern, component, cfg!(windows)))
-                {
-                    return true;
-                }
-            } else if let Some(rest) = filename_abs.strip_prefix(pattern.as_str()) {
-                if rest.starts_with('/') {
-                    return true;
-                }
-            }
-            glob_match(&pattern, &filename_abs, cfg!(windows))
+            hide_entry_matches(&expanded, &filename_abs, &cwd, cfg!(windows))
         })
     }
 
@@ -1994,7 +2039,14 @@ mod tests {
 
     #[test]
     fn non_windows_treats_backslash_and_colon_as_filename_bytes() {
-        for path in [r"/..\secret.txt", "/C:/x", r"/\x", "/a:b", "/.. /x", "/.../x"] {
+        for path in [
+            r"/..\secret.txt",
+            "/C:/x",
+            r"/\x",
+            "/a:b",
+            "/.. /x",
+            "/.../x",
+        ] {
             assert!(
                 !request_path_escapes_root(path, false),
                 "{path:?} is a literal file name outside Windows"
@@ -2849,6 +2901,33 @@ mod tests {
         let response = respond(&handler, make_request(Method::GET, "/visible.txt")).await;
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.body, Bytes::from_static(b"visible"));
+    }
+
+    /// A hide entry written with native Windows separators must still hide its file.
+    ///
+    /// Regression test: the filename was normalised to `/` form but the entry was not, so
+    /// `C:\\site\\secret.txt` contains no `/`, skipped the absolute-path branch, was compared
+    /// only as a bare path component, and never matched -- serving a hidden file. Driven through
+    /// `hide_entry_matches` with `windows = true` so a Linux CI run proves the Windows behaviour.
+    #[test]
+    fn a_backslash_hide_entry_still_hides_on_windows() {
+        let cwd = Path::new("/srv/site");
+        // The filename as `hidden()` normalises it on Windows: `/` form, lower-cased.
+        let filename_abs = "c:/site/secret.txt";
+        assert!(
+            hide_entry_matches("C:\\site\\secret.txt", filename_abs, cwd, true),
+            "a native Windows absolute entry must hide the file it names"
+        );
+        // A sibling must stay visible: the entry is a path, not a prefix.
+        assert!(
+            !hide_entry_matches("C:\\site\\secret.txt", "c:/site/visible.txt", cwd, true),
+            "the entry must not hide a sibling file"
+        );
+        // Case-insensitive on Windows.
+        assert!(
+            hide_entry_matches("c:\\SITE\\Secret.TXT", filename_abs, cwd, true),
+            "Windows matching is case-insensitive"
+        );
     }
 
     #[tokio::test]
