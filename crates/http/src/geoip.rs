@@ -508,21 +508,21 @@ mod tests {
     fn paths_use_the_names_each_product_ships() {
         let dbip = GeoIpPaths::dbip("/data");
         assert_eq!(
-            dbip.asn.unwrap().to_str().unwrap(),
-            "/data/dbip-asn-lite.mmdb"
+            dbip.asn.unwrap(),
+            std::path::Path::new("/data").join("dbip-asn-lite.mmdb")
         );
         assert_eq!(
-            dbip.country.unwrap().to_str().unwrap(),
-            "/data/dbip-country-lite.mmdb"
+            dbip.country.unwrap(),
+            std::path::Path::new("/data").join("dbip-country-lite.mmdb")
         );
         let maxmind = GeoIpPaths::maxmind("/data");
         assert_eq!(
-            maxmind.asn.unwrap().to_str().unwrap(),
-            "/data/GeoLite2-ASN.mmdb"
+            maxmind.asn.unwrap(),
+            std::path::Path::new("/data").join("GeoLite2-ASN.mmdb")
         );
         assert_eq!(
-            maxmind.country.unwrap().to_str().unwrap(),
-            "/data/GeoLite2-Country.mmdb"
+            maxmind.country.unwrap(),
+            std::path::Path::new("/data").join("GeoLite2-Country.mmdb")
         );
     }
 }

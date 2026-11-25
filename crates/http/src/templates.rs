@@ -300,6 +300,23 @@ fn internal_error_response() -> StreamingResponse {
     }
 }
 
+/// Whether a template file name (`include`, `readFile`, ...) must be refused on `windows`.
+///
+/// `..` is deliberately *not* refused here: `resolve_file_path` clamps it to the root like Caddy's
+/// `http.Dir`. What has no safe clamp on Windows is a name that reaches something other than the
+/// file it spells: an alternate data stream (`a.txt:stream`), a Win32-normalised alias (`a.txt.`,
+/// `a.txt `) or a device (`CON`, `NUL`, `COM1`), or a name the file system cannot hold (`a*`).
+fn template_name_refused(name: &str, windows: bool) -> bool {
+    windows
+        && (name.contains(':')
+            || name.split(['/', '\\']).any(|component| {
+                component != "."
+                    && component != ".."
+                    && component.trim_end_matches(['.', ' ']) != component
+            })
+            || crate::file_server::request_path_names_no_file(name, true))
+}
+
 fn status_allows_body(status: StatusCode) -> bool {
     !(status.as_u16() < 200
         || status == StatusCode::NO_CONTENT
@@ -1800,6 +1817,9 @@ impl<'a> Renderer<'a> {
 
     fn resolve_file_path(&self, name: &str) -> Option<PathBuf> {
         let root = self.root.as_ref()?;
+        if template_name_refused(name, cfg!(windows)) {
+            return None;
+        }
         let mut parts: Vec<std::ffi::OsString> = Vec::new();
         for component in Path::new(name).components() {
             match component {

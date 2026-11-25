@@ -563,7 +563,16 @@ impl FileMatcher {
         // nil/empty), then the root is lexically cleaned. This matters for roots such as
         // `{unknown}/sub`: Caddy cleans `./sub` to `sub`, whereas replacing the placeholder with
         // nothing would produce an absolute `/sub`.
-        path_clean(&expand_root_placeholders(request, &self.root))
+        let expanded = expand_root_placeholders(request, &self.root);
+        // The matcher builds `/`-separated candidate paths and its glob treats `\` as an escape, so a
+        // Windows root spelled `C:\site` must be normalised to `C:/site` first; Windows file APIs
+        // accept `/`. Without this nothing under a Windows root ever matched.
+        let expanded = if cfg!(windows) {
+            expanded.replace('\\', "/")
+        } else {
+            expanded
+        };
+        path_clean(&expanded)
     }
 
     /// Expand and clean one `try_files` pattern into candidate file paths.
@@ -772,10 +781,14 @@ impl Matcher for FileMatcher {
             "matchers.file.relative".to_string(),
             selected.candidate.relative,
         );
-        vars.insert(
-            "matchers.file.absolute".to_string(),
-            selected.candidate.fullpath,
-        );
+        // Internally candidate paths are `/`-separated; Go's `filepath.Join` yields native
+        // separators, so `{http.matchers.file.absolute}` is spelled with `\` on Windows.
+        let absolute = if cfg!(windows) {
+            selected.candidate.fullpath.replace('/', "\\")
+        } else {
+            selected.candidate.fullpath
+        };
+        vars.insert("matchers.file.absolute".to_string(), absolute);
         vars.insert(
             "matchers.file.remainder".to_string(),
             selected.candidate.remainder,
@@ -1400,12 +1413,33 @@ fn expand_placeholders_raw(request: &Request, pattern: &str) -> String {
 }
 
 fn escape_glob_metacharacters(value: &str) -> String {
+    escape_glob_metacharacters_for(value, cfg!(windows))
+}
+
+/// Escape glob metacharacters in a placeholder *value*, for the host's path syntax.
+///
+/// On Unix a backslash escapes (`\*`), like Go's `filepath.Glob`. On Windows `\` is the path
+/// separator and `NormalizedPath` turns it into `/`, which would silently destroy the escape and
+/// leave a live glob (upstream Caddy simply does not escape on Windows). A one-character class
+/// (`[*]`, `[?]`, `[[]`) escapes without any backslash, so it survives separator normalisation.
+fn escape_glob_metacharacters_for(value: &str, windows: bool) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
-        if matches!(character, '*' | '[' | '?' | '\\') {
-            escaped.push('\\');
+        if windows {
+            match character {
+                '*' | '?' | '[' => {
+                    escaped.push('[');
+                    escaped.push(character);
+                    escaped.push(']');
+                }
+                other => escaped.push(other),
+            }
+        } else {
+            if matches!(character, '*' | '[' | '?' | '\\') {
+                escaped.push('\\');
+            }
+            escaped.push(character);
         }
-        escaped.push(character);
     }
     escaped
 }
@@ -1736,6 +1770,13 @@ fn is_local_path(relative: &str) -> bool {
     std::path::Path::new(relative)
         .components()
         .all(|component| matches!(component, Component::Normal(_)))
+        // The `file` matcher decides "this file exists" for `try_files`; it must agree with what
+        // `file_server` will then serve. On Windows that includes refusing the forms that name a
+        // different file than they spell (`a.txt:stream`, `index.html.`), which `file_server`
+        // rejects. (The illegal-character and device-name rules are not applied here: this runs on
+        // glob *patterns*, where `*` and `?` are legal, and `file_server` reports those names as
+        // not found anyway.)
+        && !crate::file_server::request_path_escapes_root(relative, cfg!(windows))
 }
 
 /// Caddy's `strictFileExists`: a path ending in `/` must be a directory; otherwise it must not.
@@ -1963,8 +2004,21 @@ fn unescape_path(input: &[u8]) -> Option<Vec<u8>> {
     Some(output)
 }
 
+/// Percent-decode a URI component like [`percent_decode`], but return `None` when the decoded bytes
+/// are not valid UTF-8 (`%ff`, `%c3%28`, overlong forms such as `%c0%ae`) instead of replacing them
+/// with U+FFFD. Used where the result names a file: different invalid byte sequences must not
+/// collapse into one mangled name.
+pub fn percent_decode_strict(input: &str) -> Option<String> {
+    let decoded = percent_decode_bytes(input);
+    String::from_utf8(decoded).ok()
+}
+
 /// Percent-decode a URI component, leaving malformed escapes untouched.
 pub fn percent_decode(input: &str) -> String {
+    String::from_utf8_lossy(&percent_decode_bytes(input)).into_owned()
+}
+
+fn percent_decode_bytes(input: &str) -> Vec<u8> {
     let bytes = input.as_bytes();
     let mut output = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -1981,7 +2035,7 @@ pub fn percent_decode(input: &str) -> String {
         output.push(bytes[index]);
         index += 1;
     }
-    String::from_utf8_lossy(&output).into_owned()
+    output
 }
 
 fn hex_value(byte: u8) -> Option<u8> {
@@ -2610,7 +2664,8 @@ mod tests {
             Some(
                 nested
                     .path()
-                    .join("site/index.html")
+                    .join("site")
+                    .join("index.html")
                     .to_string_lossy()
                     .as_ref()
             )
@@ -3020,6 +3075,23 @@ mod tests {
             .vars
             .insert("attempt".to_string(), "/../secret.css".to_string());
         assert!(!matcher.matches(&request_for_match));
+    }
+
+    #[test]
+    fn glob_escaping_follows_the_host_path_syntax() {
+        // Unix: backslash escapes.
+        assert_eq!(
+            escape_glob_metacharacters_for("a*b?[c]\\", false),
+            "a\\*b\\?\\[c]\\\\"
+        );
+        // Windows: one-character classes, no backslashes, so separator normalisation cannot undo it.
+        let windows = escape_glob_metacharacters_for("a*b?[c]", true);
+        assert_eq!(windows, "a[*]b[?][[]c]");
+        assert!(!windows.contains('\\'));
+        // The escaped form must be a *literal* match for the original text, and never a glob.
+        assert!(glob_path_match(&windows, "a*b?[c]"));
+        assert!(!glob_path_match(&windows, "aXbY[c]"));
+        assert!(!path_has_glob_meta("x") && path_has_glob_meta(&windows));
     }
 
     #[test]

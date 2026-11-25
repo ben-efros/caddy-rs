@@ -12,11 +12,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
+use http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use tokio::fs;
 
 use crate::handlers::clean_path;
-use crate::matchers::{glob_match, percent_decode};
+use crate::matchers::{glob_match, percent_decode_strict};
 use crate::types::{Error, Handler, Outcome, Request, Response, Result};
 
 fn invalid(path: &str, message: impl Into<String>) -> Error {
@@ -202,6 +202,57 @@ pub struct FileServerHandler {
     precompressed_order: Vec<String>,
     /// File suffixes to read an ETag from instead of computing one (`etag_file_extensions`).
     etag_file_extensions: Vec<String>,
+    /// What to do with a symlink on the requested path (`symlinks`, a caddy-rs extension).
+    symlinks: SymlinkPolicy,
+}
+
+/// How `file_server` treats a symbolic link (or, on Windows, a directory junction) on a requested
+/// path.
+///
+/// Other servers differ: nginx and Apache follow every link unless told not to (`disable_symlinks`,
+/// `Options -FollowSymLinks`), Caddy follows every link, and servers that care about containment
+/// (salvo's `SymlinkPolicy::WithinRoot`, static-web-server's default) refuse links that leave the
+/// served directory. `within_root` is the safe middle: links are served, but only when the real
+/// target is inside the real root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SymlinkPolicy {
+    /// Any symlink on the path is refused with 403.
+    Deny,
+    /// A symlink is followed when the file it resolves to lies inside the root (the default). A
+    /// link to anywhere else is refused with 403. The `hide` list is applied to the real target as
+    /// well, so a link cannot reach a hidden file.
+    WithinRoot,
+    /// Every symlink is followed wherever it points (Caddy's behaviour). The `hide` list is still
+    /// applied to the real target.
+    Follow,
+}
+
+/// A file read through one verified handle (see [`FileServerHandler::read_contents`]).
+struct FileRead {
+    contents: Vec<u8>,
+    /// Metadata of the open handle, not of the path: it describes exactly the bytes in `contents`.
+    metadata: std::fs::Metadata,
+}
+
+/// Why [`FileServerHandler::read_contents`] declined to return a file.
+enum ReadFailure {
+    /// The opened file is outside the root (403).
+    Forbidden,
+    /// Nothing is there to serve, it is not a regular file, or it is hidden (404).
+    NotFound,
+    /// A real I/O failure (500).
+    Io(std::io::Error),
+}
+
+/// The outcome of [`FileServerHandler::resolve_links`].
+enum LinkCheck {
+    /// No symlink on the path below the root: use the path as it is.
+    Clean,
+    /// The path crosses at least one symlink the policy allows. `real` is the fully resolved,
+    /// link-free path to read from, and `root` the real root it was checked against.
+    Resolved { real: PathBuf, root: PathBuf },
+    /// The policy refuses the link.
+    Refused,
 }
 
 enum StatusOverride {
@@ -361,6 +412,23 @@ impl FileServerHandler {
             })
             .transpose()?
             .unwrap_or_default();
+        let symlinks = match object.get("symlinks") {
+            None | Some(serde_json::Value::Null) => SymlinkPolicy::WithinRoot,
+            Some(serde_json::Value::String(policy)) => match policy.as_str() {
+                "deny" => SymlinkPolicy::Deny,
+                "within_root" => SymlinkPolicy::WithinRoot,
+                "follow" => SymlinkPolicy::Follow,
+                other => {
+                    return Err(invalid(
+                        path,
+                        format!(
+                            "`symlinks` must be `deny`, `within_root` or `follow`, not `{other}`"
+                        ),
+                    ))
+                }
+            },
+            Some(_) => return Err(invalid(path, "`symlinks` must be a string")),
+        };
         Ok(Self {
             root,
             hide,
@@ -372,7 +440,122 @@ impl FileServerHandler {
             precompressed,
             precompressed_order,
             etag_file_extensions,
+            symlinks,
         })
+    }
+
+    /// Decide what a symlink on `path` (below `root`) means under the configured policy.
+    ///
+    /// A path with no link below the root is [`LinkCheck::Clean`]. Otherwise the whole path is
+    /// resolved with `canonicalize`, and under `within_root` the result must start with the real
+    /// root. A link whose target is simply absent (dangling) is `Clean`, so the caller's own lookup
+    /// answers 404; a loop or any other failure is `Refused`. The returned `real` path contains no
+    /// links, so every later operation uses it instead of re-following the link.
+    async fn resolve_links(&self, path: &Path, root: &Path) -> Result<LinkCheck> {
+        if !path_contains_symlink(path, root).await? {
+            return Ok(LinkCheck::Clean);
+        }
+        if self.symlinks == SymlinkPolicy::Deny {
+            return Ok(LinkCheck::Refused);
+        }
+        let real = match fs::canonicalize(path).await {
+            Ok(real) => real,
+            // Dangling link: nothing to serve; the caller's lookup reports 404.
+            Err(error) if is_not_found_like(&error) => return Ok(LinkCheck::Clean),
+            // Loops and anything unexpected are refused rather than reported as a server error.
+            Err(_) => return Ok(LinkCheck::Refused),
+        };
+        let Ok(real_root) = fs::canonicalize(root).await else {
+            return Ok(LinkCheck::Refused);
+        };
+        if self.symlinks == SymlinkPolicy::WithinRoot && !real.starts_with(&real_root) {
+            return Ok(LinkCheck::Refused);
+        }
+        Ok(LinkCheck::Resolved {
+            real,
+            root: real_root,
+        })
+    }
+
+    /// Read a file from a single open handle and decide, from where that handle *really* lives,
+    /// whether it may be served.
+    ///
+    /// Checking a path and then opening it leaves a window in which a path component can be swapped
+    /// for a symlink. Opening first and asking the operating system where the *open handle*
+    /// really lives closes it, because what was opened cannot change afterwards. The real path is
+    /// then judged by the same rules as a request path:
+    ///
+    /// * it must lie inside the real root (not under `follow`, where links may go anywhere);
+    /// * it must not be covered by `hide` (`check_hide`; see below), so a path swapped for a link
+    ///   to a hidden file between the check and the open still answers 404;
+    /// * the handle must be a regular file (opened without blocking, so a FIFO placed where a
+    ///   sidecar is expected cannot hang the server).
+    ///
+    /// `expected` is for precompressed and ETag sidecars. Caddy applies `hide` only to the requested
+    /// name, so a plain sidecar (`a.txt.gz` under `hide *.gz`) is still served; `hide` is applied to
+    /// a sidecar only when its real path is *not* the plain path it was looked up at, which means a
+    /// link or a swap is involved. `None` (the requested file itself) always applies `hide`.
+    ///
+    /// On platforms or sandboxes that cannot report a handle's path (no `/proc`), Unix falls back to
+    /// requiring that the path resolves to the very file that is open (same device and inode).
+    /// Where there is no fallback (Windows, when the handle's path is unavailable) the earlier
+    /// path-based check is all there is. The returned metadata is the handle's, so a validator and a
+    /// length can never describe a different file than the bytes.
+    async fn read_contents(
+        &self,
+        path: &Path,
+        root: &Path,
+        request: &Request,
+        expected: Option<&Path>,
+    ) -> std::result::Result<FileRead, ReadFailure> {
+        let follow = self.symlinks == SymlinkPolicy::Follow;
+        let path = path.to_path_buf();
+        let root = root.to_path_buf();
+        let expected = expected.map(Path::to_path_buf);
+        let read = tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut file = caddy_rs_fsperm::open_regular_file(&path)?;
+            let metadata = file.metadata()?;
+            let real = match caddy_rs_fsperm::verified_real_path(&file, &path) {
+                Ok(real) => {
+                    let real_root = std::fs::canonicalize(&root)?;
+                    // A sidecar looked up at a plain path is exempt from `hide` unless something
+                    // other than that plain path was opened.
+                    let check_hide = expected.as_ref().is_none_or(|plain| {
+                        std::fs::canonicalize(plain).map_or(true, |plain| plain != real)
+                    });
+                    Some((real, real_root, check_hide))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Unsupported => None,
+                // `follow` accepts links anywhere, so an inability to prove the path is not fatal.
+                Err(_) if follow => None,
+                Err(error) => return Err(error),
+            };
+            let mut contents = Vec::new();
+            file.read_to_end(&mut contents)?;
+            Ok((contents, metadata, real))
+        })
+        .await
+        .map_err(|error| ReadFailure::Io(std::io::Error::other(error)))?
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                ReadFailure::Forbidden
+            } else if is_not_found_like(&error) {
+                ReadFailure::NotFound
+            } else {
+                ReadFailure::Io(error)
+            }
+        })?;
+        let (contents, metadata, real) = read;
+        if let Some((real, real_root, check_hide)) = real {
+            if !follow && !real.starts_with(&real_root) {
+                return Err(ReadFailure::Forbidden);
+            }
+            if check_hide && self.hidden(&display_real_path(&real), request) {
+                return Err(ReadFailure::NotFound);
+            }
+        }
+        Ok(FileRead { contents, metadata })
     }
 
     fn not_found(&self, request: Request) -> Result<Outcome> {
@@ -394,8 +577,14 @@ impl FileServerHandler {
         // On Windows `PathBuf` yields `\` separators, which the `/`-based matching below would never
         // split on (so `hide .env` never matched a basename); compare in `/` form, case-insensitively.
         let normalise = |path: String| -> String {
-            if cfg!(windows) {
-                path.replace('\\', "/").to_ascii_lowercase()
+            // `\` is a separator only on Windows (it is an ordinary name byte on macOS).
+            let path = if cfg!(windows) {
+                path.replace('\\', "/")
+            } else {
+                path
+            };
+            if hide_is_case_insensitive() {
+                path.to_ascii_lowercase()
             } else {
                 path
             }
@@ -405,6 +594,22 @@ impl FileServerHandler {
                 .to_string_lossy()
                 .into_owned(),
         );
+        // One hide pattern (already absolute and normalised if it names a path) against the file.
+        let matches_pattern = |pattern: &str| -> bool {
+            if !pattern.contains('/') {
+                if filename_abs
+                    .split('/')
+                    .any(|component| glob_match(pattern, component, hide_is_case_insensitive()))
+                {
+                    return true;
+                }
+            } else if let Some(rest) = filename_abs.strip_prefix(pattern) {
+                if rest.starts_with('/') {
+                    return true;
+                }
+            }
+            glob_match(pattern, &filename_abs, hide_is_case_insensitive())
+        };
         self.hide.iter().any(|pattern| {
             // Caddy: `hide[i] = repl.ReplaceAll(fsrv.Hide[i], "")` (staticfiles.go).
             let expanded = request.replace_all(pattern);
@@ -412,50 +617,71 @@ impl FileServerHandler {
                 // An empty expansion (for example a missing placeholder) never hides anything.
                 return false;
             }
-            let pattern = if expanded.contains('/') {
-                normalise(
-                    fast_abs(Path::new(&expanded), &cwd)
-                        .to_string_lossy()
-                        .into_owned(),
-                )
-            } else {
-                expanded
-            };
-            if !pattern.contains('/') {
-                if filename_abs
-                    .split('/')
-                    .any(|component| glob_match(&pattern, component, cfg!(windows)))
-                {
-                    return true;
-                }
-            } else if let Some(rest) = filename_abs.strip_prefix(pattern.as_str()) {
-                if rest.starts_with('/') {
-                    return true;
-                }
+            // "Has a separator" decides between a basename glob and a path entry. On Windows a path
+            // spelled `C:\site\caddy` has no `/` at all, and treating it as a basename glob made
+            // every absolute hide entry (including the automatic one for the config directory,
+            // which holds `autosave.json`) match nothing.
+            let has_separator =
+                expanded.contains('/') || (cfg!(windows) && expanded.contains('\\'));
+            if !has_separator {
+                return matches_pattern(&expanded);
             }
-            glob_match(&pattern, &filename_abs, cfg!(windows))
+            let absolute = fast_abs(Path::new(&expanded), &cwd);
+            if matches_pattern(&normalise(absolute.to_string_lossy().into_owned())) {
+                return true;
+            }
+            // The same entry spelled through its real path. A request that crossed a symlink is
+            // judged by its resolved path (`current/../releases/r1/secret`), so an entry written
+            // through a symlinked ancestor (a `current -> releases/<id>` root, `/var` ->
+            // `/private/var` on macOS, a symlinked working directory) must match that spelling too.
+            match std::fs::canonicalize(&absolute) {
+                Ok(real) => matches_pattern(&normalise(display_real_path(&real))),
+                Err(_) => false,
+            }
         })
     }
 
     /// Serve one regular file through Caddy's `ServeContent` pipeline.
+    ///
+    /// `filename` is the path to read (link-free once a link was resolved) and `root` the root it
+    /// was checked against; `original_name` is the name the client asked for and `requested_root`
+    /// the configured root that name lives under. They differ only when a symlink was crossed, and
+    /// precompressed sidecars are looked up next to the *requested* name (`a.txt.gz` beside the
+    /// link `a.txt`), like Caddy, each judged by the symlink policy on its own.
     async fn serve_file(
         &self,
         request: Request,
         filename: &Path,
         original_name: &str,
         root: &Path,
+        requested_root: &Path,
     ) -> Result<Outcome> {
-        if path_contains_symlink(filename, root).await? {
-            return Ok(Outcome::Respond(Response::text(
-                StatusCode::FORBIDDEN,
-                "403 Forbidden",
-            )));
-        }
-        let original_metadata = fs::metadata(filename)
-            .await
-            .map_err(|error| Error::Io(error))?;
-        let modtime = mod_time(&original_metadata);
-        let useful_modtime = modtime.is_some_and(|time| time.unix != 0 && time.unix != 1);
+        // Defence in depth: the caller already resolved links, so `filename` should be link-free.
+        // If it is not (a future caller), the policy still applies and the resolved path is used.
+        let resolved_filename;
+        let (filename, root) = match self.resolve_links(filename, root).await? {
+            LinkCheck::Clean => (filename, root),
+            LinkCheck::Refused => {
+                return Ok(Outcome::Respond(Response::text(
+                    StatusCode::FORBIDDEN,
+                    "403 Forbidden",
+                )))
+            }
+            LinkCheck::Resolved {
+                real,
+                root: real_root,
+            } => {
+                resolved_filename = (real, real_root);
+                (resolved_filename.0.as_path(), resolved_filename.1.as_path())
+            }
+        };
+        let original_metadata = match fs::metadata(filename).await {
+            Ok(metadata) => metadata,
+            Err(error) if is_not_found_like(&error) => return self.not_found(request),
+            Err(error) => return Err(Error::Io(error)),
+        };
+        let mut modtime = mod_time(&original_metadata);
+        let mut useful_modtime = modtime.is_some_and(|time| time.unix != 0 && time.unix != 1);
 
         // Response headers staged by earlier `headers` handlers (Caddy's `respHeader`).
         let mut headers = request.pending_response_headers.clone();
@@ -476,12 +702,20 @@ impl FileServerHandler {
             else {
                 continue;
             };
-            let sidecar = PathBuf::from(format!("{}{suffix}", filename.display()));
-            if path_contains_symlink(&sidecar, root).await? {
-                return Ok(Outcome::Respond(Response::text(
-                    StatusCode::FORBIDDEN,
-                    "403 Forbidden",
-                )));
+            // Looked up next to the requested name (`a.txt.gz` beside the link `a.txt`), like Caddy.
+            let mut sidecar = PathBuf::from(format!("{original_name}{suffix}"));
+            // A sidecar can be a symlink too: the same policy decides, a link the policy refuses
+            // or that leads to a hidden file is simply not used (the plain file is served), and
+            // the resolved, link-free path is what is read.
+            match self.resolve_links(&sidecar, requested_root).await? {
+                LinkCheck::Clean => {}
+                LinkCheck::Refused => continue,
+                LinkCheck::Resolved { real, .. } => {
+                    if self.hidden(&display_real_path(&real), &request) {
+                        continue;
+                    }
+                    sidecar = real;
+                }
             }
             let Ok(info) = fs::metadata(&sidecar).await else {
                 continue;
@@ -527,6 +761,40 @@ impl FileServerHandler {
             }));
         }
 
+        // Read the representation through one verified handle (see `read_contents`) before any
+        // validator is computed, so the length, mtime and ETag describe exactly these bytes. A
+        // sidecar was already judged when it was selected; passing it as `expected` makes `hide`
+        // apply to it only if something other than that path was opened.
+        let expected_sidecar = content_encoding.is_some().then(|| representation.clone());
+        let read = match self
+            .read_contents(&representation, root, &request, expected_sidecar.as_deref())
+            .await
+        {
+            Ok(read) => read,
+            Err(ReadFailure::Forbidden) => {
+                return Ok(Outcome::Respond(Response::text(
+                    StatusCode::FORBIDDEN,
+                    "403 Forbidden",
+                )))
+            }
+            Err(ReadFailure::NotFound) => return self.not_found(request),
+            Err(ReadFailure::Io(error)) => return Err(Error::Io(error)),
+        };
+        representation_metadata = read.metadata;
+        let body = Bytes::from(read.contents);
+        let size = body.len() as u64;
+        if content_encoding.is_none() {
+            // The representation is the file itself: its handle's mtime is its Last-Modified.
+            modtime = mod_time(&representation_metadata);
+            useful_modtime = modtime.is_some_and(|time| time.unix != 0 && time.unix != 1);
+        } else if !request.headers.contains_key(header::RANGE) {
+            headers.insert(
+                header::CONTENT_LENGTH,
+                HeaderValue::from_str(&size.to_string())
+                    .expect("decimal length is a valid header value"),
+            );
+        }
+
         // ETag: an explicit earlier `Etag` header wins, then an etag sidecar file, then the
         // computed strong validator over the representation's (mtime, size).
         let mut etag = headers
@@ -535,8 +803,9 @@ impl FileServerHandler {
             .unwrap_or_default()
             .to_string();
         if etag.is_empty() && !self.etag_file_extensions.is_empty() {
-            if let Some(from_file) =
-                read_etag_sidecar(&representation, &self.etag_file_extensions).await?
+            if let Some(from_file) = self
+                .read_etag_sidecar(&representation, &self.etag_file_extensions, root, &request)
+                .await?
             {
                 etag = from_file;
             }
@@ -572,9 +841,6 @@ impl FileServerHandler {
                 }
             }
         }
-
-        let body = Bytes::from(fs::read(&representation).await.map_err(Error::Io)?);
-        let size = representation_metadata.len();
 
         // Conditional requests, following Go's `checkPreconditions` (RFC 7232 section 6).
         if let Some(status) = conditional_status(&request, &headers, modtime, useful_modtime) {
@@ -692,7 +958,12 @@ impl Handler for FileServerHandler {
     }
 
     async fn handle(&self, request: Request) -> Result<Outcome> {
-        let decoded_path = percent_decode(request.path());
+        // Decode once, strictly: a path whose escapes do not form valid UTF-8 (`%ff`, `%c3%28`)
+        // cannot name a file we can serve, so it is not found instead of being looked up under a
+        // U+FFFD-mangled name that different invalid byte sequences would all collapse to.
+        let Some(decoded_path) = percent_decode_strict(request.path()) else {
+            return self.not_found(request);
+        };
         for component in decoded_path.split('/') {
             if component == ".." {
                 return Ok(Outcome::Respond(Response::text(
@@ -728,6 +999,12 @@ impl Handler for FileServerHandler {
                 "403 Forbidden",
             )));
         }
+        // Names Windows cannot create (reserved device names, wildcard and other illegal
+        // characters) cannot be files here, and handing them to the OS risks opening a device or
+        // an invalid-name error that would surface as a 500.
+        if request_path_names_no_file(&decoded_path, cfg!(windows)) {
+            return self.not_found(request);
+        }
         // Expand `{http.vars.root}` and friends (Caddy's file_server root supports placeholders).
         let expanded_root = request.replace_all(&self.root);
         let root = if expanded_root.is_empty() {
@@ -743,22 +1020,45 @@ impl Handler for FileServerHandler {
         }
         let request_path = request.uri.path().to_string();
 
-        if path_contains_symlink(&full_path, &root).await? {
-            return Ok(Outcome::Respond(Response::text(
-                StatusCode::FORBIDDEN,
-                "403 Forbidden",
-            )));
-        }
+        // The name the client asked for (a symlink keeps its own name for the Content-Type and the
+        // redirects); the I/O path below is the resolved, link-free one when a link was crossed.
+        let requested_path_buf = full_path.clone();
+        // The configured root, which `requested_path_buf` lives under, as opposed to the real root
+        // used once a link has been resolved.
+        let configured_root = root.clone();
+        let mut walk_root = root.clone();
+        let full_path = match self.resolve_links(&full_path, &root).await? {
+            LinkCheck::Clean => full_path,
+            LinkCheck::Refused => {
+                return Ok(Outcome::Respond(Response::text(
+                    StatusCode::FORBIDDEN,
+                    "403 Forbidden",
+                )))
+            }
+            LinkCheck::Resolved {
+                real,
+                root: real_root,
+            } => {
+                // A link must not reach a file the `hide` list covers, however it is spelled.
+                if self.hidden(&display_real_path(&real), &request) {
+                    return self.not_found(request);
+                }
+                walk_root = real_root;
+                real
+            }
+        };
+        let root = walk_root;
 
         let metadata = match fs::metadata(&full_path).await {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return self.not_found(request)
-            }
+            // A missing file, a file used as a directory (`/index.html/x`), or a name the OS
+            // refuses (too long, invalid) is "not found", not a server error.
+            Err(error) if is_not_found_like(&error) => return self.not_found(request),
             Err(error) => return Err(Error::Io(error)),
         };
 
         let mut filename = full_path;
+        let mut requested_name = requested_path_buf;
         let mut metadata = metadata;
         let mut implicit_index = false;
         if metadata.is_dir() && !self.index_names.is_empty() {
@@ -768,21 +1068,43 @@ impl Handler for FileServerHandler {
                 if index.is_empty() {
                     continue;
                 }
-                let candidate = filename.join(index);
-                if path_contains_symlink(&candidate, &root).await? {
-                    return Ok(Outcome::Respond(Response::text(
-                        StatusCode::FORBIDDEN,
-                        "403 Forbidden",
-                    )));
+                let mut candidate = filename.join(&index);
+                // The index file may itself be a symlink; apply the same policy to it.
+                match self.resolve_links(&candidate, &root).await? {
+                    LinkCheck::Clean => {}
+                    LinkCheck::Refused => {
+                        return Ok(Outcome::Respond(Response::text(
+                            StatusCode::FORBIDDEN,
+                            "403 Forbidden",
+                        )))
+                    }
+                    LinkCheck::Resolved { real, .. } => {
+                        if self.hidden(&display_real_path(&real), &request) {
+                            return self.not_found(request);
+                        }
+                        candidate = real;
+                    }
                 }
                 if let Ok(index_metadata) = fs::metadata(&candidate).await {
                     if index_metadata.is_file() {
                         filename = candidate;
+                        requested_name = requested_name.join(&index);
                         metadata = index_metadata;
                         implicit_index = true;
                         break;
                     }
                 }
+            }
+        }
+
+        // Windows also answers to 8.3 short names (`GIT~1`, `SECRET~1.ENV`): the request path names
+        // the alias, so a `hide .git` / `hide *.env` entry never matches it. Match `hide` against
+        // the real (long-name) path as well, before a directory is listed or redirected, so an
+        // alias of a hidden directory is not browsable either.
+        #[cfg(windows)]
+        if let Ok(real) = fs::canonicalize(&filename).await {
+            if self.hidden(&display_real_path(&real), &request) {
+                return self.not_found(request);
             }
         }
 
@@ -796,7 +1118,7 @@ impl Handler for FileServerHandler {
                 )));
             }
             if let Some(browse) = &self.browse {
-                let body = browse_html(&filename, request.uri.clone(), relative, browse).await?;
+                let body = browse_html(self, &request, &filename, &root, relative, browse).await?;
                 return Ok(Outcome::Respond(Response::bytes(
                     StatusCode::OK,
                     "text/html; charset=utf-8",
@@ -840,8 +1162,8 @@ impl Handler for FileServerHandler {
         if !implicit_index && has_trailing_separator(&decoded_path) {
             return self.not_found(request);
         }
-        let original_name = filename.to_string_lossy().to_string();
-        self.serve_file(request, &filename, &original_name, &root)
+        let original_name = requested_name.to_string_lossy().to_string();
+        self.serve_file(request, &filename, &original_name, &root, &configured_root)
             .await
     }
 }
@@ -856,7 +1178,7 @@ impl Handler for FileServerHandler {
 /// mean `..`, `secret.env.` opens `secret.env` behind a `hide *.env`), so any component ending in
 /// a dot or space is refused. On other platforms `\` and `:` are
 /// ordinary file-name bytes and only a `/`-separated `..` is a parent reference.
-fn request_path_escapes_root(decoded_path: &str, windows: bool) -> bool {
+pub(crate) fn request_path_escapes_root(decoded_path: &str, windows: bool) -> bool {
     if !windows {
         return decoded_path.split('/').any(|component| component == "..");
     }
@@ -872,9 +1194,102 @@ fn request_path_escapes_root(decoded_path: &str, windows: bool) -> bool {
     // Win32 path normalisation drops trailing dots and spaces *after* `hide` and the matchers have
     // looked at the name: `secret.env.` and `secret.env ` open `secret.env` while `*.env` does not
     // match them. Refuse any component that would be altered that way (`.` itself is a no-op).
-    decoded_path.split(['/', '\\']).any(|component| {
-        component != "." && component.trim_end_matches(['.', ' ']) != component
-    })
+    decoded_path
+        .split(['/', '\\'])
+        .any(|component| component != "." && component.trim_end_matches(['.', ' ']) != component)
+}
+
+/// Whether `decoded_path` contains a component that Windows cannot create as a file or directory.
+///
+/// `windows` selects the host's rules so the vectors run on every platform. On Windows a component
+/// is unserviceable when it holds a character the file system forbids (`<`, `>`, `"`, `|`, `?`,
+/// `*` and the control characters; `:` and `\` are handled by [`request_path_escapes_root`]), or
+/// when it is a reserved DOS device name. Such names never exist as files, but passing them to the
+/// OS either opens a device (`CON`, `NUL`, `COM1`) or fails with an invalid-name error that would
+/// otherwise surface as a 500. The device-name rules and several vectors follow tower-http's
+/// `ServeDir` (MIT); see NOTICE.md.
+pub(crate) fn request_path_names_no_file(decoded_path: &str, windows: bool) -> bool {
+    windows
+        && decoded_path
+            .split(['/', '\\'])
+            .any(|component| windows_name_cannot_exist(component))
+}
+
+fn windows_name_cannot_exist(component: &str) -> bool {
+    component
+        .chars()
+        .any(|character| matches!(character, '<' | '>' | '"' | '|' | '?' | '*') || character < ' ')
+        || is_reserved_windows_device_name(component)
+}
+
+/// Windows reserved device names: `CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, `COM0`-`COM9`
+/// and `LPT0`-`LPT9` (the superscript digits `¹ ² ³` count too), matched case-insensitively on the
+/// part before the first `.` or `:`, with trailing whitespace ignored. `CON.txt`, `NUL  .txt` and
+/// `com1:` are reserved; `COM10`, `NULL`, `CONIN` and `contact.html` are ordinary names.
+fn is_reserved_windows_device_name(component: &str) -> bool {
+    let base = component.split(['.', ':']).next().unwrap_or(component);
+    let base = base.trim_end_matches(char::is_whitespace);
+    let upper = base.to_uppercase();
+    if matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    let mut characters = upper.chars();
+    let stem: String = characters.by_ref().take(3).collect();
+    let digit = characters.next();
+    matches!(stem.as_str(), "COM" | "LPT")
+        && characters.next().is_none()
+        && matches!(digit, Some('0'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'))
+}
+
+/// Whether an I/O error from looking a path up means "there is nothing there to serve".
+///
+/// `NotFound` is the obvious case. A file used as a directory (`/index.html/foo`, `ENOTDIR`) and a
+/// name the OS refuses (too long, `ENAMETOOLONG`; invalid, Windows `ERROR_INVALID_NAME`) are the
+/// same answer for a client and must not become 500s.
+fn is_not_found_like(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{InvalidFilename, InvalidInput, NotADirectory, NotFound};
+    if matches!(
+        error.kind(),
+        NotFound | NotADirectory | InvalidFilename | InvalidInput
+    ) {
+        return true;
+    }
+    // Windows: ERROR_PATH_NOT_FOUND (3), ERROR_INVALID_NAME (123), ERROR_BAD_PATHNAME (161),
+    // ERROR_FILENAME_EXCED_RANGE (206), ERROR_DIRECTORY (267). The numbers mean other things on
+    // other platforms, so they are only consulted on Windows.
+    cfg!(windows) && matches!(error.raw_os_error(), Some(3 | 123 | 161 | 206 | 267))
+}
+
+/// `std::fs::canonicalize` returns Windows verbatim paths (`\\?\C:\dir`); `hide` entries are
+/// spelled without the prefix, so remove it when it is just a drive letter. Identity elsewhere.
+#[cfg(windows)]
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// A resolved real path spelled the way `hide` entries are (no Windows verbatim `\\?\` prefix).
+fn display_real_path(real: &Path) -> String {
+    #[cfg(windows)]
+    {
+        strip_verbatim_prefix(real).to_string_lossy().into_owned()
+    }
+    #[cfg(not(windows))]
+    {
+        real.to_string_lossy().into_owned()
+    }
+}
+
+/// Whether `hide` matching ignores case: Windows and macOS file systems are case-insensitive by
+/// default, so `/.ENV` must not slip past `hide .env` there.
+const fn hide_is_case_insensitive() -> bool {
+    cfg!(any(windows, target_os = "macos"))
 }
 
 /// Caddy's `SanitizedPathJoin` relative part for a decoded request path: `path.Clean` (which drops
@@ -1058,18 +1473,24 @@ fn calculate_etag(metadata: &std::fs::Metadata) -> String {
 async fn path_contains_symlink(path: &Path, root: &Path) -> Result<bool> {
     let mut current = path;
     loop {
+        // The configured root is the operator's choice, not request-controlled, and a symlinked
+        // root is the standard release layout (`/srv/site -> /srv/releases/2026-11-24`); only the
+        // components below it come from the client. Stop before testing the root itself.
+        if current == root {
+            return Ok(false);
+        }
         match fs::symlink_metadata(current).await {
             Ok(meta) => {
                 if meta.file_type().is_symlink() {
                     return Ok(true);
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // The path (or a parent) does not exist; keep checking ancestors.
-            }
+            // The path (or a parent) does not exist, or is below a file (`ENOTDIR`) or has a name
+            // the OS refuses: nothing to inspect here; keep checking ancestors.
+            Err(error) if is_not_found_like(&error) => {}
             Err(error) => return Err(Error::Io(error)),
         }
-        if current == root || current.parent().is_none() {
+        if current.parent().is_none() {
             return Ok(false);
         }
         let Some(parent) = current.parent() else {
@@ -1079,28 +1500,56 @@ async fn path_contains_symlink(path: &Path, root: &Path) -> Result<bool> {
     }
 }
 
-/// Read an ETag from a sidecar file (`etag_file_extensions`), removing newlines like Caddy.
-async fn read_etag_sidecar(filename: &Path, suffixes: &[String]) -> Result<Option<String>> {
-    for suffix in suffixes {
-        let candidate = PathBuf::from(format!("{}{suffix}", filename.display()));
-        match fs::read(&candidate).await {
-            Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes).replace('\n', "");
-                return Ok(Some(text));
+impl FileServerHandler {
+    /// Read an ETag from a sidecar file (`etag_file_extensions`), removing newlines like Caddy.
+    ///
+    /// The sidecar is read through [`FileServerHandler::read_contents`] after the symlink policy
+    /// has decided about it: a sidecar that is a link to a file outside the root would otherwise
+    /// put that file's contents into the `ETag` response header.
+    async fn read_etag_sidecar(
+        &self,
+        filename: &Path,
+        suffixes: &[String],
+        root: &Path,
+        request: &Request,
+    ) -> Result<Option<String>> {
+        for suffix in suffixes {
+            let mut candidate = PathBuf::from(format!("{}{suffix}", filename.display()));
+            match self.resolve_links(&candidate, root).await? {
+                LinkCheck::Clean => {}
+                // A refused sidecar is ignored; the computed validator is used instead.
+                LinkCheck::Refused => continue,
+                LinkCheck::Resolved { real, .. } => {
+                    // A sidecar link to a hidden file must not put that file in the header either.
+                    if self.hidden(&display_real_path(&real), request) {
+                        continue;
+                    }
+                    candidate = real;
+                }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(Error::Handler {
-                    status: StatusCode::INTERNAL_SERVER_ERROR,
-                    message: format!(
-                        "cannot read etag from file {}: {error}",
-                        candidate.display()
-                    ),
-                })
+            match self
+                .read_contents(&candidate, root, request, Some(&candidate))
+                .await
+            {
+                Ok(read) => {
+                    let text = String::from_utf8_lossy(&read.contents).replace('\n', "");
+                    return Ok(Some(text));
+                }
+                // Missing, refused, hidden or not a regular file: use the computed validator.
+                Err(ReadFailure::NotFound | ReadFailure::Forbidden) => continue,
+                Err(ReadFailure::Io(error)) => {
+                    return Err(Error::Handler {
+                        status: StatusCode::INTERNAL_SERVER_ERROR,
+                        message: format!(
+                            "cannot read etag from file {}: {error}",
+                            candidate.display()
+                        ),
+                    })
+                }
             }
         }
+        Ok(None)
     }
-    Ok(None)
 }
 
 fn content_encoding_present(headers: &HeaderMap) -> bool {
@@ -1669,23 +2118,48 @@ fn multipart_body(
 }
 
 async fn browse_html(
+    handler: &FileServerHandler,
+    request: &Request,
+    directory: &Path,
     root: &Path,
-    uri: Uri,
     relative: &str,
     options: &BrowseOptions,
 ) -> Result<Vec<u8>> {
-    let mut entries = fs::read_dir(root).await?;
+    let uri = request.uri.clone();
+    let mut entries = fs::read_dir(directory).await?;
     let mut names = Vec::new();
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name().to_string_lossy().to_string();
         let path = entry.path();
+        // An entry the `hide` list covers is not advertised (it would answer 404 anyway).
+        if handler.hidden(&path.to_string_lossy(), request) {
+            continue;
+        }
         let file_type = entry.file_type().await.ok();
-        let is_dir = file_type
+        let mut is_dir = file_type
             .map(|file_type| file_type.is_dir())
             .unwrap_or(false);
         let is_symlink = file_type
             .map(|file_type| file_type.is_symlink())
             .unwrap_or(false);
+        if is_symlink {
+            // List a link only if following it is allowed, and as what it points to: a link to a
+            // directory is a directory (trailing slash), so clicking it works. A link the policy
+            // refuses, a hidden target or a dangling link would answer 403/404, so it is omitted.
+            match handler.resolve_links(&path, root).await? {
+                LinkCheck::Refused => continue,
+                LinkCheck::Clean => continue, // dangling: nothing to open
+                LinkCheck::Resolved { real, .. } => {
+                    if handler.hidden(&display_real_path(&real), request) {
+                        continue;
+                    }
+                    is_dir = fs::metadata(&real)
+                        .await
+                        .map(|metadata| metadata.is_dir())
+                        .unwrap_or(false);
+                }
+            }
+        }
         // `reveal_symlinks` shows where a symlink points. The link is only read when the option
         // asks for it: without it the target is not part of the listing at all.
         let symlink_target = if is_symlink && options.reveal_symlinks {
@@ -1953,7 +2427,14 @@ mod tests {
 
     #[test]
     fn non_windows_treats_backslash_and_colon_as_filename_bytes() {
-        for path in [r"/..\secret.txt", "/C:/x", r"/\x", "/a:b", "/.. /x", "/.../x"] {
+        for path in [
+            r"/..\secret.txt",
+            "/C:/x",
+            r"/\x",
+            "/a:b",
+            "/.. /x",
+            "/.../x",
+        ] {
             assert!(
                 !request_path_escapes_root(path, false),
                 "{path:?} is a literal file name outside Windows"
@@ -2890,59 +3371,631 @@ mod tests {
         );
     }
 
+    /// A served site `<tmp>/site` next to an `<tmp>/outside` directory the site must never expose.
+    #[cfg(unix)]
+    struct LinkSite {
+        _dir: tempfile::TempDir,
+        site: PathBuf,
+        outside: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl LinkSite {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let site = dir.path().join("site");
+            let outside = dir.path().join("outside");
+            std::fs::create_dir_all(site.join("docs")).unwrap();
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(site.join("real.txt"), b"real file").unwrap();
+            std::fs::write(site.join("docs/guide.html"), b"guide").unwrap();
+            std::fs::write(site.join("secret.env"), b"TOP SECRET").unwrap();
+            std::fs::write(outside.join("leak.txt"), b"LEAKED").unwrap();
+            std::fs::write(outside.join("leak.txt.gz"), b"LEAKED GZIP").unwrap();
+            Self {
+                _dir: dir,
+                site,
+                outside,
+            }
+        }
+
+        fn link(&self, target: &Path, name: &str) {
+            std::os::unix::fs::symlink(target, self.site.join(name)).unwrap();
+        }
+
+        async fn get(&self, handler: &FileServerHandler, path: &str) -> Response {
+            respond(handler, make_request(Method::GET, path)).await
+        }
+    }
+
     #[tokio::test]
     #[cfg(unix)]
-    async fn symlink_to_outside_root_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let outside = dir.path().join("outside.txt");
-        std::fs::write(&outside, b"secret").unwrap();
-        let link = dir.path().join("link.txt");
-        std::os::unix::fs::symlink(&outside, &link).unwrap();
+    async fn symlink_to_a_file_inside_the_root_is_served_under_the_links_name() {
+        let site = LinkSite::new();
+        site.link(&site.site.join("real.txt"), "latest.txt");
+        site.link(Path::new("real.txt"), "relative.txt"); // a relative link target
+        let handler = configured_handler(&site.site, serde_json::json!({}));
+        for path in ["/latest.txt", "/relative.txt"] {
+            let response = site.get(&handler, path).await;
+            assert_eq!(response.status, StatusCode::OK, "{path}");
+            assert_eq!(response.body, Bytes::from_static(b"real file"), "{path}");
+            // The Content-Type follows the name that was requested, like nginx and Apache.
+            assert_eq!(
+                header(&response, header::CONTENT_TYPE),
+                "text/plain; charset=utf-8"
+            );
+        }
+    }
 
-        let handler = handler(dir.path()).await;
-        let response = respond(&handler, make_request(Method::GET, "/link.txt")).await;
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn the_content_type_follows_the_link_name_not_the_target_name() {
+        let site = LinkSite::new();
+        std::fs::write(site.site.join("build-1234.bin"), b"<html>x</html>").unwrap();
+        site.link(Path::new("build-1234.bin"), "latest.html");
+        let handler = configured_handler(&site.site, serde_json::json!({}));
+        let response = site.get(&handler, "/latest.html").await;
+        assert_eq!(response.status, StatusCode::OK);
         assert_eq!(
-            response.status,
-            StatusCode::FORBIDDEN,
-            "symlink pointing outside the root must be rejected"
+            header(&response, header::CONTENT_TYPE),
+            "text/html; charset=utf-8"
         );
     }
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn symlink_to_hidden_file_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let hidden = dir.path().join(".htpasswd");
-        std::fs::write(&hidden, b"secret").unwrap();
-        let link = dir.path().join("safe.txt");
-        std::os::unix::fs::symlink(&hidden, &link).unwrap();
-
-        let handler = handler(dir.path()).await;
-        let response = respond(&handler, make_request(Method::GET, "/safe.txt")).await;
+    async fn symlink_to_outside_root_is_rejected() {
+        let site = LinkSite::new();
+        site.link(&site.outside.join("leak.txt"), "link.txt");
+        let handler = configured_handler(&site.site, serde_json::json!({}));
+        let response = site.get(&handler, "/link.txt").await;
         assert_eq!(
             response.status,
             StatusCode::FORBIDDEN,
-            "symlink pointing to a hidden file must be rejected"
+            "a symlink to a file outside the root must be refused"
         );
+        assert!(!response.body.windows(6).any(|window| window == b"LEAKED"));
     }
 
     #[tokio::test]
     #[cfg(unix)]
     async fn symlink_directory_to_outside_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let outside_dir = dir.path().join("outside");
-        std::fs::create_dir(&outside_dir).unwrap();
-        std::fs::write(outside_dir.join("secret.txt"), b"secret").unwrap();
-        let link_dir = dir.path().join("linkdir");
-        std::os::unix::fs::symlink(&outside_dir, &link_dir).unwrap();
-
-        let handler = handler(dir.path()).await;
-        let response = respond(&handler, make_request(Method::GET, "/linkdir/secret.txt")).await;
+        let site = LinkSite::new();
+        site.link(&site.outside, "linkdir");
+        let handler = configured_handler(&site.site, serde_json::json!({}));
+        let response = site.get(&handler, "/linkdir/leak.txt").await;
         assert_eq!(
             response.status,
             StatusCode::FORBIDDEN,
-            "symlink directory pointing outside the root must be rejected"
+            "a symlinked directory pointing outside the root must be refused"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn symlink_directory_inside_the_root_is_served_and_gets_a_canonical_redirect() {
+        let site = LinkSite::new();
+        site.link(Path::new("docs"), "manual");
+        let handler = configured_handler(&site.site, serde_json::json!({}));
+        let response = site.get(&handler, "/manual/guide.html").await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from_static(b"guide"));
+        // A directory reached through a link still redirects to the trailing slash.
+        let response = site.get(&handler, "/manual").await;
+        assert_eq!(response.status, StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(header(&response, header::LOCATION), "/manual/");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn symlink_chains_are_followed_while_every_hop_stays_inside() {
+        let site = LinkSite::new();
+        site.link(Path::new("real.txt"), "hop1.txt");
+        site.link(Path::new("hop1.txt"), "hop2.txt");
+        site.link(Path::new("hop2.txt"), "hop3.txt");
+        let handler = configured_handler(&site.site, serde_json::json!({}));
+        assert_eq!(site.get(&handler, "/hop3.txt").await.status, StatusCode::OK);
+        // A chain whose last hop leaves the root is refused even though the first hops are fine.
+        site.link(&site.outside.join("leak.txt"), "exit.txt");
+        site.link(Path::new("exit.txt"), "chain-out.txt");
+        assert_eq!(
+            site.get(&handler, "/chain-out.txt").await.status,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// A link that goes up and back down (`docs/../real.txt`, `../site/real.txt`) is judged by
+    /// where it really resolves, not by how it is spelled.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn links_are_judged_by_where_they_resolve_not_how_they_are_spelled() {
+        let site = LinkSite::new();
+        site.link(Path::new("docs/../real.txt"), "up-and-down.txt");
+        site.link(Path::new("../site/real.txt"), "out-and-back.txt");
+        site.link(Path::new("../outside/leak.txt"), "dotdot-out.txt");
+        site.link(Path::new("docs/../../outside/leak.txt"), "deep-out.txt");
+        let handler = configured_handler(&site.site, serde_json::json!({}));
+        assert_eq!(
+            site.get(&handler, "/up-and-down.txt").await.status,
+            StatusCode::OK
+        );
+        assert_eq!(
+            site.get(&handler, "/out-and-back.txt").await.status,
+            StatusCode::OK
+        );
+        for path in ["/dotdot-out.txt", "/deep-out.txt"] {
+            assert_eq!(
+                site.get(&handler, path).await.status,
+                StatusCode::FORBIDDEN,
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_sibling_directory_with_the_roots_name_prefix_is_not_inside_the_root() {
+        // `starts_with` is component-wise, but this pins it: `/tmp/site-evil` is not inside
+        // `/tmp/site` even though its path starts with the same characters.
+        let site = LinkSite::new();
+        let evil = site.site.parent().unwrap().join("site-evil");
+        std::fs::create_dir_all(&evil).unwrap();
+        std::fs::write(evil.join("leak.txt"), b"LEAKED").unwrap();
+        site.link(&evil.join("leak.txt"), "prefix.txt");
+        let handler = configured_handler(&site.site, serde_json::json!({}));
+        assert_eq!(
+            site.get(&handler, "/prefix.txt").await.status,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_link_to_a_hidden_file_cannot_bypass_hide() {
+        let site = LinkSite::new();
+        site.link(Path::new("secret.env"), "innocent.txt");
+        site.link(Path::new("secret.env"), "innocent.env2");
+        let handler = configured_handler(&site.site, serde_json::json!({"hide": ["*.env"]}));
+        assert_eq!(
+            site.get(&handler, "/innocent.txt").await.status,
+            StatusCode::NOT_FOUND,
+            "the link's name is not hidden but its target is"
+        );
+        assert_eq!(
+            site.get(&handler, "/secret.env").await.status,
+            StatusCode::NOT_FOUND
+        );
+        // A hidden *directory* reached through a link is hidden too.
+        std::fs::create_dir(site.site.join(".git")).unwrap();
+        std::fs::write(site.site.join(".git/config"), b"[core]").unwrap();
+        site.link(Path::new(".git"), "gitlink");
+        let handler = configured_handler(&site.site, serde_json::json!({"hide": [".git"]}));
+        assert_eq!(
+            site.get(&handler, "/gitlink/config").await.status,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn dangling_links_are_not_found_and_loops_are_refused_never_a_server_error() {
+        let site = LinkSite::new();
+        site.link(Path::new("does-not-exist.txt"), "dangling.txt");
+        site.link(Path::new("loop-b"), "loop-a");
+        site.link(Path::new("loop-a"), "loop-b");
+        let handler = configured_handler(&site.site, serde_json::json!({}));
+        assert_eq!(
+            site.get(&handler, "/dangling.txt").await.status,
+            StatusCode::NOT_FOUND
+        );
+        let response = site.get(&handler, "/loop-a").await;
+        assert!(
+            response.status == StatusCode::FORBIDDEN || response.status == StatusCode::NOT_FOUND,
+            "a link loop must be refused or not found, got {}",
+            response.status
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn symlink_policy_deny_refuses_every_link_and_follow_allows_every_link() {
+        let site = LinkSite::new();
+        site.link(Path::new("real.txt"), "inside.txt");
+        site.link(&site.outside.join("leak.txt"), "outside.txt");
+
+        let deny = configured_handler(&site.site, serde_json::json!({"symlinks": "deny"}));
+        assert_eq!(
+            site.get(&deny, "/inside.txt").await.status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            site.get(&deny, "/outside.txt").await.status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(site.get(&deny, "/real.txt").await.status, StatusCode::OK);
+
+        let follow = configured_handler(&site.site, serde_json::json!({"symlinks": "follow"}));
+        assert_eq!(
+            site.get(&follow, "/inside.txt").await.status,
+            StatusCode::OK
+        );
+        let response = site.get(&follow, "/outside.txt").await;
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "follow is Caddy's behaviour"
+        );
+        assert_eq!(response.body, Bytes::from_static(b"LEAKED"));
+
+        let default = configured_handler(&site.site, serde_json::json!({}));
+        assert_eq!(
+            site.get(&default, "/inside.txt").await.status,
+            StatusCode::OK
+        );
+        assert_eq!(
+            site.get(&default, "/outside.txt").await.status,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn symlinks_option_is_validated() {
+        for bad in [
+            serde_json::json!("sometimes"),
+            serde_json::json!(true),
+            serde_json::json!(1),
+        ] {
+            let error = FileServerHandler::from_json(
+                &serde_json::json!({"handler": "file_server", "root": ".", "symlinks": bad}),
+                "handler",
+            )
+            .err()
+            .expect("an invalid `symlinks` value is rejected");
+            assert!(error.to_string().contains("symlinks"), "{error}");
+        }
+    }
+
+    /// The release layout `current -> releases/<id>`: the root itself is a symlink.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_symlinked_root_is_served_and_still_contains_its_own_links() {
+        let site = LinkSite::new();
+        site.link(Path::new("real.txt"), "inside.txt");
+        site.link(&site.outside.join("leak.txt"), "outside.txt");
+        let parent = tempfile::tempdir().unwrap();
+        let current = parent.path().join("current");
+        std::os::unix::fs::symlink(&site.site, &current).unwrap();
+        let handler = configured_handler(&current, serde_json::json!({}));
+        assert_eq!(site.get(&handler, "/real.txt").await.status, StatusCode::OK);
+        assert_eq!(
+            site.get(&handler, "/inside.txt").await.status,
+            StatusCode::OK
+        );
+        assert_eq!(
+            site.get(&handler, "/outside.txt").await.status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            site.get(&handler, "/docs/guide.html").await.status,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn index_files_and_precompressed_sidecars_that_are_links_follow_the_same_policy() {
+        let site = LinkSite::new();
+        // Index file that is a link inside the root: served. One that leaves the root: refused.
+        std::fs::create_dir_all(site.site.join("ok")).unwrap();
+        std::os::unix::fs::symlink("../real.txt", site.site.join("ok/index.html")).unwrap();
+        std::fs::create_dir_all(site.site.join("bad")).unwrap();
+        std::os::unix::fs::symlink(
+            site.outside.join("leak.txt"),
+            site.site.join("bad/index.html"),
+        )
+        .unwrap();
+        let handler = configured_handler(&site.site, serde_json::json!({}));
+        let ok = site.get(&handler, "/ok/").await;
+        assert_eq!(ok.status, StatusCode::OK);
+        assert_eq!(ok.body, Bytes::from_static(b"real file"));
+        assert_eq!(
+            site.get(&handler, "/bad/").await.status,
+            StatusCode::FORBIDDEN
+        );
+
+        // A precompressed sidecar that is a link out of the root is refused; one inside is used.
+        site.link(&site.outside.join("leak.txt"), "evil.txt");
+        std::os::unix::fs::symlink(
+            site.outside.join("leak.txt.gz"),
+            site.site.join("evil.txt.gz"),
+        )
+        .unwrap();
+        std::fs::write(site.site.join("good.txt"), b"plain").unwrap();
+        std::fs::write(site.site.join("good-real.gz"), b"GZIP INSIDE").unwrap();
+        std::os::unix::fs::symlink("good-real.gz", site.site.join("good.txt.gz")).unwrap();
+        let pre = configured_handler(
+            &site.site,
+            serde_json::json!({"precompressed": {"gzip": {}}, "precompressed_order": ["gzip"]}),
+        );
+        let mut request = make_request(Method::GET, "/good.txt");
+        request
+            .headers
+            .insert(header::ACCEPT_ENCODING, "gzip".parse().unwrap());
+        let response = respond(&pre, request).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from_static(b"GZIP INSIDE"));
+        std::fs::write(site.site.join("evil2.txt"), b"plain").unwrap();
+        std::os::unix::fs::symlink(
+            site.outside.join("leak.txt.gz"),
+            site.site.join("evil2.txt.gz"),
+        )
+        .unwrap();
+        let mut request = make_request(Method::GET, "/evil2.txt");
+        request
+            .headers
+            .insert(header::ACCEPT_ENCODING, "gzip".parse().unwrap());
+        let response = respond(&pre, request).await;
+        // The refused sidecar is simply not used: the plain file is served, uncompressed. (A link
+        // someone planted must not turn the whole file into a 403 for every gzip client.)
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from_static(b"plain"));
+        assert!(header(&response, header::CONTENT_ENCODING).is_empty());
+        assert!(!response.body.windows(6).any(|window| window == b"LEAKED"));
+    }
+
+    /// Review finding (High): a sidecar that is a link to a `hide`-covered file must not serve that
+    /// file, neither as the precompressed body nor inside the `ETag` header.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn sidecar_links_to_hidden_files_are_not_served() {
+        let site = LinkSite::new();
+        std::fs::write(site.site.join("a.txt"), b"plain a").unwrap();
+        std::os::unix::fs::symlink("secret.env", site.site.join("a.txt.gz")).unwrap();
+        std::os::unix::fs::symlink("secret.env", site.site.join("a.txt.sha256")).unwrap();
+        let handler = configured_handler(
+            &site.site,
+            serde_json::json!({
+                "hide": ["*.env"],
+                "precompressed": {"gzip": {}},
+                "precompressed_order": ["gzip"],
+                "etag_file_extensions": [".sha256"]
+            }),
+        );
+        let mut request = make_request(Method::GET, "/a.txt");
+        request
+            .headers
+            .insert(header::ACCEPT_ENCODING, "gzip".parse().unwrap());
+        let response = respond(&handler, request).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from_static(b"plain a"));
+        assert!(header(&response, header::CONTENT_ENCODING).is_empty());
+        assert!(
+            !header(&response, header::ETAG).contains("SECRET"),
+            "the hidden file's text must not reach the ETag: {:?}",
+            header(&response, header::ETAG)
+        );
+        let body = String::from_utf8_lossy(&response.body).to_string();
+        assert!(!body.contains("SECRET"), "{body}");
+    }
+
+    /// A plain (non-link) precompressed sidecar under a `hide` pattern is still served, as in
+    /// Caddy, which applies `hide` to the requested name only.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_plain_sidecar_is_served_even_when_its_name_matches_hide() {
+        let site = LinkSite::new();
+        std::fs::write(site.site.join("b.txt"), b"plain b").unwrap();
+        std::fs::write(site.site.join("b.txt.gz"), b"GZIP B").unwrap();
+        let handler = configured_handler(
+            &site.site,
+            serde_json::json!({
+                "hide": ["*.gz"],
+                "precompressed": {"gzip": {}},
+                "precompressed_order": ["gzip"]
+            }),
+        );
+        let mut request = make_request(Method::GET, "/b.txt");
+        request
+            .headers
+            .insert(header::ACCEPT_ENCODING, "gzip".parse().unwrap());
+        let response = respond(&handler, request).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from_static(b"GZIP B"));
+        // The sidecar itself, requested directly, is hidden.
+        assert_eq!(
+            site.get(&handler, "/b.txt.gz").await.status,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// Review finding: precompressed sidecars are found next to the *requested* name, so
+    /// `a.txt.gz` beside the link `a.txt` is used even though the target lives elsewhere.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn sidecars_are_looked_up_next_to_the_link_not_its_target() {
+        let site = LinkSite::new();
+        std::fs::create_dir_all(site.site.join("sub")).unwrap();
+        std::fs::write(site.site.join("sub/real.txt"), b"plain real").unwrap();
+        std::os::unix::fs::symlink("sub/real.txt", site.site.join("a.txt")).unwrap();
+        std::fs::write(site.site.join("a.txt.gz"), b"GZIP BESIDE LINK").unwrap();
+        for policy in ["within_root", "follow"] {
+            let handler = configured_handler(
+                &site.site,
+                serde_json::json!({
+                    "symlinks": policy,
+                    "precompressed": {"gzip": {}},
+                    "precompressed_order": ["gzip"]
+                }),
+            );
+            let mut request = make_request(Method::GET, "/a.txt");
+            request
+                .headers
+                .insert(header::ACCEPT_ENCODING, "gzip".parse().unwrap());
+            let response = respond(&handler, request).await;
+            assert_eq!(response.status, StatusCode::OK, "{policy}");
+            assert_eq!(
+                response.body,
+                Bytes::from_static(b"GZIP BESIDE LINK"),
+                "{policy}"
+            );
+            assert_eq!(
+                header(&response, header::CONTENT_ENCODING),
+                "gzip",
+                "{policy}"
+            );
+        }
+    }
+
+    /// Review finding (Medium): a `hide` entry spelled through a symlinked ancestor (a
+    /// `current -> releases/r1` root) must also match the canonical path a followed link reports.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_hide_entry_written_through_a_symlinked_root_still_matches_resolved_links() {
+        let parent = tempfile::tempdir().unwrap();
+        let release = parent.path().join("releases").join("r1");
+        std::fs::create_dir_all(release.join("secret")).unwrap();
+        std::fs::write(release.join("secret/x.txt"), b"HIDDEN-DIR-CONTENT").unwrap();
+        std::fs::write(release.join("public.txt"), b"public").unwrap();
+        std::os::unix::fs::symlink("secret", release.join("pub")).unwrap();
+        let current = parent.path().join("current");
+        std::os::unix::fs::symlink(&release, &current).unwrap();
+        // The entry is written the way an operator writes it: through `current`.
+        let handler = configured_handler(
+            &current,
+            serde_json::json!({"hide": [current.join("secret").to_string_lossy()]}),
+        );
+        let site = LinkSite::new(); // only for its `get` helper
+        assert_eq!(
+            site.get(&handler, "/secret/x.txt").await.status,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            site.get(&handler, "/pub/x.txt").await.status,
+            StatusCode::NOT_FOUND,
+            "a link to the hidden directory is hidden too"
+        );
+        assert_eq!(
+            site.get(&handler, "/public.txt").await.status,
+            StatusCode::OK
+        );
+    }
+
+    /// Review finding (Medium): the opened handle is judged, so a path swapped for a link to a
+    /// hidden file (or out of the root) *after* the earlier checks is still refused at read time.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn read_contents_judges_the_opened_file_not_the_path_it_was_checked_as() {
+        let site = LinkSite::new();
+        std::os::unix::fs::symlink("secret.env", site.site.join("to-hidden")).unwrap();
+        std::os::unix::fs::symlink(site.outside.join("leak.txt"), site.site.join("to-outside"))
+            .unwrap();
+        let handler = configured_handler(&site.site, serde_json::json!({"hide": ["*.env"]}));
+        let request = make_request(Method::GET, "/");
+        let real_root = std::fs::canonicalize(&site.site).unwrap();
+        // Bypassing `resolve_links` entirely, as a race would.
+        assert!(matches!(
+            handler
+                .read_contents(&site.site.join("to-hidden"), &real_root, &request, None)
+                .await,
+            Err(ReadFailure::NotFound)
+        ));
+        assert!(matches!(
+            handler
+                .read_contents(&site.site.join("to-outside"), &real_root, &request, None)
+                .await,
+            Err(ReadFailure::Forbidden)
+        ));
+        assert!(matches!(
+            handler
+                .read_contents(&site.site.join("real.txt"), &real_root, &request, None)
+                .await,
+            Ok(_)
+        ));
+        // A directory is not a file.
+        assert!(matches!(
+            handler
+                .read_contents(&site.site.join("docs"), &real_root, &request, None)
+                .await,
+            Err(ReadFailure::NotFound)
+        ));
+    }
+
+    /// Review finding: a FIFO planted where a sidecar is expected must not hang the server.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_fifo_in_place_of_a_sidecar_does_not_hang_the_request() {
+        let site = LinkSite::new();
+        std::fs::write(site.site.join("c.txt"), b"plain c").unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(site.site.join("c.txt.gz"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let handler = configured_handler(
+            &site.site,
+            serde_json::json!({"precompressed": {"gzip": {}}, "precompressed_order": ["gzip"]}),
+        );
+        let mut request = make_request(Method::GET, "/c.txt");
+        request
+            .headers
+            .insert(header::ACCEPT_ENCODING, "gzip".parse().unwrap());
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            respond(&handler, request),
+        )
+        .await
+        .expect("a FIFO sidecar must not block the request");
+        // Whatever it answers, it must not have served a FIFO as a gzip body.
+        assert!(header(&response, header::CONTENT_ENCODING).is_empty());
+    }
+
+    /// An ETag sidecar that links outside the root must not put that file's text in the header.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn an_etag_sidecar_link_that_leaves_the_root_is_ignored() {
+        let site = LinkSite::new();
+        std::fs::write(site.outside.join("etag-secret"), b"\"LEAKED-ETAG\"").unwrap();
+        std::os::unix::fs::symlink(
+            site.outside.join("etag-secret"),
+            site.site.join("real.txt.sha256"),
+        )
+        .unwrap();
+        let handler = configured_handler(
+            &site.site,
+            serde_json::json!({"etag_file_extensions": [".sha256"]}),
+        );
+        let response = site.get(&handler, "/real.txt").await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(!header(&response, header::ETAG).contains("LEAKED"));
+    }
+
+    /// The listing shows a link to a directory as a directory, keeps links the policy allows, and
+    /// omits links it would refuse, hidden entries and dangling links.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn browse_lists_followable_links_as_what_they_point_to_and_omits_the_rest() {
+        let site = LinkSite::new();
+        site.link(Path::new("docs"), "manual"); // dir link inside
+        site.link(Path::new("real.txt"), "latest.txt"); // file link inside
+        site.link(&site.outside.join("leak.txt"), "escape.txt"); // refused
+        site.link(Path::new("secret.env"), "via-link.txt"); // hidden target
+        site.link(Path::new("nowhere"), "dangling.txt"); // dangling
+        let handler = configured_handler(
+            &site.site,
+            serde_json::json!({"browse": {}, "hide": ["*.env"]}),
+        );
+        let response = site.get(&handler, "/").await;
+        assert_eq!(response.status, StatusCode::OK);
+        let listing = String::from_utf8(response.body.to_vec()).unwrap();
+        assert!(listing.contains("href=\"manual/\""), "{listing}");
+        assert!(listing.contains("href=\"latest.txt\""), "{listing}");
+        assert!(listing.contains("href=\"real.txt\""), "{listing}");
+        for absent in ["escape.txt", "via-link.txt", "dangling.txt", "secret.env"] {
+            assert!(
+                !listing.contains(absent),
+                "{absent} must not be listed: {listing}"
+            );
+        }
     }
 
     #[tokio::test]

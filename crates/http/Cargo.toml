@@ -28,6 +28,8 @@ bytes = { workspace = true }
 # runtime/admin API, and the dependency is acyclic (admin -> config/core, not http).
 caddy-rs-admin = { workspace = true, default-features = false }
 caddy-rs-core = { workspace = true, default-features = false }
+# Real path of an open file, to verify a handle stayed inside the served root.
+caddy-rs-fsperm = { path = "../fsperm" }
 caddy-rs-tls = { workspace = true, default-features = false }
 flate2 = { version = "1", optional = true }
 http = { workspace = true }
