@@ -31,6 +31,7 @@ fn test_config() -> AuthnConfig {
         issuer: None,
         audience: None,
         totp_window: TotpWindow::Current,
+        login_throttle: LoginThrottleConfig::default(),
     }
 }
 
@@ -729,10 +730,11 @@ async fn totp_login_and_disable() {
         .login("ivan", "password", Some(&login_code))
         .await
         .is_ok());
-    // Replaying the consumed code is rejected and flagged as a replay attempt.
+    // Replaying the consumed code is rejected. At the login boundary it is indistinguishable from
+    // a wrong code (E1): the `TotpReplay` distinction is only for the lower-level verify call.
     assert!(matches!(
         later.login("ivan", "password", Some(&login_code)).await,
-        Err(AuthError::TotpReplay)
+        Err(AuthError::InvalidTotpCode)
     ));
 
     service.totp_disable(user.id).await.unwrap();

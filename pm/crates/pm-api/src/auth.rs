@@ -8,6 +8,10 @@
 //! message is only reachable after the password matched, so it does not become an account oracle.
 //! Login failures are rate limited per username: five failures inside a minute answer `429` with
 //! `Retry-After`, which also bounds online TOTP guessing (every TOTP failure is a login failure).
+//! This sliding window is the outer limiter. The authentication service enforces its own
+//! per-account lockout with exponential backoff (30 s doubling to 15 min, shared by password and
+//! TOTP failures, see `caddy-rs-authn`'s `LoginThrottleConfig`), also for `totp_verify`, so the
+//! TOTP confirm/disable endpoints are throttled too; its refusals map to the same `429`.
 //!
 //! Every handler takes [`LocalPeer`] first, like the rest of the management API: a non-loopback
 //! peer is refused before the body is parsed. `Cache-Control: no-store` keeps token pairs and the
@@ -280,8 +284,20 @@ fn login_error(error: AuthError) -> ApiError {
             ApiError::Unauthorized("invalid username or password".to_owned())
         }
         AuthError::InvalidTotpCode => ApiError::Unauthorized("invalid TOTP code".to_owned()),
-        AuthError::TotpReplay => ApiError::Unauthorized("TOTP code already used".to_owned()),
+        // The service already reports a replayed code as `InvalidTotpCode` at the login boundary;
+        // this arm only keeps a direct `TotpReplay` from distinguishing itself if that changes.
+        AuthError::TotpReplay => ApiError::Unauthorized("invalid TOTP code".to_owned()),
+        AuthError::TooManyAttempts { retry_after } => rate_limited(retry_after),
         other => internal_error(other),
+    }
+}
+
+/// The service-level lockout (per-account failure budget with exponential backoff) as `429` with
+/// `Retry-After`. The same mapping serves login and the TOTP endpoints, so every caller of the
+/// authentication service gets one consistent refusal.
+fn rate_limited(retry_after: Duration) -> ApiError {
+    ApiError::RateLimited {
+        retry_after_seconds: retry_after.as_secs().max(1),
     }
 }
 
@@ -435,6 +451,7 @@ pub(crate) async fn totp_confirm_handler(
                 tracing::warn!(user = %sub.0, "TOTP replay refused at confirm");
                 ApiError::Unauthorized("invalid TOTP code".to_owned())
             }
+            AuthError::TooManyAttempts { retry_after } => rate_limited(retry_after),
             AuthError::UserNotFound => ApiError::Unauthorized("invalid access token".to_owned()),
             other => internal_error(other),
         })?;
@@ -494,6 +511,7 @@ async fn verify_totp(state: &ApiState, user_id: UserId, code: &str) -> Result<()
             tracing::warn!(user = %user_id.0, "TOTP replay refused");
             Err(ApiError::Unauthorized("invalid TOTP code".to_owned()))
         }
+        Err(AuthError::TooManyAttempts { retry_after }) => Err(rate_limited(retry_after)),
         Err(AuthError::UserNotFound) => {
             Err(ApiError::Unauthorized("invalid access token".to_owned()))
         }
@@ -591,6 +609,25 @@ mod tests {
             refresh_token: "refresh-token".to_owned(),
         };
         assert!(!format!("{refresh:?}").contains("refresh-token"));
+    }
+
+    #[test]
+    fn service_lockouts_map_to_429_with_retry_after_and_replays_stay_masked() {
+        let response = login_error(AuthError::TooManyAttempts {
+            retry_after: Duration::from_secs(90),
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "90");
+
+        // A zero wait would invite an immediate refused retry.
+        let response = rate_limited(Duration::ZERO).into_response();
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+
+        // A replayed code carries the same message as a wrong one.
+        let replay = login_error(AuthError::TotpReplay);
+        let wrong = login_error(AuthError::InvalidTotpCode);
+        assert_eq!(replay.to_string(), wrong.to_string());
     }
 
     #[test]

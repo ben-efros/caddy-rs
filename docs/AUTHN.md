@@ -32,6 +32,7 @@ containing `AuthnConfig` does not. `Debug` redacts the signing-key source.
 | `argon2_params` | memory 19 456 KiB, time cost 2, parallelism 1 | OWASP-recommended Argon2id defaults (2024). |
 | `issuer` / `audience` | `None` | Optional JWT issuer/audience claims. |
 | `totp_window` | `TotpWindow::Current` | See [TOTP.md](TOTP.md). |
+| `login_throttle` | 5 failures, 30 s doubling to 15 min, 10 000 tracked keys | See [Login throttling](#login-throttling). Invalid values (zero failures, zero or inverted lockouts, zero tracked keys) make `AuthnService::new` fail with `AuthError::InvalidConfig`. |
 
 ## JWT signing secret
 
@@ -79,12 +80,38 @@ so response time does not reveal whether an account exists.
 - Unknown username and wrong password both return `AuthError::InvalidCredentials`.
 - If the account has TOTP enabled, a missing or non-matching code returns
   `AuthError::InvalidTotpCode`. A code that is cryptographically valid but already consumed (or
-  older than the last accepted step) returns `AuthError::TotpReplay` — the replay signal is
-  preserved through login. See [TOTP.md](TOTP.md) for how to treat it.
+  older than the last accepted step) is also reported as `InvalidTotpCode` at login: the replay
+  is logged by the service rather than returned, so it is not an oracle for recently valid codes.
+  `totp_verify` called directly still returns `AuthError::TotpReplay`. See [TOTP.md](TOTP.md).
+- While an account is locked out (see below) the call returns `AuthError::TooManyAttempts` without
+  checking any credential.
 - The refresh token is opaque, single-use and rotated: `refresh` atomically consumes the presented
   token and issues a new pair. A reused, revoked, expired or unknown token is rejected with a
   distinct `AuthError` (`RefreshTokenRevoked`, `RefreshTokenNotFound`, `TokenExpired`, …);
   `revoke_all_for_user` revokes every live refresh token for an account.
+
+## Login throttling
+
+`login` and `totp_verify` throttle failed attempts inside the service, so every embedder (the PM
+API, the CLI enrolment flow, any future caller) inherits it. `AuthnConfig::login_throttle`
+(`LoginThrottleConfig`) defaults to `max_failures = 5`, `base_lockout = 30 s`,
+`max_lockout = 15 min`, `max_tracked = 10 000`.
+
+- An attempt is **reserved before** the credential is checked, under one lock, so parallel guesses
+  cannot all pass an "under the limit" check. A success resets the counter; a failure leaves it
+  counted.
+- After `max_failures` consecutive failures the key is locked for `base_lockout`; once served, each
+  further failure re-locks for twice as long (capped at `max_lockout`): one guess per lockout
+  period. A key idle for `2 * max_lockout` is forgiven.
+- Password failures and TOTP failures during `login` share one per-username budget. Direct
+  `totp_verify` calls use a separate per-account budget (`totp:<user id>`).
+- Keys are the *submitted* username (ASCII-case-folded), counted whether or not the account exists,
+  so lockout state does not reveal which usernames are real. Keys over 128 bytes are replaced by a
+  SHA-256 digest, and at `max_tracked` entries the least recently active unlocked entry is evicted
+  (locked entries last), so the tracker's memory is bounded however many usernames are submitted.
+- Counters are in-process and shared by clones of the service; they reset on restart.
+- Availability trade-off: anyone who knows a username can keep that account locked out (at most
+  `max_lockout` at a time). That is the price of bounding online guessing.
 
 ## Enrolment API surface (not an HTTP endpoint)
 

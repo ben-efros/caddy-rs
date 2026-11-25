@@ -88,11 +88,22 @@ Disabling TOTP, or re-enrolling a user, clears `totp_last_step` so the new secre
 | `Err(AuthError::TotpNotConfigured)` | The user has no TOTP secret. | Configuration error; do not prompt for a code. |
 | `Err(AuthError::UserNotFound)` | Unknown user id. | Do not reveal which condition failed. |
 
-`AuthnService::login` preserves the distinction: a missing or wrong code is
-`AuthError::InvalidTotpCode`, while a replayed/downgraded code propagates
-`AuthError::TotpReplay`. The PM API maps them to `401 invalid TOTP code` and
-`401 TOTP code already used` respectively; a public response may deliberately collapse the replay
-case to a generic error, but logs and metrics should keep the distinction.
+`AuthnService::totp_verify` itself still reports the replay distinction (`AuthError::TotpReplay`).
+`AuthnService::login` does **not**: a missing, wrong, replayed or downgraded code is always
+`AuthError::InvalidTotpCode` at the login boundary, so a caller holding the password cannot learn
+which codes were recently valid. The replay is logged at `warn` by the service (`TOTP replay refused
+at login`) instead.
+
+### Online guessing is throttled
+
+Every `totp_verify` call and every `login` attempt reserves one attempt in a per-account budget
+([`LoginThrottleConfig`], see [AUTHN.md](AUTHN.md#login-throttling)): after 5 consecutive failures
+the account is locked for 30 s, then 60 s, 120 s, … up to 15 min, and the call fails with
+`AuthError::TooManyAttempts { retry_after }` *before* the code is evaluated. Password failures and
+TOTP failures share one budget (login) so the six-digit code cannot be brute-forced independently of
+the password; direct `totp_verify` calls (enrolment confirmation, factor removal) have their own
+per-account budget. A successful verification resets it. The PM API maps the refusal to `429` with
+`Retry-After`.
 
 ## Enrolment
 

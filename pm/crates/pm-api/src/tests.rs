@@ -3274,6 +3274,64 @@ async fn a_replayed_confirm_code_is_refused() {
 }
 
 #[tokio::test]
+async fn totp_confirm_guessing_is_throttled_with_429_and_retry_after() {
+    let (_dir, server, _authn) = server_with_authn();
+    let _admin = first_admin(&server).await;
+    let tokens = login(&server, "admin", SETUP_PASSWORD).await;
+    let enrollment = begin_enrollment(&server, &tokens.access_token).await;
+
+    // Five wrong guesses by a caller holding a (stolen) access token spend the budget ...
+    for _ in 0..5 {
+        let wrong = confirm_enrollment(&server, &tokens.access_token, "abcdef").await;
+        assert_eq!(wrong.status_code(), StatusCode::UNAUTHORIZED);
+    }
+    // ... after which even the correct code is refused without being evaluated.
+    let code = totp_code_for(&enrollment.otpauth_uri);
+    let blocked = confirm_enrollment(&server, &tokens.access_token, &code).await;
+    assert_eq!(blocked.status_code(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(error_envelope(&blocked).error.code, ErrorCode::RateLimited);
+    let retry_after = blocked
+        .header("retry-after")
+        .to_str()
+        .expect("a Retry-After header")
+        .parse::<u64>()
+        .expect("seconds");
+    assert!((1..=30).contains(&retry_after), "{retry_after}");
+}
+
+#[tokio::test]
+async fn totp_disable_guessing_is_throttled() {
+    let (_dir, server, _authn) = server_with_totp_window();
+    let _admin = first_admin(&server).await;
+    let tokens = login(&server, "admin", SETUP_PASSWORD).await;
+    let enrollment = begin_enrollment(&server, &tokens.access_token).await;
+    let code = totp_code_for(&enrollment.otpauth_uri);
+    assert_eq!(
+        confirm_enrollment(&server, &tokens.access_token, &code)
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+    let session = login_with_totp(&server, "admin", SETUP_PASSWORD, &enrollment.otpauth_uri).await;
+
+    for _ in 0..5 {
+        let bad = server
+            .post("/api/v1/auth/totp/disable")
+            .add_header("Authorization", bearer(&session.access_token))
+            .json(&serde_json::json!({"totpCode": "abcdef"}))
+            .await;
+        assert_eq!(bad.status_code(), StatusCode::UNAUTHORIZED);
+    }
+    let blocked = server
+        .post("/api/v1/auth/totp/disable")
+        .add_header("Authorization", bearer(&session.access_token))
+        .json(&serde_json::json!({"totpCode": "abcdef"}))
+        .await;
+    assert_eq!(blocked.status_code(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(blocked.maybe_header("retry-after").is_some());
+}
+
+#[tokio::test]
 async fn disabling_totp_requires_a_current_code() {
     let (_dir, server, _authn) = server_with_totp_window();
     let _admin = first_admin(&server).await;

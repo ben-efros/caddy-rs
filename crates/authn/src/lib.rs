@@ -31,8 +31,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use argon2::{
     password_hash::{phc::PasswordHash, PasswordHasher, PasswordVerifier},
@@ -573,6 +573,19 @@ pub enum AuthError {
     /// TOTP is already active, so there is no pending enrollment to confirm.
     #[error("TOTP is already enabled for this account")]
     TotpAlreadyEnabled,
+    /// Too many failed attempts for this account: the caller must wait before trying again.
+    ///
+    /// Returned *before* any credential is checked, so a locked account cannot be used to keep
+    /// guessing. The same error is returned for a username that does not exist once enough
+    /// attempts were made against it, so the lockout state is not an account-existence oracle.
+    #[error("too many failed attempts; retry in {} seconds", .retry_after.as_secs())]
+    TooManyAttempts {
+        /// How long until the next attempt is accepted.
+        retry_after: Duration,
+    },
+    /// The service configuration is unusable (weak or inconsistent parameters).
+    #[error("invalid authentication configuration: {0}")]
+    InvalidConfig(String),
     /// A password hash is malformed or uses an unsupported format.
     #[error("password hash error: {0}")]
     PasswordHash(String),
@@ -1120,6 +1133,8 @@ pub struct AuthnConfig {
     pub audience: Option<String>,
     /// TOTP verification window.
     pub totp_window: TotpWindow,
+    /// Failed-attempt throttling for [`AuthnService::login`] and [`AuthnService::totp_verify`].
+    pub login_throttle: LoginThrottleConfig,
 }
 
 impl Default for AuthnConfig {
@@ -1132,8 +1147,193 @@ impl Default for AuthnConfig {
             issuer: None,
             audience: None,
             totp_window: TotpWindow::Current,
+            login_throttle: LoginThrottleConfig::default(),
         }
     }
+}
+
+/// Failed-attempt throttling: consecutive failures lock the account out with exponential backoff.
+///
+/// One budget covers password failures *and* TOTP failures for the same submitted username, so
+/// guessing the six-digit code online is bounded by the same lockout schedule as guessing the
+/// password. Counting is keyed by the submitted username string whether or not an account of that
+/// name exists, which keeps the lockout state from revealing which usernames are real.
+///
+/// The lockout is a deliberate availability trade-off: someone who knows a username can keep that
+/// account locked out (at most [`max_lockout`](Self::max_lockout) at a time). That is the cost of
+/// bounding online guessing; the alternative is an unbounded guessing budget.
+#[derive(Debug, Clone)]
+pub struct LoginThrottleConfig {
+    /// Consecutive failures tolerated before the first lockout. Must be at least 1.
+    pub max_failures: u32,
+    /// Length of the first lockout; it doubles for every further lockout without an intervening
+    /// success. Must be non-zero.
+    pub base_lockout: Duration,
+    /// Upper bound for the doubling lockout. Must be at least [`base_lockout`](Self::base_lockout).
+    pub max_lockout: Duration,
+    /// Maximum number of usernames tracked at once. At the cap the least recently active entry is
+    /// evicted, so submitting made-up usernames cannot grow memory without bound.
+    pub max_tracked: usize,
+}
+
+impl Default for LoginThrottleConfig {
+    fn default() -> Self {
+        Self {
+            max_failures: 5,
+            base_lockout: Duration::from_secs(30),
+            max_lockout: Duration::from_secs(15 * 60),
+            max_tracked: 10_000,
+        }
+    }
+}
+
+impl LoginThrottleConfig {
+    /// Reject a configuration that would disable or break the throttle.
+    pub fn validate(&self) -> AuthResult<()> {
+        if self.max_failures == 0 {
+            return Err(AuthError::InvalidConfig(
+                "login_throttle.max_failures must be at least 1".to_string(),
+            ));
+        }
+        if self.base_lockout.is_zero() {
+            return Err(AuthError::InvalidConfig(
+                "login_throttle.base_lockout must be greater than zero".to_string(),
+            ));
+        }
+        if self.max_lockout < self.base_lockout {
+            return Err(AuthError::InvalidConfig(
+                "login_throttle.max_lockout must not be shorter than base_lockout".to_string(),
+            ));
+        }
+        if self.max_tracked == 0 {
+            return Err(AuthError::InvalidConfig(
+                "login_throttle.max_tracked must be at least 1".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Failure state for one throttle key.
+#[derive(Debug)]
+struct AttemptEntry {
+    /// Attempts reserved since the last success (or idle reset). Stays at or above the threshold
+    /// once reached, so every attempt after an expired lockout re-locks immediately with a longer
+    /// duration: one guess per lockout period.
+    failures: u32,
+    /// How many lockouts this entry has served; the next one lasts `base << level`.
+    level: u32,
+    locked_until: Option<Instant>,
+    last_activity: Instant,
+}
+
+/// Bounded map of failure counters shared by every clone of an [`AuthnService`].
+#[derive(Debug, Default)]
+struct AttemptTracker {
+    entries: HashMap<String, AttemptEntry>,
+}
+
+impl AttemptTracker {
+    /// Reserve one attempt for `key`, or report how long the key stays locked.
+    ///
+    /// The attempt is counted *before* the credential is checked and stays counted unless the
+    /// caller reports a success via [`clear`](Self::clear). Counting up front, under one lock, is
+    /// what makes the budget hold under concurrency: parallel guesses cannot all observe "still
+    /// under the limit" and then each get a free verification.
+    fn reserve(
+        &mut self,
+        key: &str,
+        now: Instant,
+        config: &LoginThrottleConfig,
+    ) -> Result<(), Duration> {
+        // A key that has been quiet for twice the longest lockout starts over, so old failures do
+        // not accumulate forever and a served backoff level is eventually forgiven.
+        let idle_reset = config.max_lockout.saturating_mul(2);
+        if let Some(entry) = self.entries.get_mut(key) {
+            match entry.locked_until {
+                Some(until) if until > now => return Err(until - now),
+                Some(_) => entry.locked_until = None,
+                None => {}
+            }
+            if now.saturating_duration_since(entry.last_activity) >= idle_reset {
+                entry.failures = 0;
+                entry.level = 0;
+            }
+        } else {
+            if self.entries.len() >= config.max_tracked {
+                self.evict_one(now);
+            }
+            self.entries.insert(
+                key.to_string(),
+                AttemptEntry {
+                    failures: 0,
+                    level: 0,
+                    locked_until: None,
+                    last_activity: now,
+                },
+            );
+        }
+        let Some(entry) = self.entries.get_mut(key) else {
+            return Ok(());
+        };
+        entry.last_activity = now;
+        entry.failures = entry.failures.saturating_add(1);
+        if entry.failures >= config.max_failures {
+            let factor = 1u32.checked_shl(entry.level).unwrap_or(u32::MAX);
+            let lockout = config
+                .base_lockout
+                .saturating_mul(factor)
+                .min(config.max_lockout);
+            entry.locked_until = Some(now + lockout);
+            entry.level = entry.level.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    /// Forget `key`: a successful authentication ends the failure streak.
+    fn clear(&mut self, key: &str) {
+        self.entries.remove(key);
+    }
+
+    /// Drop one entry to make room: an unlocked one first (oldest activity), a locked one only
+    /// when everything is locked.
+    fn evict_one(&mut self, now: Instant) {
+        let victim = self
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| {
+                (
+                    entry.locked_until.is_some_and(|until| until > now),
+                    entry.last_activity,
+                )
+            })
+            .map(|(key, _)| key.clone());
+        if let Some(key) = victim {
+            self.entries.remove(&key);
+        }
+    }
+}
+
+/// Longest submitted username kept verbatim as a throttle key; longer ones are keyed by digest so
+/// the tracker's memory is bounded by `max_tracked` regardless of request size.
+const MAX_THROTTLE_KEY_BYTES: usize = 128;
+
+/// Throttle key for a submitted username.
+///
+/// ASCII case is folded: the store matches names case-sensitively, but a limiter that treated
+/// `Admin` and `admin` as different keys could be dodged by changing the spelling.
+fn username_throttle_key(username: &str) -> String {
+    let folded = username.to_ascii_lowercase();
+    if folded.len() > MAX_THROTTLE_KEY_BYTES {
+        format!("user-sha256:{}", hash_refresh_token(&folded))
+    } else {
+        format!("user:{folded}")
+    }
+}
+
+/// Throttle key for TOTP verification of one account outside the login flow.
+fn totp_throttle_key(user_id: UserId) -> String {
+    format!("totp:{}", user_id.0)
 }
 
 impl std::fmt::Debug for AuthnConfig {
@@ -1146,6 +1346,7 @@ impl std::fmt::Debug for AuthnConfig {
             .field("issuer", &self.issuer)
             .field("audience", &self.audience)
             .field("totp_window", &self.totp_window)
+            .field("login_throttle", &self.login_throttle)
             .finish()
     }
 }
@@ -1617,6 +1818,11 @@ pub struct AuthnService<S: UserStore> {
     /// 30-second boundary.
     #[cfg(test)]
     test_step: Option<u64>,
+    /// Failure counters for [`LoginThrottleConfig`]; shared by every clone of the service.
+    attempts: Arc<Mutex<AttemptTracker>>,
+    /// Origin of the throttle clock in tests, where "now" is origin + the shared offset.
+    #[cfg(test)]
+    test_clock: Option<(Instant, Arc<std::sync::atomic::AtomicU64>)>,
 }
 
 impl<S: UserStore> AuthnService<S> {
@@ -1625,6 +1831,7 @@ impl<S: UserStore> AuthnService<S> {
     /// Fails when the configured [`JwtSecretSource`] cannot produce a signing key, rather than
     /// silently starting with a different (ephemeral) key that would invalidate every session.
     pub fn new(store: S, config: AuthnConfig) -> AuthResult<Self> {
+        config.login_throttle.validate()?;
         let secret = config.jwt_secret_source.resolve()?;
         let encoding_key = EncodingKey::from_secret(&secret);
         let decoding_key = DecodingKey::from_secret(&secret);
@@ -1640,7 +1847,56 @@ impl<S: UserStore> AuthnService<S> {
             dummy_password_hash,
             #[cfg(test)]
             test_step: None,
+            attempts: Arc::new(Mutex::new(AttemptTracker::default())),
+            #[cfg(test)]
+            test_clock: None,
         })
+    }
+
+    /// Drive the throttle clock from a shared counter of elapsed seconds. Test-only.
+    #[cfg(test)]
+    pub(crate) fn with_test_clock(
+        mut self,
+        elapsed_seconds: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        self.test_clock = Some((Instant::now(), elapsed_seconds));
+        self
+    }
+
+    /// "Now" for the throttle: the monotonic clock, or the test clock when one is installed.
+    fn throttle_now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some((origin, elapsed)) = &self.test_clock {
+            return *origin
+                + Duration::from_secs(elapsed.load(std::sync::atomic::Ordering::SeqCst));
+        }
+        Instant::now()
+    }
+
+    /// Reserve one attempt for `key`, failing with [`AuthError::TooManyAttempts`] while it is
+    /// locked out.
+    fn reserve_attempt(&self, key: &str) -> AuthResult<()> {
+        let now = self.throttle_now();
+        let mut tracker = self
+            .attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tracker
+            .reserve(key, now, &self.config.login_throttle)
+            .map_err(|wait| AuthError::TooManyAttempts {
+                // Round up: telling the client "0 seconds" invites an immediate, refused retry.
+                retry_after: Duration::from_secs(
+                    wait.as_secs() + u64::from(wait.subsec_nanos() > 0),
+                ),
+            })
+    }
+
+    /// A success ends the failure streak for `key`.
+    fn clear_attempts(&self, key: &str) {
+        self.attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear(key);
     }
 
     /// Pin the TOTP time step. Test-only: production always uses the system clock.
@@ -1902,7 +2158,25 @@ impl<S: UserStore> AuthnService<S> {
     /// impersonation attempt. Detection of older codes is bounded by
     /// [`TOTP_REPLAY_LOOKBACK_STEPS`]: a code older than that is indistinguishable from a wrong
     /// guess and is reported as `Ok(false)`.
+    ///
+    /// Every call is a throttled attempt: after [`LoginThrottleConfig::max_failures`] consecutive
+    /// failures for this account the call fails with [`AuthError::TooManyAttempts`] before the code
+    /// is looked at, with exponentially growing lockouts. A successful verification resets the
+    /// budget. This bounds online guessing of the six-digit code for every caller (enrollment
+    /// confirmation, factor removal) and not just for [`login`](Self::login), which has its own
+    /// per-username budget.
     pub async fn totp_verify(&self, user_id: UserId, code: &str) -> AuthResult<bool> {
+        let key = totp_throttle_key(user_id);
+        self.reserve_attempt(&key)?;
+        let verified = self.totp_verify_unthrottled(user_id, code).await?;
+        if verified {
+            self.clear_attempts(&key);
+        }
+        Ok(verified)
+    }
+
+    /// The verification itself, with no failure accounting: the caller owns the throttle.
+    async fn totp_verify_unthrottled(&self, user_id: UserId, code: &str) -> AuthResult<bool> {
         let user = self
             .store
             .get_user(user_id)
@@ -1985,12 +2259,29 @@ impl<S: UserStore> AuthnService<S> {
     }
 
     /// Log in with a username, password and optional TOTP code.
+    ///
+    /// # Throttling
+    ///
+    /// Each call reserves one attempt in the per-username budget of [`LoginThrottleConfig`] before
+    /// any credential is checked; a success resets the budget. Password failures and TOTP failures
+    /// draw from the same budget, and an unknown username is counted exactly like a known one, so
+    /// a locked-out response never reveals whether the account exists. While locked out the call
+    /// fails with [`AuthError::TooManyAttempts`].
+    ///
+    /// # Error reporting
+    ///
+    /// A TOTP code that is correct but stale or already used (a replay) is reported as
+    /// [`AuthError::InvalidTotpCode`], the same as a wrong code: the distinction would tell a
+    /// password-holder which codes were recently valid. The replay is logged instead.
     pub async fn login(
         &self,
         username: &str,
         password: &str,
         totp_code: Option<&str>,
     ) -> AuthResult<TokenPair> {
+        let key = username_throttle_key(username);
+        self.reserve_attempt(&key)?;
+
         let Some(user) = self.store.get_user_by_username(username).await? else {
             // Spend the same password-verification work as the hit path before failing, so the
             // response time does not reveal whether the username exists.
@@ -2004,12 +2295,20 @@ impl<S: UserStore> AuthnService<S> {
 
         if user.has_totp() {
             let code = totp_code.ok_or(AuthError::InvalidTotpCode)?;
-            if !self.totp_verify(user.id, code).await? {
-                return Err(AuthError::InvalidTotpCode);
+            match self.totp_verify_unthrottled(user.id, code).await {
+                Ok(true) => {}
+                Ok(false) => return Err(AuthError::InvalidTotpCode),
+                Err(AuthError::TotpReplay) => {
+                    tracing::warn!(user = %user.id.0, "TOTP replay refused at login");
+                    return Err(AuthError::InvalidTotpCode);
+                }
+                Err(other) => return Err(other),
             }
         }
 
-        self.issue_token_pair(&user).await
+        let tokens = self.issue_token_pair(&user).await?;
+        self.clear_attempts(&key);
+        Ok(tokens)
     }
 
     /// Refresh an access token using a refresh token.
@@ -2180,3 +2479,5 @@ impl<S: UserStore> AuthnService<S> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_security;
