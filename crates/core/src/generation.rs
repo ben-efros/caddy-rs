@@ -533,6 +533,17 @@ impl GenerationStore {
     pub fn is_active(&self) -> bool {
         self.current().is_some()
     }
+
+    /// How many generations have been loaded in this store's lifetime.
+    ///
+    /// This is monotonic and independent of any observer's history, so it answers "was this store
+    /// ever active?" even after [`GenerationStore::stop`] has emptied it. The server runtime loop
+    /// needs exactly that: a `/stop` that empties the store before the loop's first pass can
+    /// otherwise look like "nothing was ever loaded" and the loop would wait forever for a
+    /// generation that is never coming.
+    pub fn loaded_count(&self) -> u64 {
+        self.next_id.load(Ordering::Acquire)
+    }
 }
 
 /// Result of [`GenerationStore::stop_async`].
