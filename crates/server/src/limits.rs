@@ -101,8 +101,11 @@ pub struct ServerLimits {
     pub read_header_timeout: Duration,
 
     /// How long a request-body read may stall before the request is aborted (Caddy's
-    /// `read_idle_timeout`, default 1 minute; `None` when configured negative). Enforced on
-    /// HTTP/3 request bodies; HTTP/1.1 and HTTP/2 rely on `read_timeout` (DIV-0029).
+    /// `read_idle_timeout`, default 1 minute; `None` when configured negative).
+    ///
+    /// Parsed and validated only: no listener or handler reads this field yet, so configuring it
+    /// currently has no runtime effect. Applying it to HTTP/3 request bodies is tracked with the
+    /// other unenforced connection limits in DIV-0021.
     pub read_idle_timeout: Option<Duration>,
 
     /// Maximum size in bytes of the request head. `None` uses the hyper default.
