@@ -187,26 +187,10 @@ impl Cidr {
         Some(Self { base, prefix })
     }
 
+    /// Whether `address` is in the range, also trying the IPv4-canonical form of an IPv4-mapped
+    /// IPv6 peer (the default listener is dual-stack; SEC-MEDIUM-PROXY review).
     fn contains(&self, address: IpAddr) -> bool {
-        match (self.base, address) {
-            (IpAddr::V4(base), IpAddr::V4(address)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u32::MAX << (32 - self.prefix)
-                };
-                (u32::from(base) & mask) == (u32::from(address) & mask)
-            }
-            (IpAddr::V6(base), IpAddr::V6(address)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u128::MAX << (128 - self.prefix)
-                };
-                (u128::from(base) & mask) == (u128::from(address) & mask)
-            }
-            _ => false,
-        }
+        caddy_rs_core::net::ip_in_net(self.base, self.prefix, address)
     }
 }
 
@@ -681,17 +665,317 @@ pub struct BasicAuthHandler {
     realm: String,
     /// Caddy's fixed fake hashes, verified for unknown usernames to avoid a user-existence timing
     /// side channel (see `BcryptHash.FakeHash`/`Argon2idHash.FakeHash` upstream).
-    fake_hash: PasswordHash,
+    fake_hash: std::sync::Arc<PasswordHash>,
+    /// Memoised comparison results (Caddy's `hash_cache`), keyed by a secret-keyed MAC.
+    cache: std::sync::Arc<HashCache>,
+    /// Hash-permit pool; the process-wide one unless a test injects its own.
+    limiter: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Longest a request may wait for a hash permit before a 503. `None` (`stock_compat: true`)
+    /// waits indefinitely, like stock Caddy.
+    max_wait: Option<std::time::Duration>,
+    /// Uncached verifications currently in flight per client bucket.
+    waiters: std::sync::Arc<ClientWaiters>,
+    /// Most uncached verifications one client may have in flight (`None` under `stock_compat`).
+    per_client_cap: Option<usize>,
+    /// Hash computations actually run (not served from the cache or a shared flight).
+    hash_runs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Verifications in flight per cache key (single flight).
+    flights: std::sync::Arc<Flights>,
+}
+
+/// In-flight uncached verifications one client (IPv4 address, or IPv6 /64) may have at once under
+/// the secure default; more get 429 immediately instead of queueing behind the hash pool.
+const CLIENT_WAITER_CAP: usize = 8;
+
+type ClientBucket = [u8; 16];
+
+/// The client bucket of a request: the resolved `client_ip` variable (set by the server from the
+/// trusted-proxy configuration, like the `client_ip` matcher) or else the peer address; IPv6
+/// addresses are bucketed by their /64.
+fn client_bucket(request: &Request) -> Option<ClientBucket> {
+    let parse = |value: &str| {
+        value
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .or_else(|| value.parse::<std::net::SocketAddr>().ok().map(|a| a.ip()))
+    };
+    let ip = request
+        .vars
+        .get("client_ip")
+        .and_then(|value| parse(value))
+        .or_else(|| request.remote_addr.map(|remote| remote.ip()))?;
+    Some(match ip {
+        std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
+        std::net::IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            octets[8..].fill(0);
+            // An IPv4-mapped address is the IPv4 client, not a /64 of mapped space.
+            match v6.to_ipv4_mapped() {
+                Some(v4) => v4.to_ipv6_mapped().octets(),
+                None => octets,
+            }
+        }
+    })
+}
+
+/// Bounded by construction: an entry exists only while that client has a verification in flight.
+#[derive(Default, Debug)]
+struct ClientWaiters {
+    counts: std::sync::Mutex<std::collections::HashMap<ClientBucket, usize>>,
+}
+
+struct WaiterGuard {
+    owner: std::sync::Arc<ClientWaiters>,
+    bucket: ClientBucket,
+}
+
+/// Process-wide client table, shared by every `basic_auth` handler like the hash pool it
+/// protects: K handlers must not give one client K times the cap.
+fn global_client_waiters() -> &'static std::sync::Arc<ClientWaiters> {
+    static WAITERS: std::sync::OnceLock<std::sync::Arc<ClientWaiters>> = std::sync::OnceLock::new();
+    WAITERS.get_or_init(std::sync::Arc::default)
+}
+
+/// Verifications in flight per cache key. The first request for a key (the leader) computes;
+/// concurrent identical requests (followers) wait for its result instead of each hashing and
+/// each taking a per-client slot.
+#[derive(Default, Debug)]
+struct Flights {
+    map: std::sync::Mutex<
+        std::collections::HashMap<
+            [u8; 32],
+            std::sync::Arc<tokio::sync::watch::Sender<FlightState>>,
+        >,
+    >,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FlightState {
+    Pending,
+    Done(bool),
+    /// The leader went away without a result (cancelled, refused, overloaded): followers retry.
+    Abandoned,
+}
+
+enum Joined {
+    Leader(FlightLeader),
+    Follower(tokio::sync::watch::Receiver<FlightState>),
+}
+
+/// Completion handle of a flight; moved into the blocking job. Dropping it unfinished (the
+/// request was cancelled before the hash started, or was refused) abandons the flight.
+struct FlightLeader {
+    flights: std::sync::Arc<Flights>,
+    key: [u8; 32],
+    sender: std::sync::Arc<tokio::sync::watch::Sender<FlightState>>,
+    finished: bool,
+}
+
+impl Flights {
+    fn join(self: &std::sync::Arc<Self>, key: [u8; 32]) -> Joined {
+        let mut map = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(sender) = map.get(&key) {
+            return Joined::Follower(sender.subscribe());
+        }
+        let (sender, _receiver) = tokio::sync::watch::channel(FlightState::Pending);
+        let sender = std::sync::Arc::new(sender);
+        map.insert(key, std::sync::Arc::clone(&sender));
+        Joined::Leader(FlightLeader {
+            flights: std::sync::Arc::clone(self),
+            key,
+            sender,
+            finished: false,
+        })
+    }
+}
+
+impl FlightLeader {
+    fn settle(&mut self, state: FlightState) {
+        self.finished = true;
+        self.sender.send_replace(state);
+        let mut map = self
+            .flights
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map
+            .get(&self.key)
+            .is_some_and(|current| std::sync::Arc::ptr_eq(current, &self.sender))
+        {
+            map.remove(&self.key);
+        }
+    }
+
+    fn finish(mut self, matched: bool) {
+        self.settle(FlightState::Done(matched));
+    }
+}
+
+impl Drop for FlightLeader {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.settle(FlightState::Abandoned);
+        }
+    }
+}
+
+impl ClientWaiters {
+    fn enter(self: &std::sync::Arc<Self>, bucket: ClientBucket, cap: usize) -> Option<WaiterGuard> {
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = counts.entry(bucket).or_insert(0);
+        if *count >= cap {
+            return None;
+        }
+        *count += 1;
+        Some(WaiterGuard {
+            owner: std::sync::Arc::clone(self),
+            bucket,
+        })
+    }
+}
+
+impl Drop for WaiterGuard {
+    fn drop(&mut self) {
+        let mut counts = self
+            .owner
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = counts.get_mut(&self.bucket) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.bucket);
+            }
+        }
+    }
+}
+
+/// Why a verification was refused instead of computed.
+#[derive(Debug, PartialEq, Eq)]
+enum Refusal {
+    /// The hash pool stayed saturated past the secure-default wait (503).
+    Overloaded,
+    /// This client already has the maximum in-flight uncached verifications (429).
+    ClientBusy,
+}
+
+/// Longest wait for a hash permit under the secure default before answering 503 + `Retry-After`.
+const HASH_QUEUE_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Entries kept by the hash cache (Caddy's `HashCache` also stops growing at 1000 entries).
+const HASH_CACHE_CAPACITY: usize = 1000;
+
+/// Caddy's `hash_cache`: remembers whether a (stored hash, presented password) pair matched, so a
+/// repeated credential pair is answered without recomputing bcrypt/argon2id.
+///
+/// Unlike a map keyed by the plaintext, entries are keyed by `HMAC-SHA256(secret, hash || 0 ||
+/// password)` with a random per-handler secret that never leaves the process, so the cache
+/// contents cannot be used to test password guesses offline.
+struct HashCache {
+    key: ring::hmac::Key,
+    entries: std::sync::Mutex<CacheState>,
+}
+
+/// Remembered successes: key -> "hit since last considered for eviction", plus insertion order
+/// for the clock hand.
+#[derive(Default)]
+struct CacheState {
+    referenced: std::collections::HashMap<[u8; 32], bool>,
+    queue: std::collections::VecDeque<[u8; 32]>,
+}
+
+impl std::fmt::Debug for HashCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("HashCache").finish_non_exhaustive()
+    }
+}
+
+impl HashCache {
+    fn new() -> Self {
+        let rng = ring::rand::SystemRandom::new();
+        Self {
+            key: ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng)
+                .expect("the system random source is available"),
+            entries: std::sync::Mutex::new(CacheState::default()),
+        }
+    }
+
+    fn key(&self, identity: &[u8], password: &[u8]) -> [u8; 32] {
+        let mut message = Vec::with_capacity(8 + identity.len() + password.len());
+        message.extend_from_slice(&(identity.len() as u64).to_be_bytes());
+        message.extend_from_slice(identity);
+        message.extend_from_slice(password);
+        let tag = ring::hmac::sign(&self.key, &message);
+        let mut key = [0u8; 32];
+        key.copy_from_slice(tag.as_ref());
+        key
+    }
+
+    /// Whether `key` is a remembered success; a hit marks the entry as recently used.
+    fn hit(&self, key: &[u8; 32]) -> bool {
+        let Ok(mut state) = self.entries.lock() else {
+            return false;
+        };
+        match state.referenced.get_mut(key) {
+            Some(referenced) => {
+                *referenced = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Remember a success. When full, second-chance (clock) eviction removes the oldest entry
+    /// that was not hit since it was last considered, so entries in active use survive a flood.
+    fn insert(&self, key: [u8; 32]) {
+        let Ok(mut state) = self.entries.lock() else {
+            return;
+        };
+        if let Some(referenced) = state.referenced.get_mut(&key) {
+            *referenced = true;
+            return;
+        }
+        while state.referenced.len() >= HASH_CACHE_CAPACITY {
+            let Some(candidate) = state.queue.pop_front() else {
+                break;
+            };
+            match state.referenced.get_mut(&candidate) {
+                Some(referenced) if *referenced => {
+                    *referenced = false;
+                    state.queue.push_back(candidate);
+                }
+                _ => {
+                    state.referenced.remove(&candidate);
+                }
+            }
+        }
+        state.queue.push_back(key);
+        state.referenced.insert(key, false);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .map_or(0, |state| state.referenced.len())
+    }
 }
 
 #[derive(Debug, Clone)]
 struct Account {
-    hash: PasswordHash,
+    /// `Arc` so the hash can move into the blocking pool without a deep copy per request.
+    hash: std::sync::Arc<PasswordHash>,
 }
 
 /// A validated account password: the modular-crypt/PHC hash is parsed at configuration load, so
 /// malformed hashes fail loudly instead of turning into request-time 401s.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum PasswordHash {
     /// `$2a$`/`$2b$`/`$2x$`/`$2y$` modular-crypt bcrypt hash (validated by `bcrypt::HashParts`).
     Bcrypt(String),
@@ -701,17 +985,75 @@ enum PasswordHash {
     Plaintext(Vec<u8>),
 }
 
-#[derive(Debug, Clone)]
+/// Manual `Debug`: never prints a plaintext password, a bcrypt hash or an argon2 key.
+impl std::fmt::Debug for PasswordHash {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self {
+            Self::Bcrypt(_) => "Bcrypt",
+            Self::Argon2id(_) => "Argon2id",
+            Self::Plaintext(_) => "Plaintext",
+        };
+        formatter
+            .debug_tuple(kind)
+            .field(&format_args!("<redacted>"))
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 struct Argon2idHash {
     salt: Vec<u8>,
     key: Vec<u8>,
     params: Params,
 }
 
+/// Manual `Debug`: salt and derived key are redacted; the cost parameters stay visible.
+impl std::fmt::Debug for Argon2idHash {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Argon2idHash")
+            .field("salt", &format_args!("<redacted>"))
+            .field("key", &format_args!("<redacted>"))
+            .field("params", &self.params)
+            .finish()
+    }
+}
+
 impl BasicAuthHandler {
     /// Build from Caddy JSON. Accepts the canonical `authentication` handler shape as well as the
     /// caddy-rs `basic_auth` shorthand that carries the `http_basic` provider fields directly.
     pub fn from_json(value: &serde_json::Value, path: &str) -> Result<Self> {
+        Self::from_json_with_stock_compat(value, path, false)
+    }
+
+    /// Like [`Self::from_json`] with the generation's `stock_compat`: `true` keeps Caddy's
+    /// unbounded wait for a hash permit, `false` (the secure default) answers 503 + `Retry-After`
+    /// once the wait exceeds [`HASH_QUEUE_MAX_WAIT`].
+    pub fn from_json_with_stock_compat(
+        value: &serde_json::Value,
+        path: &str,
+        stock_compat: bool,
+    ) -> Result<Self> {
+        let mut handler = Self::from_json_inner(value, path)?;
+        handler.max_wait = (!stock_compat).then_some(HASH_QUEUE_MAX_WAIT);
+        handler.per_client_cap = (!stock_compat).then_some(CLIENT_WAITER_CAP);
+        Ok(handler)
+    }
+
+    #[cfg(test)]
+    fn with_hash_limits(
+        mut self,
+        limiter: std::sync::Arc<tokio::sync::Semaphore>,
+        max_wait: std::time::Duration,
+    ) -> Self {
+        self.limiter = limiter;
+        if self.max_wait.is_some() {
+            self.max_wait = Some(max_wait);
+        }
+        self
+    }
+
+    fn from_json_inner(value: &serde_json::Value, path: &str) -> Result<Self> {
         let object = value
             .as_object()
             .ok_or_else(|| invalid(path, "basic_auth handler must be an object"))?;
@@ -750,7 +1092,14 @@ impl BasicAuthHandler {
                 return Ok(Self {
                     accounts: BTreeMap::new(),
                     realm: "restricted".to_string(),
-                    fake_hash: fake_hash(PasswordAlgorithm::Bcrypt),
+                    fake_hash: std::sync::Arc::new(fake_hash(PasswordAlgorithm::Bcrypt)),
+                    cache: std::sync::Arc::new(HashCache::new()),
+                    limiter: std::sync::Arc::clone(hash_verification_limiter()),
+                    max_wait: Some(HASH_QUEUE_MAX_WAIT),
+                    waiters: std::sync::Arc::clone(global_client_waiters()),
+                    per_client_cap: Some(CLIENT_WAITER_CAP),
+                    hash_runs: std::sync::Arc::default(),
+                    flights: std::sync::Arc::default(),
                 });
             }
             Some(provider) => provider.as_object().ok_or_else(|| {
@@ -851,13 +1200,25 @@ impl BasicAuthHandler {
                 &password_bytes,
                 &format!("{account_path}.password"),
             )?;
-            accounts.insert(username, Account { hash });
+            accounts.insert(
+                username,
+                Account {
+                    hash: std::sync::Arc::new(hash),
+                },
+            );
         }
 
         Ok(Self {
             accounts,
             realm,
-            fake_hash: fake_hash(algorithm),
+            fake_hash: std::sync::Arc::new(fake_hash(algorithm)),
+            cache: std::sync::Arc::new(HashCache::new()),
+            limiter: std::sync::Arc::clone(hash_verification_limiter()),
+            max_wait: Some(HASH_QUEUE_MAX_WAIT),
+            waiters: std::sync::Arc::clone(global_client_waiters()),
+            per_client_cap: Some(CLIENT_WAITER_CAP),
+            hash_runs: std::sync::Arc::default(),
+            flights: std::sync::Arc::default(),
         })
     }
 }
@@ -1120,6 +1481,191 @@ fn verify_password(hash: &PasswordHash, password: &[u8]) -> bool {
     }
 }
 
+/// Upper bound on simultaneous password-hash computations: the machine's parallelism (at least
+/// 2). Hashing is pure CPU (and, for argon2id, memory) work, so more concurrency than cores only
+/// adds memory pressure without adding throughput.
+fn hash_verification_limit() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .max(2)
+}
+
+/// Process-wide limiter shared by every `basic_auth` handler instance, so the bound holds for
+/// the whole server rather than per route.
+fn hash_verification_limiter() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static LIMITER: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    LIMITER
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(hash_verification_limit())))
+}
+
+/// Run blocking `work` on the blocking pool once a permit is free. Callers beyond the limit wait
+/// asynchronously (they never occupy a worker thread and are never rejected, so response codes
+/// stay exactly Caddy's). A cancelled/panicked job counts as a failed verification.
+///
+/// The permit moves INTO the blocking closure: if the request future is dropped (HTTP/2
+/// `RST_STREAM`, timeout) the detached hash keeps its permit until it really finishes, so
+/// cancelled requests cannot multiply concurrent hashes beyond the limit.
+async fn run_limited<F>(limiter: &std::sync::Arc<tokio::sync::Semaphore>, work: F) -> bool
+where
+    F: FnOnce() -> bool + Send + 'static,
+{
+    run_limited_within(limiter, None, work)
+        .await
+        .unwrap_or(false)
+}
+
+/// [`run_limited`] with an optional cap on the wait for a permit: `None` waits indefinitely;
+/// `Some(limit)` gives up with `None` (the caller answers 503) once the wait exceeds `limit`.
+async fn run_limited_within<F>(
+    limiter: &std::sync::Arc<tokio::sync::Semaphore>,
+    max_wait: Option<std::time::Duration>,
+    work: F,
+) -> Option<bool>
+where
+    F: FnOnce() -> bool + Send + 'static,
+{
+    let acquire = std::sync::Arc::clone(limiter).acquire_owned();
+    let permit = match max_wait {
+        None => acquire.await,
+        Some(limit) => tokio::time::timeout(limit, acquire).await.ok()?,
+    };
+    let Ok(permit) = permit else {
+        return Some(false);
+    };
+    Some(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work()
+        })
+        .await
+        .unwrap_or(false),
+    )
+}
+
+impl PasswordHash {
+    /// Stable bytes identifying the stored hash, mixed into the hash-cache key.
+    fn cache_identity(&self) -> Vec<u8> {
+        match self {
+            Self::Bcrypt(encoded) => [b"bcrypt:".as_slice(), encoded.as_bytes()].concat(),
+            Self::Argon2id(hash) => {
+                let mut identity = b"argon2id:".to_vec();
+                for value in [
+                    hash.params.m_cost(),
+                    hash.params.t_cost(),
+                    hash.params.p_cost(),
+                ] {
+                    identity.extend_from_slice(&value.to_be_bytes());
+                }
+                identity.extend_from_slice(&(hash.salt.len() as u64).to_be_bytes());
+                identity.extend_from_slice(&hash.salt);
+                identity.extend_from_slice(&hash.key);
+                identity
+            }
+            Self::Plaintext(expected) => [b"plaintext:".as_slice(), expected].concat(),
+        }
+    }
+}
+
+impl BasicAuthHandler {
+    /// Verify `password` against `hash` without blocking an async worker. bcrypt (cost 14 for the
+    /// unknown-user fake hash) and argon2id take 100 ms to seconds of CPU; the constant-time
+    /// plaintext extension is trivially cheap and stays inline. Repeated pairs are answered from
+    /// the hash cache. `None` means the hash pool stayed saturated past the secure-default wait.
+    ///
+    /// `username` is `Some` only for a real account: the verdict for the fake hash of an unknown
+    /// user is never cached (a cached unknown-user verdict would make a repeat probe cheaper than
+    /// the same probe of a real account, a user-existence oracle), and the username is part of
+    /// every cache key.
+    async fn verify_offloaded(
+        &self,
+        bucket: Option<ClientBucket>,
+        username: Option<&str>,
+        hash: std::sync::Arc<PasswordHash>,
+        password: Vec<u8>,
+    ) -> std::result::Result<bool, Refusal> {
+        if matches!(*hash, PasswordHash::Plaintext(_)) {
+            return Ok(verify_password(&hash, &password));
+        }
+        let key = username.map(|username| {
+            let mut identity = (username.len() as u64).to_be_bytes().to_vec();
+            identity.extend_from_slice(username.as_bytes());
+            identity.extend_from_slice(&hash.cache_identity());
+            self.cache.key(&identity, &password)
+        });
+        // Single flight: identical concurrent (user, password) checks wait for one verification.
+        let mut leader = None;
+        loop {
+            let Some(key) = key.as_ref() else { break };
+            if self.cache.hit(key) {
+                return Ok(true);
+            }
+            match self.flights.join(*key) {
+                Joined::Leader(own) => {
+                    leader = Some(own);
+                    break;
+                }
+                Joined::Follower(mut flight) => {
+                    let state = flight
+                        .wait_for(|state| *state != FlightState::Pending)
+                        .await
+                        .map(|state| *state);
+                    if let Ok(FlightState::Done(matched)) = state {
+                        return Ok(matched);
+                    }
+                    // Abandoned: try again (cache hit, or become the leader).
+                }
+            }
+        }
+        // Per-client fairness (secure default only). The slot moves into the blocking job below,
+        // next to the pool permit, so a cancelled request whose hash is still running keeps
+        // counting against its client until that hash really finishes.
+        let slot = match (self.per_client_cap, bucket) {
+            (Some(cap), Some(bucket)) => {
+                Some(self.waiters.enter(bucket, cap).ok_or(Refusal::ClientBusy)?)
+            }
+            _ => None,
+        };
+        let cache = std::sync::Arc::clone(&self.cache);
+        let runs = std::sync::Arc::clone(&self.hash_runs);
+        run_limited_within(&self.limiter, self.max_wait, move || {
+            let _slot = slot;
+            runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let matched = verify_password(&hash, &password);
+            // Cached from inside the job so a hash whose request was cancelled still pays off.
+            if let Some(key) = key.filter(|_| matched) {
+                cache.insert(key);
+            }
+            if let Some(leader) = leader {
+                leader.finish(matched);
+            }
+            matched
+        })
+        .await
+        .ok_or(Refusal::Overloaded)
+    }
+}
+
+fn overloaded() -> Outcome {
+    refusal_response(StatusCode::SERVICE_UNAVAILABLE)
+}
+
+fn client_busy() -> Outcome {
+    refusal_response(StatusCode::TOO_MANY_REQUESTS)
+}
+
+fn refusal_response(status: StatusCode) -> Outcome {
+    let mut response = Response {
+        status,
+        headers: HeaderMap::new(),
+        body: Bytes::new(),
+    };
+    response
+        .headers
+        .insert(http::header::RETRY_AFTER, HeaderValue::from_static("5"));
+    Outcome::Respond(response)
+}
+
 /// Expand `{env.NAME}` placeholders the way Caddy's global replacer does at provision time.
 /// Unknown placeholders are left literal (ReplaceKnown semantics); unset environment variables
 /// expand to the empty string (env lookups are always known to Caddy).
@@ -1231,10 +1777,28 @@ impl Handler for BasicAuthHandler {
         };
 
         // Verify even for unknown usernames, against Caddy's fixed fake hash for the configured
-        // algorithm, so response timing does not reveal whether the account exists.
+        // algorithm, so response timing does not reveal whether the account exists. The hash runs
+        // on the blocking pool behind a concurrency limiter (SEC-MEDIUM-HTTP B1) so bad
+        // credentials cannot starve the async workers; unknown users take the same path.
         let account = self.accounts.get(&username);
-        let hash = account.map_or(&self.fake_hash, |account| &account.hash);
-        let matches = verify_password(hash, password.as_bytes());
+        let hash = account.map_or_else(
+            || std::sync::Arc::clone(&self.fake_hash),
+            |account| std::sync::Arc::clone(&account.hash),
+        );
+        let cache_user = account.is_some().then_some(username.as_str());
+        let matches = match self
+            .verify_offloaded(
+                client_bucket(&request),
+                cache_user,
+                hash,
+                password.into_bytes(),
+            )
+            .await
+        {
+            Ok(matches) => matches,
+            Err(Refusal::Overloaded) => return Ok(overloaded()),
+            Err(Refusal::ClientBusy) => return Ok(client_busy()),
+        };
         if !matches || account.is_none() {
             return Ok(challenge(&self.realm));
         }
@@ -1259,6 +1823,16 @@ mod tests {
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
     use tokio::net::TcpListener;
+
+    /// SEC-MEDIUM-PROXY (review): a trusted-proxy CIDR must match an IPv4 peer that arrives
+    /// IPv4-mapped on the default dual-stack listener.
+    #[test]
+    fn trusted_proxy_cidrs_match_ipv4_mapped_peers() {
+        let cidr = Cidr::parse("203.0.113.0/24").unwrap();
+        assert!(cidr.contains("203.0.113.5".parse().unwrap()));
+        assert!(cidr.contains("::ffff:203.0.113.5".parse().unwrap()));
+        assert!(!cidr.contains("::ffff:198.51.100.5".parse().unwrap()));
+    }
 
     fn base_request() -> Request {
         let mut request = Request::new(Method::POST, "/protected?q=1".parse::<Uri>().unwrap());
@@ -1537,7 +2111,10 @@ mod tests {
     }
 
     fn basic_auth_handler(value: serde_json::Value) -> BasicAuthHandler {
-        BasicAuthHandler::from_json(&value, "handler").expect("basic_auth config")
+        // `stock_compat` (unbounded hash-permit wait) keeps these functional tests independent of
+        // load on the shared process-wide hash pool; the capped default has its own tests.
+        BasicAuthHandler::from_json_with_stock_compat(&value, "handler", true)
+            .expect("basic_auth config")
     }
 
     fn plaintext_handler(accounts: serde_json::Value) -> BasicAuthHandler {
@@ -2106,5 +2683,601 @@ mod tests {
             .contains("2001:db8::1".parse().unwrap()));
         assert!(Cidr::parse("not-an-ip").is_none());
         assert!(Cidr::parse("10.0.0.0/33").is_none());
+    }
+
+    /// B1 (SEC-MEDIUM-HTTP): password hashing is CPU-heavy (the unknown-user fake bcrypt hash is
+    /// cost 14, about a second). It must run off the async workers, otherwise a few concurrent
+    /// bad-credential requests starve every tokio worker and the whole server stops answering.
+    /// With a single worker thread and eight in-flight bad-credential requests, an unrelated timer
+    /// task must still be serviced promptly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn bad_credentials_do_not_starve_the_async_workers() {
+        let handler = std::sync::Arc::new(basic_auth_handler(serde_json::json!({
+            "handler": "basic_auth",
+            "hash": {"algorithm": "bcrypt"},
+            "accounts": [{
+                "username": "alice",
+                "password": "$2a$04$XziKIb5ayw0suaNwlK.1vOqOj9gEveGnkq.anOrdVrnkN5z1bA2A."
+            }]
+        })));
+
+        let started = std::time::Instant::now();
+        let mut attackers = Vec::new();
+        for index in 0..8 {
+            let handler = std::sync::Arc::clone(&handler);
+            attackers.push(tokio::spawn(async move {
+                let mut request = base_request();
+                // Unknown user => the cost-14 fake hash is verified.
+                request.headers.insert(
+                    header::AUTHORIZATION,
+                    authorization(&format!("nobody{index}"), "x"),
+                );
+                handler.handle(request).await
+            }));
+        }
+        // An unrelated task on the same runtime must still make progress while the attackers
+        // are in flight (each hash takes seconds in a debug build, so a starved runtime would
+        // not answer for many seconds).
+        let probe = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        });
+        let probed = tokio::time::timeout(Duration::from_millis(1500), probe).await;
+        let elapsed = started.elapsed();
+        assert!(
+            probed.is_ok() && elapsed < Duration::from_millis(1500),
+            "an unrelated task was starved by password hashing on the async workers \
+             (took {elapsed:?})"
+        );
+        probed.unwrap().expect("probe task");
+
+        for attacker in attackers {
+            let Outcome::Respond(response) = attacker.await.unwrap().unwrap() else {
+                panic!("expected challenge");
+            };
+            assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    /// The concurrency limiter caps simultaneous hash computations but never rejects: callers
+    /// beyond the limit wait and still get a correct answer (no divergence from Caddy's status
+    /// codes, so there is no `stock_compat` switch for it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hash_verification_limiter_caps_concurrency_without_rejecting() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let running = std::sync::Arc::new(AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let (limiter, running, peak) = (limiter.clone(), running.clone(), peak.clone());
+            tasks.push(tokio::spawn(async move {
+                run_limited(&limiter, move || {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(30));
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    true
+                })
+                .await
+            }));
+        }
+        for task in tasks {
+            assert!(task.await.unwrap(), "waiting callers must still succeed");
+        }
+        assert!(peak.load(Ordering::SeqCst) <= 2, "limit exceeded");
+        assert!(peak.load(Ordering::SeqCst) >= 1);
+    }
+
+    /// SEC-MEDIUM-HTTP B1 review: a dropped request future (h2 RST_STREAM, timeout) detaches the
+    /// blocking job but must NOT free its permit, otherwise cancelled requests let unbounded
+    /// concurrent hashes run. Permits are released only when the hash really finishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_requests_keep_their_permit_until_the_hash_finishes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let running = std::sync::Arc::new(AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(AtomicUsize::new(0));
+        let job = |running: std::sync::Arc<AtomicUsize>, peak: std::sync::Arc<AtomicUsize>| {
+            move || {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(300));
+                running.fetch_sub(1, Ordering::SeqCst);
+                true
+            }
+        };
+        let mut cancelled = Vec::new();
+        for _ in 0..2 {
+            let (limiter, running, peak) = (limiter.clone(), running.clone(), peak.clone());
+            cancelled.push(tokio::spawn(async move {
+                run_limited(&limiter, job(running, peak)).await
+            }));
+        }
+        // Let both jobs start on the blocking pool, then cancel the request futures.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        for task in &cancelled {
+            task.abort();
+        }
+        for task in cancelled {
+            let _ = task.await;
+        }
+        // Eight more requests arrive while the two orphaned hashes are still running.
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let (limiter, running, peak) = (limiter.clone(), running.clone(), peak.clone());
+            tasks.push(tokio::spawn(async move {
+                run_limited(&limiter, job(running, peak)).await
+            }));
+        }
+        for task in tasks {
+            assert!(task.await.unwrap());
+        }
+        assert!(
+            peak.load(Ordering::SeqCst) <= 2,
+            "in-flight hashes exceeded the limit after cancellation: {}",
+            peak.load(Ordering::SeqCst)
+        );
+    }
+
+    fn cached_handler(
+        stock_compat: bool,
+        limiter: &Arc<tokio::sync::Semaphore>,
+    ) -> BasicAuthHandler {
+        let value = serde_json::json!({
+            "handler": "basic_auth",
+            "hash": {"algorithm": "bcrypt"},
+            "accounts": [{"username": "alice", "password": bcrypt::hash("pw", 4).unwrap()}]
+        });
+        BasicAuthHandler::from_json_with_stock_compat(&value, "handler", stock_compat)
+            .expect("config")
+            .with_hash_limits(Arc::clone(limiter), Duration::from_millis(150))
+    }
+
+    async fn attempt(handler: &BasicAuthHandler, user: &str, password: &str) -> Outcome {
+        let mut request = base_request();
+        request
+            .headers
+            .insert(header::AUTHORIZATION, authorization(user, password));
+        handler.handle(request).await.unwrap()
+    }
+
+    fn status_of(outcome: &Outcome) -> Option<StatusCode> {
+        match outcome {
+            Outcome::Respond(response) => Some(response.status),
+            _ => None,
+        }
+    }
+
+    /// B1 review: like Caddy's `hash_cache`, a repeated successful credential pair is answered
+    /// from the cache without computing a hash, so legitimate clients are unaffected by a
+    /// saturated hash pool. Proven by exhausting the pool: a cached success still answers, an
+    /// uncached pair times out with 503.
+    #[tokio::test]
+    async fn hash_cache_answers_repeat_credentials_while_the_pool_is_exhausted() {
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let handler = cached_handler(false, &limiter);
+        assert!(matches!(
+            attempt(&handler, "alice", "pw").await,
+            Outcome::Continue(_)
+        ));
+        assert_eq!(
+            status_of(&attempt(&handler, "alice", "wrong").await),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+
+        let _held = Arc::clone(&limiter).acquire_owned().await.unwrap();
+        assert!(
+            matches!(attempt(&handler, "alice", "pw").await, Outcome::Continue(_)),
+            "a cached success must not need a hash permit"
+        );
+        assert_eq!(
+            status_of(&attempt(&handler, "alice", "never-seen").await),
+            Some(StatusCode::SERVICE_UNAVAILABLE),
+            "an uncached pair needs a permit and must not queue forever"
+        );
+    }
+
+    async fn attempt_from(handler: &BasicAuthHandler, remote: &str, password: &str) -> Outcome {
+        let mut request = base_request();
+        request.remote_addr = Some(remote.parse().unwrap());
+        request
+            .headers
+            .insert(header::AUTHORIZATION, authorization("alice", password));
+        handler.handle(request).await.unwrap()
+    }
+
+    /// B1 round 2: a single client may not occupy the whole wait queue. With the pool exhausted,
+    /// the fifth concurrent uncached attempt from one client (IPv6 bucketed by /64) is refused at
+    /// once with 429 + `Retry-After`, while another client still queues. `stock_compat` has no
+    /// per-client cap.
+    #[tokio::test]
+    async fn one_client_cannot_fill_the_hash_wait_queue() {
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let handler = Arc::new(
+            cached_handler(false, &limiter)
+                .with_hash_limits(Arc::clone(&limiter), Duration::from_secs(2)),
+        );
+        let held = Arc::clone(&limiter).acquire_owned().await.unwrap();
+        let mut waiting = Vec::new();
+        for index in 0..CLIENT_WAITER_CAP {
+            let handler = Arc::clone(&handler);
+            // Same /64, different interface identifiers.
+            let remote = format!("[2001:db8:1:2::{}]:5555", index + 1);
+            waiting.push(tokio::spawn(async move {
+                attempt_from(&handler, &remote, &format!("pw{index}")).await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let started = std::time::Instant::now();
+        let refused = tokio::time::timeout(
+            Duration::from_millis(500),
+            attempt_from(&handler, "[2001:db8:1:2::99]:1", "pw-extra"),
+        )
+        .await
+        .expect("the over-cap attempt must be refused immediately, not queued");
+        assert!(started.elapsed() < Duration::from_millis(500));
+        let Outcome::Respond(response) = refused else {
+            panic!("expected a response");
+        };
+        assert_eq!(response.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers.contains_key(http::header::RETRY_AFTER));
+        // A different client still queues (it is still waiting after 200 ms).
+        assert!(tokio::time::timeout(
+            Duration::from_millis(200),
+            attempt_from(&handler, "[2001:db8:9::1]:1", "pw-other")
+        )
+        .await
+        .is_err());
+        drop(held);
+        for task in waiting {
+            assert_eq!(
+                status_of(&task.await.unwrap()),
+                Some(StatusCode::UNAUTHORIZED)
+            );
+        }
+
+        // stock_compat: no per-client cap.
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let stock = Arc::new(cached_handler(true, &limiter));
+        let _held = Arc::clone(&limiter).acquire_owned().await.unwrap();
+        let mut pending = Vec::new();
+        for index in 0..(CLIENT_WAITER_CAP + 2) {
+            let stock = Arc::clone(&stock);
+            pending.push(tokio::spawn(async move {
+                attempt_from(&stock, "203.0.113.7:1", &format!("pw{index}")).await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(pending.iter().all(|task| !task.is_finished()));
+        for task in pending {
+            task.abort();
+        }
+    }
+
+    /// B1 round 3: a request future dropped mid-hash (HTTP/2 `RST_STREAM`) must not free its
+    /// per-client slot while the detached hash still holds a global permit, otherwise one client
+    /// could keep unbounded detached hashes running by resetting and resending.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn per_client_slots_stay_taken_until_a_cancelled_hash_finishes() {
+        let value = serde_json::json!({
+            "handler": "basic_auth",
+            "hash": {"algorithm": "bcrypt"},
+            // Cost 12 keeps every hash running for far longer than the test's timings.
+            "accounts": [{"username": "alice", "password": bcrypt::hash("pw", 12).unwrap()}]
+        });
+        let limiter = Arc::new(tokio::sync::Semaphore::new(CLIENT_WAITER_CAP));
+        let handler = Arc::new(
+            BasicAuthHandler::from_json_with_stock_compat(&value, "handler", false)
+                .unwrap()
+                .with_hash_limits(Arc::clone(&limiter), Duration::from_secs(30)),
+        );
+        let mut tasks = Vec::new();
+        for index in 0..CLIENT_WAITER_CAP {
+            let handler = Arc::clone(&handler);
+            tasks.push(tokio::spawn(async move {
+                attempt_from(&handler, "[2001:db8:a::1]:1", &format!("wrong{index}")).await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+        // The cancelled hashes are still running: the client is still at its cap.
+        let Outcome::Respond(response) = tokio::time::timeout(
+            Duration::from_secs(2),
+            attempt_from(&handler, "[2001:db8:a::2]:1", "one-too-many"),
+        )
+        .await
+        .expect("refused immediately, not queued behind the running hashes") else {
+            panic!("expected a response");
+        };
+        assert_eq!(
+            response.status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "cancelled-but-running hashes must keep counting against the client"
+        );
+        // Once they finish the slots come back.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let outcome = attempt_from(&handler, "[2001:db8:a::3]:1", "later").await;
+            if status_of(&outcome) != Some(StatusCode::TOO_MANY_REQUESTS) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "slots never came back"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// B1 round 3: identical concurrent credentials are verified once (single flight) and share
+    /// the result, so a burst of parallel requests with the same new credentials (after a reload,
+    /// behind a proxy) takes one slot, not one each. A shared failure is not cached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn identical_concurrent_credentials_are_verified_once() {
+        use std::sync::atomic::Ordering;
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let handler = Arc::new(
+            cached_handler(false, &limiter)
+                .with_hash_limits(Arc::clone(&limiter), Duration::from_secs(5)),
+        );
+        for (password, expected_ok) in [("pw", true), ("wrong", false)] {
+            let before = handler.hash_runs.load(Ordering::SeqCst);
+            // Hold the pool so every request is registered before the single hash can start.
+            let held = Arc::clone(&limiter).acquire_owned().await.unwrap();
+            let mut tasks = Vec::new();
+            for _ in 0..(CLIENT_WAITER_CAP * 3) {
+                let handler = Arc::clone(&handler);
+                tasks.push(tokio::spawn(async move {
+                    attempt_from(&handler, "[2001:db8:b::1]:1", password).await
+                }));
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(held);
+            for task in tasks {
+                let outcome = task.await.unwrap();
+                assert_eq!(
+                    matches!(outcome, Outcome::Continue(_)),
+                    expected_ok,
+                    "{password}: {:?}",
+                    status_of(&outcome)
+                );
+            }
+            assert_eq!(
+                handler.hash_runs.load(Ordering::SeqCst) - before,
+                1,
+                "{password}: identical concurrent checks must share one hash"
+            );
+        }
+        // The shared failure was not cached: the same wrong pair is computed again.
+        let before = handler.hash_runs.load(Ordering::SeqCst);
+        attempt_from(&handler, "[2001:db8:b::1]:1", "wrong").await;
+        assert_eq!(handler.hash_runs.load(Ordering::SeqCst) - before, 1);
+    }
+
+    /// B1 round 3: the per-client table is process-wide like the hash pool, so many `basic_auth`
+    /// handlers cannot each give a client its own cap.
+    #[test]
+    fn client_waiters_are_shared_by_every_handler() {
+        let value = serde_json::json!({"handler": "basic_auth"});
+        let first = BasicAuthHandler::from_json(&value, "a").unwrap();
+        let second = BasicAuthHandler::from_json(&value, "b").unwrap();
+        assert!(Arc::ptr_eq(&first.waiters, &second.waiters));
+    }
+
+    /// A panic while the table lock is held must not make every later client look over the cap.
+    #[test]
+    fn a_poisoned_client_table_still_admits_clients() {
+        let waiters = Arc::new(ClientWaiters::default());
+        let poisoner = Arc::clone(&waiters);
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.counts.lock().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+        let guard = waiters.enter([7u8; 16], 1);
+        assert!(
+            guard.is_some(),
+            "a poisoned lock must not refuse every client"
+        );
+        drop(guard);
+        assert!(waiters.enter([7u8; 16], 1).is_some());
+    }
+
+    #[test]
+    fn client_buckets_group_ipv6_by_64_and_keep_ipv4_exact() {
+        let key = |remote: &str| {
+            let mut request = base_request();
+            request.remote_addr = Some(remote.parse().unwrap());
+            client_bucket(&request)
+        };
+        assert_eq!(key("[2001:db8:1:2::1]:1"), key("[2001:db8:1:2:ffff::9]:2"));
+        assert_ne!(key("[2001:db8:1:2::1]:1"), key("[2001:db8:1:3::1]:1"));
+        assert_ne!(key("203.0.113.7:1"), key("203.0.113.8:1"));
+        assert_eq!(key("203.0.113.7:1"), key("203.0.113.7:99"));
+    }
+
+    /// B1 round 2: only successes are cached. A failure gains no availability (the legitimate
+    /// client is the one that succeeds) and every junk password would otherwise insert an entry,
+    /// the flood vector that flushes legitimate entries.
+    #[tokio::test]
+    async fn failed_verdicts_are_not_cached() {
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let handler = cached_handler(false, &limiter);
+        assert_eq!(
+            status_of(&attempt(&handler, "alice", "wrong").await),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        let _held = Arc::clone(&limiter).acquire_owned().await.unwrap();
+        assert_eq!(
+            status_of(&attempt(&handler, "alice", "wrong").await),
+            Some(StatusCode::SERVICE_UNAVAILABLE),
+            "a failed pair must be recomputed, not served from the cache"
+        );
+    }
+
+    /// A hot (recently hit) success survives a flood of new entries: second-chance eviction, not
+    /// arbitrary eviction.
+    #[test]
+    fn hot_cache_entries_survive_a_flood_of_new_entries() {
+        let cache = HashCache::new();
+        let hot = cache.key(b"user", b"hot-password");
+        cache.insert(hot);
+        for index in 0..(HASH_CACHE_CAPACITY * 3) {
+            assert!(
+                cache.hit(&hot),
+                "the hot entry was evicted after {index} inserts"
+            );
+            cache.insert(cache.key(b"user", format!("junk-{index}").as_bytes()));
+        }
+        assert!(cache.len() <= HASH_CACHE_CAPACITY);
+    }
+
+    /// B1 round 2: the cache must not turn into a user-existence oracle. A verdict for an unknown
+    /// username (fake hash) is never cached, so probing `(candidate, P)` after `(nonexistent, P)`
+    /// costs the same hash path for unknown and real accounts. Proven with the pool exhausted:
+    /// both must need a permit (503), neither may be answered instantly from the cache.
+    #[tokio::test]
+    async fn unknown_user_probes_cost_the_same_hash_path_as_real_accounts() {
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let handler = cached_handler(false, &limiter);
+        // Warm: the unknown-user pair is computed once.
+        assert_eq!(
+            status_of(&attempt(&handler, "zz-nonexistent", "P").await),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        let _held = Arc::clone(&limiter).acquire_owned().await.unwrap();
+        for user in ["zz-nonexistent", "alice"] {
+            assert_eq!(
+                status_of(&attempt(&handler, user, "P").await),
+                Some(StatusCode::SERVICE_UNAVAILABLE),
+                "{user} must need a hash permit on every attempt (no cached verdict)"
+            );
+        }
+    }
+
+    /// Secure default: waiting for a hash permit is capped; the overload answer is 503 with
+    /// `Retry-After`, not an unbounded queue.
+    #[tokio::test]
+    async fn queue_wait_is_capped_with_503_and_retry_after_by_default() {
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let handler = cached_handler(false, &limiter);
+        let _held = Arc::clone(&limiter).acquire_owned().await.unwrap();
+        let Outcome::Respond(response) = attempt(&handler, "alice", "pw").await else {
+            panic!("expected a response");
+        };
+        assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers.contains_key(http::header::RETRY_AFTER));
+    }
+
+    /// `stock_compat: true` keeps Caddy's behaviour: wait as long as it takes, never 503.
+    #[tokio::test]
+    async fn stock_compat_waits_for_a_permit_without_a_cap() {
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let handler = cached_handler(true, &limiter);
+        let held = Arc::clone(&limiter).acquire_owned().await.unwrap();
+        let pending = attempt(&handler, "alice", "pw");
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), &mut pending)
+                .await
+                .is_err(),
+            "stock_compat must keep waiting past the secure-default cap"
+        );
+        drop(held);
+        assert!(matches!(pending.await, Outcome::Continue(_)));
+    }
+
+    #[test]
+    fn hash_cache_keys_are_secret_keyed_and_the_cache_is_bounded() {
+        let first = HashCache::new();
+        let second = HashCache::new();
+        assert_ne!(
+            first.key(b"hash", b"pw"),
+            second.key(b"hash", b"pw"),
+            "keys must depend on a per-cache secret so the cache is not a password oracle"
+        );
+        assert_ne!(first.key(b"hash", b"pw"), first.key(b"hash", b"pw2"));
+        assert_ne!(first.key(b"hash", b"pw"), first.key(b"hash2", b"pw"));
+        // Unambiguous framing: moving a byte between hash and password changes the key.
+        assert_ne!(first.key(b"ab", b"c"), first.key(b"a", b"bc"));
+        for index in 0..(HASH_CACHE_CAPACITY * 2) {
+            first.insert(first.key(b"hash", index.to_string().as_bytes()));
+        }
+        assert!(first.len() <= HASH_CACHE_CAPACITY);
+    }
+
+    #[test]
+    fn hash_verification_limit_is_a_small_multiple_of_parallelism() {
+        let limit = hash_verification_limit();
+        assert!(limit >= 2);
+        let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
+        assert!(limit <= parallelism.max(2) * 2);
+    }
+
+    #[tokio::test]
+    async fn offloaded_verification_still_accepts_and_rejects_each_algorithm() {
+        let bcrypt = std::sync::Arc::new(
+            parse_password_hash(
+                PasswordAlgorithm::Bcrypt,
+                bcrypt::hash("pw", 4).unwrap().as_bytes(),
+                "t",
+            )
+            .unwrap(),
+        );
+        let handler = basic_auth_handler(serde_json::json!({"handler": "basic_auth"}));
+        let accept = handler
+            .verify_offloaded(None, Some("u"), bcrypt.clone(), b"pw".to_vec())
+            .await;
+        assert_eq!(accept, Ok(true));
+        let reject = handler
+            .verify_offloaded(None, Some("u"), bcrypt, b"nope".to_vec())
+            .await;
+        assert_eq!(reject, Ok(false));
+
+        let plain = std::sync::Arc::new(PasswordHash::Plaintext(b"pw".to_vec()));
+        let accept = handler
+            .verify_offloaded(None, Some("u"), plain.clone(), b"pw".to_vec())
+            .await;
+        assert_eq!(accept, Ok(true));
+        let reject = handler
+            .verify_offloaded(None, Some("u"), plain, b"px".to_vec())
+            .await;
+        assert_eq!(reject, Ok(false));
+    }
+}
+
+/// SEC-MEDIUM D4 residual: password material must not appear in `{:?}`.
+#[cfg(test)]
+mod debug_redaction {
+    use super::*;
+
+    #[test]
+    fn password_hash_debug_hides_plaintext_hashes_and_keys() {
+        let argon = PasswordHash::Argon2id(Argon2idHash {
+            salt: vec![251, 252],
+            key: vec![253, 254],
+            params: Params::new(8192, 2, 1, Some(32)).unwrap(),
+        });
+        let cases = [
+            (
+                PasswordHash::Plaintext(b"hunter2-secret".to_vec()),
+                "hunter2",
+            ),
+            (
+                PasswordHash::Bcrypt("$2y$10$BCRYPTSECRETHASH".to_string()),
+                "BCRYPTSECRET",
+            ),
+            (argon, "253"),
+        ];
+        for (hash, secret) in cases {
+            for text in [format!("{hash:?}"), format!("{hash:#?}")] {
+                assert!(!text.contains(secret), "{text}");
+            }
+        }
     }
 }

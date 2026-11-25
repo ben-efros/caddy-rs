@@ -39,11 +39,33 @@ async fn request(
     path: &str,
     body: Option<&str>,
 ) -> (u16, Bytes) {
+    request_with_host(address, "example.com", method, path, body).await
+}
+
+/// Request the admin API the way a real client does: `Host` is the admin listener's own address.
+/// The DNS-rebinding Host check now runs on every admin request (SEC-MEDIUM-ADMIN-SERVER A1), so a
+/// foreign `Host` such as `example.com` is a 403 there.
+async fn admin_request(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> (u16, Bytes) {
+    request_with_host(address, &address.to_string(), method, path, body).await
+}
+
+async fn request_with_host(
+    address: SocketAddr,
+    host: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> (u16, Bytes) {
     let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
     let request = hyper::Request::builder()
         .method(method)
         .uri(format!("http://{address}{path}"))
-        .header(http::header::HOST, "example.com")
+        .header(http::header::HOST, host)
         .body(Full::new(Bytes::from(body.unwrap_or("").to_string())))
         .unwrap();
     let response = client.request(request).await.expect("request succeeds");
@@ -140,7 +162,7 @@ async fn admin_api_loads_configuration_end_to_end() {
     let admin = runtime.admin_address().expect("admin bound");
     let http_address = runtime.listener_address("127.0.0.1:0").unwrap();
 
-    let (code, body) = request(admin, "GET", "/config/", None).await;
+    let (code, body) = admin_request(admin, "GET", "/config/", None).await;
     assert_eq!(code, 200);
     let config_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(
@@ -150,7 +172,7 @@ async fn admin_api_loads_configuration_end_to_end() {
 
     let new_config =
         String::from_utf8(config("127.0.0.1:0", "after", false).to_vec().unwrap()).unwrap();
-    let (code, _body) = request(admin, "POST", "/load", Some(&new_config)).await;
+    let (code, _body) = admin_request(admin, "POST", "/load", Some(&new_config)).await;
     assert_eq!(code, 200);
     assert_eq!(store.current().unwrap().id(), 2);
     // In production `ServerRuntime::run` reacts to the admin API's reload notification; this test
@@ -176,7 +198,7 @@ async fn admin_rejects_invalid_config_with_400() {
             "routes": [{"handle": [{"handler": "unknown_module"}]}]
         }}}}
     });
-    let (code, body) = request(admin, "POST", "/load", Some(&invalid.to_string())).await;
+    let (code, body) = admin_request(admin, "POST", "/load", Some(&invalid.to_string())).await;
     assert_eq!(code, 400);
     assert!(String::from_utf8_lossy(&body).contains("unknown_module"));
     runtime.shutdown().await;
@@ -268,7 +290,7 @@ async fn admin_stop_ends_the_runtime_loop() {
     let running = tokio::spawn(async move { runtime.run(shutdown_rx).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let (status, _) = request(admin, "POST", "/stop", None).await;
+    let (status, _) = admin_request(admin, "POST", "/stop", None).await;
     assert_eq!(status, 200);
 
     let joined = tokio::time::timeout(Duration::from_secs(5), running)

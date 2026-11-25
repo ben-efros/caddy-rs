@@ -1,4 +1,5 @@
 use super::*;
+use bcrypt::{hash as bcrypt_hash, DEFAULT_COST};
 
 /// Fixed TOTP time step for tests: the window and replay assertions must not depend on where the
 /// wall clock happens to be inside a 30-second step.
@@ -45,6 +46,9 @@ fn test_config() -> AuthnConfig {
         issuer: None,
         audience: None,
         totp_window: TotpWindow::Current,
+        login_throttle: LoginThrottleConfig::default(),
+        // Cheap hashing keeps the suite fast; the minimum itself is tested in `tests_security`.
+        allow_weak_argon2_params: true,
     }
 }
 
@@ -72,6 +76,7 @@ fn test_user(username: &str) -> User {
         role: Role::viewer(),
         totp_secret: None,
         totp_pending: false,
+        totp_pending_secret: None,
         totp_last_step: None,
         auth_epoch: 0,
         created_at: now,
@@ -257,7 +262,13 @@ async fn concurrent_first_admin_setup_has_exactly_one_winner_over_100_runs() {
 #[tokio::test]
 async fn memory_store_refresh_token_lifecycle() {
     let store = MemoryUserStore::new();
-    let user_id = UserId::new();
+    // The store refuses tokens for a user that does not exist, so the user must.
+    let service = AuthnService::new(store.clone(), test_config()).expect("build service");
+    let user_id = service
+        .create_user("lifecycle", "password", Role::viewer())
+        .await
+        .unwrap()
+        .id;
     let now = now_ts().expect("system clock is after the Unix epoch");
     let record = RefreshTokenRecord {
         token_hash: "hash1".to_string(),
@@ -265,6 +276,8 @@ async fn memory_store_refresh_token_lifecycle() {
         iat: now,
         expires_at: now + 60,
         revoked_at: None,
+        revoke_reason: None,
+        epoch: 0,
         token_id: "token1".to_string(),
     };
     store.store_refresh_token(record).await.unwrap();
@@ -277,9 +290,14 @@ async fn memory_store_refresh_token_lifecycle() {
             .user_id,
         user_id
     );
-    store.consume_refresh_token("hash1", now).await.unwrap();
+    store
+        .consume_refresh_token("hash1", now, RevokeReason::Rotated)
+        .await
+        .unwrap();
     assert!(matches!(
-        store.consume_refresh_token("hash1", now).await,
+        store
+            .consume_refresh_token("hash1", now, RevokeReason::Rotated)
+            .await,
         Err(AuthError::RefreshTokenRevoked)
     ));
 
@@ -289,6 +307,8 @@ async fn memory_store_refresh_token_lifecycle() {
         iat: now,
         expires_at: now + 60,
         revoked_at: None,
+        revoke_reason: None,
+        epoch: 0,
         token_id: "token2".to_string(),
     };
     store.store_refresh_token(record).await.unwrap();
@@ -310,11 +330,15 @@ async fn memory_store_refresh_token_lifecycle() {
         iat: now - 120,
         expires_at: now - 60,
         revoked_at: None,
+        revoke_reason: None,
+        epoch: 0,
         token_id: "token3".to_string(),
     };
     store.store_refresh_token(expired).await.unwrap();
     assert!(matches!(
-        store.consume_refresh_token("hash3", now).await,
+        store
+            .consume_refresh_token("hash3", now, RevokeReason::Rotated)
+            .await,
         Err(AuthError::TokenExpired)
     ));
 }
@@ -371,12 +395,12 @@ fn password_verification_is_constant_time() {
 async fn create_user_stores_hash_not_plaintext() {
     let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
-        .create_user("alice", "hunter2", Role::viewer())
+        .create_user("alice", "hunter22", Role::viewer())
         .await
         .unwrap();
-    assert_ne!(user.password_hash, "hunter2");
+    assert_ne!(user.password_hash, "hunter22");
     assert!(user.password_hash.starts_with("$argon2id$"));
-    assert!(!format!("{user:?}").contains("hunter2"));
+    assert!(!format!("{user:?}").contains("hunter22"));
 }
 
 #[tokio::test]
@@ -410,14 +434,11 @@ async fn login_and_refresh_rotation() {
         service.refresh(&tokens.refresh_token).await,
         Err(AuthError::RefreshTokenRevoked)
     ));
-    assert_ne!(
-        service
-            .refresh(&rotated.refresh_token)
-            .await
-            .unwrap()
-            .refresh_token,
-        rotated.refresh_token
-    );
+    // E5: replaying the consumed token was treated as theft, so the descendant is revoked too.
+    assert!(matches!(
+        service.refresh(&rotated.refresh_token).await,
+        Err(AuthError::RefreshTokenRevoked)
+    ));
 }
 
 #[tokio::test]
@@ -490,12 +511,12 @@ async fn expired_access_token_is_rejected() {
 async fn password_change_revokes_access_token_immediately() {
     let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
-        .create_user("charlie", "oldpass", Role::editor())
+        .create_user("charlie", "oldpass1", Role::editor())
         .await
         .unwrap();
     // The token is minted immediately before the change; the epoch check must reject it even
     // though both operations happen within the same second.
-    let tokens = service.login("charlie", "oldpass", None).await.unwrap();
+    let tokens = service.login("charlie", "oldpass1", None).await.unwrap();
     assert_eq!(
         service
             .verify_access_token(&tokens.access_token)
@@ -506,7 +527,7 @@ async fn password_change_revokes_access_token_immediately() {
     );
 
     service
-        .update_password(user.id, "oldpass", "newpass")
+        .update_password(user.id, "oldpass1", "newpass1")
         .await
         .unwrap();
     assert!(matches!(
@@ -517,18 +538,18 @@ async fn password_change_revokes_access_token_immediately() {
         service.refresh(&tokens.refresh_token).await,
         Err(AuthError::RefreshTokenRevoked)
     ));
-    assert!(service.login("charlie", "oldpass", None).await.is_err());
-    assert!(service.login("charlie", "newpass", None).await.is_ok());
+    assert!(service.login("charlie", "oldpass1", None).await.is_err());
+    assert!(service.login("charlie", "newpass1", None).await.is_ok());
 }
 
 #[tokio::test]
 async fn set_password_revokes_refresh_tokens() {
     let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
-        .create_user("dave", "oldpass", Role::viewer())
+        .create_user("dave", "oldpass1", Role::viewer())
         .await
         .unwrap();
-    let tokens = service.login("dave", "oldpass", None).await.unwrap();
+    let tokens = service.login("dave", "oldpass1", None).await.unwrap();
     service.set_password(user.id, "adminpass").await.unwrap();
     assert!(matches!(
         service.refresh(&tokens.refresh_token).await,
@@ -551,14 +572,16 @@ async fn revoke_all_for_user_invalidates_access_and_refresh() {
         service.verify_access_token(&tokens.access_token).await,
         Err(AuthError::InvalidToken)
     ));
-    assert!(matches!(
-        service.refresh(&tokens.refresh_token).await,
-        Err(AuthError::RefreshTokenRevoked)
-    ));
+    // Checked before the revoked token is presented: presenting it is itself a reuse (E5) and
+    // would bump the epoch again.
     assert_eq!(
         store.get_user(user.id).await.unwrap().unwrap().auth_epoch,
         1
     );
+    assert!(matches!(
+        service.refresh(&tokens.refresh_token).await,
+        Err(AuthError::RefreshTokenRevoked)
+    ));
 }
 
 #[tokio::test]
@@ -743,10 +766,11 @@ async fn totp_login_and_disable() {
         .login("ivan", "password", Some(&login_code))
         .await
         .is_ok());
-    // Replaying the consumed code is rejected and flagged as a replay attempt.
+    // Replaying the consumed code is rejected. At the login boundary it is indistinguishable from
+    // a wrong code (E1): the `TotpReplay` distinction is only for the lower-level verify call.
     assert!(matches!(
         later.login("ivan", "password", Some(&login_code)).await,
-        Err(AuthError::TotpReplay)
+        Err(AuthError::InvalidTotpCode)
     ));
 
     service.totp_disable(user.id).await.unwrap();
@@ -844,6 +868,8 @@ fn debug_redacts_secrets() {
         iat: now_ts().expect("system clock is after the Unix epoch"),
         expires_at: now_ts().expect("system clock is after the Unix epoch") + 60,
         revoked_at: None,
+        revoke_reason: None,
+        epoch: 0,
         token_id: "token-id".to_string(),
     };
     let record_debug = format!("{record:?}");
@@ -901,6 +927,8 @@ fn refresh_token_record_serde_roundtrip() {
         iat: now.timestamp(),
         expires_at: now.timestamp() + 3_600, // one hour
         revoked_at: Some(now.timestamp()),
+        revoke_reason: Some(RevokeReason::Revoked),
+        epoch: 0,
         token_id: token_id.clone(),
     };
 
@@ -931,6 +959,7 @@ fn user_public_view_no_secrets() {
         role: Role::viewer(),
         totp_secret: Some("SECRET_TOTP".to_string()),
         totp_pending: false,
+        totp_pending_secret: None,
         totp_last_step: Some(12345),
         auth_epoch: 42,
         created_at: now,
@@ -1752,6 +1781,12 @@ async fn revoke_refresh_token_ends_one_session_and_is_replay_safe() {
         .revoke_refresh_token(&first.refresh_token)
         .await
         .expect("revoke the first session");
+    // Logging out one device leaves the other session usable. (Order matters since E5: afterwards
+    // *presenting* the revoked token to `refresh` is a reuse and ends every session.)
+    service
+        .refresh(&second.refresh_token)
+        .await
+        .expect("other sessions are untouched");
     assert!(
         matches!(
             service.refresh(&first.refresh_token).await,
@@ -1759,10 +1794,6 @@ async fn revoke_refresh_token_ends_one_session_and_is_replay_safe() {
         ),
         "a revoked refresh token cannot be exchanged"
     );
-    service
-        .refresh(&second.refresh_token)
-        .await
-        .expect("other sessions are untouched");
 
     assert!(
         matches!(

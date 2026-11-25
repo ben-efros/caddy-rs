@@ -401,6 +401,23 @@ impl Balancer for CookieHash {
     }
 }
 
+/// The random secret used by `cookie` policies that configure none (SEC-MEDIUM-PROXY C5).
+///
+/// One secret per process: policies rebuilt by a config reload keep honouring the cookies they
+/// issued, while a restart invalidates them (clients are simply re-pinned). An operator who wants
+/// stickiness across restarts or between instances configures `secret`.
+fn process_cookie_secret() -> Result<String, String> {
+    static SECRET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(secret) = SECRET.get() {
+        return Ok(secret.clone());
+    }
+    let mut bytes = [0_u8; 32];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|error| format!("cannot generate a random cookie secret: {error}"))?;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(SECRET.get_or_init(|| hex).clone())
+}
+
 /// Caddy's `hashCookie`: `hex(HMAC-SHA256(secret, dial))`.
 fn hash_cookie(secret: &str, dial: &str) -> String {
     crate::digest::hmac_sha256_hex(secret.as_bytes(), dial.as_bytes())
@@ -819,13 +836,26 @@ pub fn from_selection_policy(
     selection_policy: Option<&serde_json::Value>,
     path: &str,
 ) -> Result<Box<dyn Balancer>, BalancerError> {
-    from_selection_policy_inner(selection_policy, path, 0)
+    from_selection_policy_with_stock_compat(selection_policy, path, false)
+}
+
+/// Like [`from_selection_policy`] with the generation's `stock_compat` flag.
+///
+/// SEC-MEDIUM-PROXY C5: a `cookie` policy without a (non-empty) `secret` gets a random per-process
+/// secret so the sticky cookie cannot be forged; `stock_compat true` keeps Caddy's empty secret.
+pub fn from_selection_policy_with_stock_compat(
+    selection_policy: Option<&serde_json::Value>,
+    path: &str,
+    stock_compat: bool,
+) -> Result<Box<dyn Balancer>, BalancerError> {
+    from_selection_policy_inner(selection_policy, path, 0, stock_compat)
 }
 
 fn from_selection_policy_inner(
     selection_policy: Option<&serde_json::Value>,
     path: &str,
     depth: usize,
+    stock_compat: bool,
 ) -> Result<Box<dyn Balancer>, BalancerError> {
     if depth > 8 {
         return Err(BalancerError::Invalid(format!(
@@ -849,9 +879,12 @@ fn from_selection_policy_inner(
     let parse_fallback = |field: &str| -> Result<Box<dyn Balancer>, BalancerError> {
         match object.get(field) {
             None | Some(serde_json::Value::Null) => Ok(random_fallback()),
-            Some(fallback) => {
-                from_selection_policy_inner(Some(fallback), &format!("{path}.{field}"), depth + 1)
-            }
+            Some(fallback) => from_selection_policy_inner(
+                Some(fallback),
+                &format!("{path}.{field}"),
+                depth + 1,
+                stock_compat,
+            ),
         }
     };
     match policy {
@@ -886,11 +919,19 @@ fn from_selection_policy_inner(
                 .filter(|name| !name.is_empty())
                 .unwrap_or("lb")
                 .to_string();
-            let secret = object
+            let configured_secret = object
                 .get("secret")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string();
+                .unwrap_or("");
+            // Stock Caddy defaults to an empty secret, which makes the cookie the unkeyed hash of
+            // the dial address (forgeable). Unless `stock_compat true`, an absent or empty secret
+            // becomes a random per-process secret (SEC-MEDIUM-PROXY C5).
+            let secret = if configured_secret.is_empty() && !stock_compat {
+                process_cookie_secret()
+                    .map_err(|message| BalancerError::Invalid(format!("{path}: {message}")))?
+            } else {
+                configured_secret.to_string()
+            };
             let max_age = match object.get("max_age") {
                 None | Some(serde_json::Value::Null) => None,
                 Some(value) => Some(value.as_i64().ok_or_else(|| {
@@ -1439,6 +1480,108 @@ mod tests {
                 .dial,
             "localhost:9000"
         );
+    }
+
+    /// Value of the `Set-Cookie` the policy echoed, and the dial it selected.
+    fn issued_cookie(balancer: &dyn Balancer, pool: &[Arc<Upstream>]) -> (String, String) {
+        let mut response = Response::ok();
+        let selected = balancer
+            .select(pool, &get("/"), &mut response)
+            .expect("fallback selects an upstream");
+        let header = response
+            .headers
+            .get(http::header::SET_COOKIE)
+            .expect("Set-Cookie echoed")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let value = header
+            .strip_prefix("lb=")
+            .and_then(|rest| rest.split(';').next())
+            .expect("lb cookie")
+            .to_string();
+        (value, selected.dial.clone())
+    }
+
+    fn cookie_policy(secret: Option<&str>, stock_compat: bool) -> Box<dyn Balancer> {
+        let mut policy = serde_json::json!({
+            "policy": "cookie", "name": "lb", "fallback": {"policy": "first"}
+        });
+        if let Some(secret) = secret {
+            policy["secret"] = serde_json::json!(secret);
+        }
+        from_selection_policy_with_stock_compat(Some(&policy), "handler", stock_compat).unwrap()
+    }
+
+    /// With no `secret` the cookie value was `HMAC-SHA256("", dial)`, which anyone can compute, so a
+    /// client could pin itself to any upstream (SEC-MEDIUM-PROXY C5).
+    #[test]
+    fn cookie_policy_without_a_secret_is_not_forgeable_by_default() {
+        let pool = pool(3);
+        for configured in [None, Some("")] {
+            let balancer = cookie_policy(configured, false);
+            let (value, dial) = issued_cookie(balancer.as_ref(), &pool);
+            assert_eq!(dial, "localhost:9000");
+            assert_ne!(
+                value,
+                hash_cookie("", &dial),
+                "the cookie must not be the unkeyed hash of the dial"
+            );
+            assert_eq!(value.len(), 64, "still a hex HMAC-SHA256: {value}");
+            // The forged cookie for upstream 2 is not honoured: the fallback re-pins to upstream 0.
+            let mut request = get("/");
+            request.headers.insert(
+                http::header::COOKIE,
+                format!("lb={}", hash_cookie("", "localhost:9002"))
+                    .parse()
+                    .unwrap(),
+            );
+            let mut response = Response::ok();
+            let chosen = balancer.select(&pool, &request, &mut response).unwrap();
+            assert_eq!(chosen.dial, "localhost:9000", "forged cookie must not pin");
+            assert_eq!(
+                response
+                    .headers
+                    .get_all(http::header::SET_COOKIE)
+                    .iter()
+                    .count(),
+                1,
+                "the client is re-pinned with a fresh cookie"
+            );
+            // A genuine cookie still sticks, including through another policy instance built in the
+            // same process (a config reload keeps clients pinned).
+            let mut request = get("/");
+            request
+                .headers
+                .insert(http::header::COOKIE, format!("lb={value}").parse().unwrap());
+            let other = cookie_policy(configured, false);
+            let chosen = other.select(&pool, &request, &mut Response::ok()).unwrap();
+            assert_eq!(chosen.dial, "localhost:9000");
+        }
+    }
+
+    /// `stock_compat true` keeps Caddy's empty default secret; an explicit secret is honoured in
+    /// both modes.
+    #[test]
+    fn cookie_policy_keeps_the_stock_secret_under_stock_compat_and_honours_explicit_ones() {
+        let pool = pool(3);
+        let stock = cookie_policy(None, true);
+        let (value, dial) = issued_cookie(stock.as_ref(), &pool);
+        assert_eq!(value, hash_cookie("", &dial));
+        let mut request = get("/");
+        request.headers.insert(
+            http::header::COOKIE,
+            format!("lb={}", hash_cookie("", "localhost:9002"))
+                .parse()
+                .unwrap(),
+        );
+        let chosen = stock.select(&pool, &request, &mut Response::ok()).unwrap();
+        assert_eq!(chosen.dial, "localhost:9002", "stock behaviour: forgeable");
+        for stock_compat in [false, true] {
+            let keyed = cookie_policy(Some("s3cret"), stock_compat);
+            let (value, dial) = issued_cookie(keyed.as_ref(), &pool);
+            assert_eq!(value, hash_cookie("s3cret", &dial), "{stock_compat}");
+        }
     }
 
     #[test]

@@ -934,6 +934,24 @@ fn tls_client_auth_modes_match_real_caddy_v2_11_7() {
     }
 }
 
+/// caddy-rs extension (SEC-MEDIUM D2), not in the upstream goldens: the acknowledgement that
+/// `request`/`require` accept any client certificate maps to the JSON field of the same name.
+#[test]
+fn tls_client_auth_accept_any_acknowledgement_adapts_to_json() {
+    let policy = client_auth_policy(
+        "localhost {\n\ttls {\n\t\tclient_auth {\n\t\t\tmode require\n\t\t\tinsecure_accept_any_client_cert\n\t\t}\n\t}\n}\n",
+    );
+    assert_eq!(
+        policy,
+        json!({"mode": "require", "insecure_accept_any_client_cert": true})
+    );
+    let error = adapt(
+        "localhost {\n\ttls {\n\t\tclient_auth {\n\t\t\tmode require\n\t\t\tinsecure_accept_any_client_cert yes\n\t\t}\n\t}\n}\n",
+    )
+    .expect_err("the acknowledgement takes no argument");
+    assert!(error.to_string().contains("takes no arguments"), "{error}");
+}
+
 #[test]
 fn tls_client_auth_trust_pool_inline_and_file_match_real_caddy_v2_11_7() {
     let der = "MIIBvDCCAWOgAwIBAgIUYoRWmsXmyWi7ReCOwK4PUufOf/QwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MTAzMTIxMTk0OVoXDTM2MTAyODIxMTk0OVowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEFbTRBdAX7WxPQs1D5sHuWV/3VKzbRc9QJ4cxCv61IgvqLmaOxLiPe+uQLyDsX1/a9F1hC+oqfq0HrFU0uGvCGaOBkjCBjzAdBgNVHQ4EFgQUsk16OWiO/BeyggEk4KQ+zT/8PeUwHwYDVR0jBBgwFoAUsk16OWiO/BeyggEk4KQ+zT/8PeUwGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMAoGCCqGSM49BAMCA0cAMEQCIDpAI8Itus5El0I4/VoCEmKH+1DqFq+Mz2kLwEUyG65OAiB69hDwqMoKucYcfywINUgq+g+T6pU4qOjKp0Vir8EVCw==";
@@ -1424,6 +1442,21 @@ fn servers_trusted_proxies_options_match_real_caddy_v2_11_9() {
             "expected `{expected}` in: {error}"
         );
     }
+}
+
+#[test]
+fn dial_allow_adapts_to_the_handler_field_and_accumulates() {
+    // caddy-rs extension (SEC-MEDIUM-PROXY C3): Caddyfile users can open request-derived dial
+    // targets without `stock_compat`.
+    let adapted = adapt(
+        ":8080 {\n\treverse_proxy {http.request.header.X-Backend} {\n\t\tdial_allow 127.0.0.0/8 10.0.0.1\n\t\tdial_allow unix//run/app\n\t}\n}\n",
+    )
+    .expect("adapt dial_allow");
+    assert_eq!(
+        adapted.config["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0]["dial_allow"],
+        json!(["127.0.0.0/8", "10.0.0.1", "unix//run/app"])
+    );
+    assert!(adapt(":8080 {\n\treverse_proxy a:1 {\n\t\tdial_allow\n\t}\n}\n").is_err());
 }
 
 #[test]

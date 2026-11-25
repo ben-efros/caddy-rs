@@ -9,6 +9,7 @@
 
 pub mod balancer;
 pub mod client;
+pub mod dial_guard;
 pub mod digest;
 pub mod dns;
 pub mod dynamic_upstreams;

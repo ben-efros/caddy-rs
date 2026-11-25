@@ -44,6 +44,7 @@ use tokio::sync::mpsc;
 use caddy_rs_http::body::{BodyError, RequestBody, StreamingBody};
 use caddy_rs_http::{Error as HttpError, Request, Result as HttpResult};
 
+use crate::dial_guard::DialGuard;
 use crate::template::{Template, TemplateContext};
 use crate::upstream::{Transport, Upstream};
 
@@ -66,6 +67,16 @@ const FCGI_HEADER_LEN: usize = 8;
 const MAX_WRITE: usize = 65500;
 /// Request id used by Caddy (single request per connection, no multiplexing).
 const REQUEST_ID: u16 = 1;
+/// Upper bound on the CGI response head (the STDOUT bytes before the blank line) accepted from a
+/// FastCGI backend, and on the STDERR bytes kept while waiting for it (SEC-MEDIUM-PROXY C6). Go's
+/// `net/textproto` `ReadMIMEHeader`, which Caddy's FastCGI client uses, bounds the head at 1 MiB
+/// as well; without a bound a misbehaving or compromised backend that never ends its headers makes
+/// the proxy buffer without limit.
+const MAX_RESPONSE_HEAD_BYTES: usize = 1 << 20;
+/// Upper bound on the records read before the response head ends. Records carry at most 65 535
+/// content bytes, so a legitimate head needs a handful; the cap stops a backend from streaming
+/// one-byte or empty records (which add no bytes toward the size cap) indefinitely.
+const MAX_HEAD_RECORDS: usize = 1 << 16;
 /// Caddy's default dial timeout for FastCGI.
 const DEFAULT_DIAL_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -306,6 +317,7 @@ impl FastCgiTransport {
         method: Method,
         path_and_query: &str,
         body: RequestBody,
+        dial_guard: Option<&DialGuard>,
     ) -> Result<FastCgiResponse, FastCgiError> {
         let content_length = body.exact_size().ok_or_else(|| {
             FastCgiError::Request(
@@ -316,7 +328,7 @@ impl FastCgiTransport {
         })?;
         let params = self.build_params(request, &method, path_and_query, content_length)?;
 
-        let stream = self.dial(upstream).await?;
+        let stream = self.dial(upstream, dial_guard).await?;
         // Caddy sets absolute connection deadlines once, right after dialing: they are not
         // refreshed per read/write, so `read_timeout`/`write_timeout` bound the whole exchange.
         let write_deadline = deadline_after(self.write_timeout);
@@ -611,7 +623,14 @@ impl FastCgiTransport {
         Ok(env)
     }
 
-    async fn dial(&self, upstream: &Upstream) -> Result<FastCgiStream, FastCgiError> {
+    /// Dial the backend. `dial_guard` (SEC-MEDIUM-PROXY C3) is set for hosts discovered from a
+    /// request-derived `dynamic_upstreams` source: the name is resolved here, every resolved
+    /// address is checked and the connection goes to a checked address (no second lookup).
+    async fn dial(
+        &self,
+        upstream: &Upstream,
+        dial_guard: Option<&DialGuard>,
+    ) -> Result<FastCgiStream, FastCgiError> {
         let Some(transport) = upstream.transport() else {
             return Err(FastCgiError::Request(
                 "FastCGI upstreams require a fixed dial address; placeholder dials are rejected at configuration time"
@@ -620,10 +639,30 @@ impl FastCgiTransport {
         };
         match transport {
             Transport::Tcp { address } => {
-                // Exempt from the ADR-0043 egress helper: FastCgiTransport carries no local_address,
-                // so the pinned-source defect (DIV-0153) is unreachable here. See
-                // crates/proxy/EGRESS-CONNECT-SITES.md.
-                let connect = tokio::net::TcpStream::connect(address);
+                let connect = async {
+                    // Resolve first so the guard (when set) sees every address and the
+                    // connection goes to a checked one, with no second lookup to race.
+                    let mut allowed = Vec::new();
+                    let mut refusal = None;
+                    for resolved in tokio::net::lookup_host(address).await? {
+                        match dial_guard.map_or(Ok(()), |guard| guard.check_ip(resolved.ip())) {
+                            Ok(()) => allowed.push(resolved),
+                            Err(message) => {
+                                refusal.get_or_insert(message);
+                            }
+                        }
+                    }
+                    if allowed.is_empty() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            refusal.unwrap_or_else(|| "no address resolved".to_string()),
+                        ));
+                    }
+                    // Exempt from the ADR-0043 egress helper: FastCgiTransport carries no local_address,
+                    // so the pinned-source defect (DIV-0153) is unreachable here. See
+                    // crates/proxy/EGRESS-CONNECT-SITES.md.
+                    tokio::net::TcpStream::connect(&allowed[..]).await
+                };
                 match tokio::time::timeout(self.dial_timeout, connect).await {
                     Ok(Ok(stream)) => Ok(FastCgiStream::Tcp(stream)),
                     Ok(Err(error)) => Err(FastCgiError::Connect(format!("{address}: {error}"))),
@@ -635,6 +674,9 @@ impl FastCgiTransport {
             }
             #[cfg(unix)]
             Transport::Unix { path } => {
+                if let Some(guard) = dial_guard {
+                    guard.check_unix(path).map_err(FastCgiError::Connect)?;
+                }
                 let connect = tokio::net::UnixStream::connect(path);
                 match tokio::time::timeout(self.dial_timeout, connect).await {
                     Ok(Ok(stream)) => Ok(FastCgiStream::Unix(stream)),
@@ -743,12 +785,35 @@ impl FastCgiTransport {
     ) -> Result<ResponseHead, FastCgiError> {
         let mut header_bytes = BytesMut::new();
         let mut stderr = BytesMut::new();
+        // Bytes already scanned for the blank line: only new bytes (plus a 3-byte overlap so a
+        // terminator split across records is still found) are searched, keeping the scan linear.
+        let mut scanned = 0_usize;
+        let mut records = 0_usize;
         loop {
+            records += 1;
+            if records > MAX_HEAD_RECORDS {
+                return Err(FastCgiError::Protocol(format!(
+                    "upstream sent more than {MAX_HEAD_RECORDS} records before the response headers ended"
+                )));
+            }
             let record = read_record(reader, read_deadline).await?;
             match record.kind {
                 FCGI_STDOUT => {
                     header_bytes.extend_from_slice(&record.content);
-                    if let Some((header_len, body_start)) = find_cgi_header_end(&header_bytes) {
+                    let from = scanned.saturating_sub(3);
+                    let head_end = find_cgi_header_end(&header_bytes[from..])
+                        .map(|(header_len, body_start)| (from + header_len, from + body_start));
+                    scanned = header_bytes.len();
+                    // Bound the head (SEC-MEDIUM-PROXY C6): a head that is already over the cap, or an
+                    // unterminated buffer over the cap, is a protocol error, not more buffering.
+                    if head_end.map_or(header_bytes.len(), |(header_len, _)| header_len)
+                        > MAX_RESPONSE_HEAD_BYTES
+                    {
+                        return Err(FastCgiError::Protocol(format!(
+                            "upstream response headers exceed {MAX_RESPONSE_HEAD_BYTES} bytes"
+                        )));
+                    }
+                    if let Some((header_len, body_start)) = head_end {
                         let (status, headers) = parse_cgi_head(&header_bytes[..header_len])?;
                         let leftover = Bytes::copy_from_slice(&header_bytes[body_start..]);
                         return Ok(ResponseHead {
@@ -759,7 +824,11 @@ impl FastCgiTransport {
                         });
                     }
                 }
-                FCGI_STDERR => stderr.extend_from_slice(&record.content),
+                // Keep at most the cap of STDERR; the rest is dropped (it is only logged).
+                FCGI_STDERR => {
+                    let room = MAX_RESPONSE_HEAD_BYTES.saturating_sub(stderr.len());
+                    stderr.extend_from_slice(&record.content[..record.content.len().min(room)]);
+                }
                 FCGI_END_REQUEST => {
                     let end = parse_end_request(&record.content)?;
                     return Err(FastCgiError::Protocol(format!(
@@ -1797,6 +1866,144 @@ mod tests {
             }
         });
         captured
+    }
+
+    /// Encode `kind` records carrying `content` the way a backend would (65500-byte chunks).
+    async fn backend_records(kind: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for chunk in content.chunks(MAX_WRITE) {
+            write_record(&mut out, kind, chunk, None)
+                .await
+                .expect("record encodes");
+        }
+        out
+    }
+
+    async fn read_head(bytes: Vec<u8>) -> Result<ResponseHead, FastCgiError> {
+        let transport = FastCgiTransport::from_json(
+            &transport_json(serde_json::json!({ "root": "/srv/www" })),
+            "transport",
+        )
+        .expect("fastcgi transport builds");
+        let mut reader: &[u8] = &bytes;
+        transport.read_response_head(&mut reader, None).await
+    }
+
+    /// SEC-MEDIUM-PROXY C6: a backend that streams STDOUT without ever ending its headers must not
+    /// make the proxy buffer without limit.
+    #[tokio::test]
+    async fn a_response_head_that_never_ends_is_rejected_at_the_cap() {
+        let endless = vec![b'a'; MAX_RESPONSE_HEAD_BYTES + MAX_WRITE];
+        let error = read_head(backend_records(FCGI_STDOUT, &endless).await)
+            .await
+            .err()
+            .expect("an unterminated oversized head is rejected");
+        assert!(
+            matches!(&error, FastCgiError::Protocol(message) if message.contains("exceed")),
+            "{error}"
+        );
+        // Many short lines are bounded the same way.
+        let lines = "X-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n".repeat(40_000);
+        assert!(lines.len() > MAX_RESPONSE_HEAD_BYTES);
+        let error = read_head(backend_records(FCGI_STDOUT, lines.as_bytes()).await)
+            .await
+            .err()
+            .expect("an oversized unterminated head is rejected");
+        assert!(error.to_string().contains("exceed"), "{error}");
+    }
+
+    /// Boundaries: a large but legitimate head is accepted, and the body that follows it is not
+    /// counted against the cap.
+    #[tokio::test]
+    async fn a_large_terminated_head_and_a_large_body_are_accepted() {
+        let mut head = String::from("Status: 200 OK\r\n");
+        while head.len() < MAX_RESPONSE_HEAD_BYTES - 4096 {
+            head.push_str(&format!("X-Pad-{}: {}\r\n", head.len(), "a".repeat(1000)));
+        }
+        head.push_str("\r\n");
+        let body = vec![b'b'; 3 * MAX_RESPONSE_HEAD_BYTES];
+        let mut stream = head.into_bytes();
+        stream.extend_from_slice(&body);
+        let parsed = read_head(backend_records(FCGI_STDOUT, &stream).await)
+            .await
+            .expect("a head just under the cap is accepted");
+        assert_eq!(parsed.status, StatusCode::OK);
+        assert!(!parsed.headers.is_empty());
+        // The body was not consumed by the head parser beyond the current record.
+        assert!(parsed.leftover.len() <= MAX_WRITE);
+    }
+
+    /// The head scan must be linear and the record count bounded (SEC-MEDIUM-PROXY C6 review): a
+    /// backend streaming one-byte STDOUT records re-scanned the whole buffer per record
+    /// (quadratic), and zero-length records made no progress at all.
+    #[tokio::test]
+    async fn one_byte_and_empty_records_are_bounded() {
+        let started = std::time::Instant::now();
+        let mut stream = Vec::new();
+        for _ in 0..100_000 {
+            write_record(&mut stream, FCGI_STDOUT, b"a", None)
+                .await
+                .unwrap();
+        }
+        let error = read_head(stream)
+            .await
+            .err()
+            .expect("an endless one-byte head is rejected");
+        assert!(error.to_string().contains("records"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "took {:?}",
+            started.elapsed()
+        );
+
+        let mut stream = Vec::new();
+        for _ in 0..100_000 {
+            write_record(&mut stream, FCGI_STDOUT, b"", None)
+                .await
+                .unwrap();
+        }
+        stream.extend(backend_records(FCGI_STDOUT, b"Status: 200 OK\r\n\r\nbody").await);
+        let error = read_head(stream)
+            .await
+            .err()
+            .expect("endless empty records are rejected");
+        assert!(error.to_string().contains("records"), "{error}");
+    }
+
+    /// The incremental scan still finds a terminator split across records, in both spellings.
+    #[tokio::test]
+    async fn a_terminator_split_across_records_is_found() {
+        for (head, body) in [
+            ("Status: 200 OK\r\nX-A: b\r\n\r\n", "rest"),
+            ("Status: 200 OK\nX-A: b\n\n", "rest"),
+        ] {
+            let bytes: Vec<u8> = format!("{head}{body}").into_bytes();
+            let mut stream = Vec::new();
+            for chunk in bytes.chunks(1) {
+                write_record(&mut stream, FCGI_STDOUT, chunk, None)
+                    .await
+                    .unwrap();
+            }
+            let parsed = read_head(stream).await.expect("split terminator found");
+            assert_eq!(parsed.status, StatusCode::OK);
+            assert_eq!(parsed.headers["x-a"], "b");
+            assert!(parsed.leftover.is_empty());
+        }
+    }
+
+    /// STDERR kept while waiting for the head is bounded too.
+    #[tokio::test]
+    async fn stderr_collected_before_the_head_is_bounded() {
+        let mut stream =
+            backend_records(FCGI_STDERR, &vec![b'e'; 4 * MAX_RESPONSE_HEAD_BYTES]).await;
+        stream.extend(backend_records(FCGI_STDOUT, b"Status: 200 OK\r\n\r\nbody").await);
+        let parsed = read_head(stream).await.expect("head still parses");
+        assert_eq!(parsed.status, StatusCode::OK);
+        assert!(
+            parsed.stderr.len() <= MAX_RESPONSE_HEAD_BYTES,
+            "kept {} stderr bytes",
+            parsed.stderr.len()
+        );
     }
 
     fn transport_json(extra: Value) -> Value {

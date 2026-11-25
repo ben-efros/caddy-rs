@@ -77,6 +77,21 @@ pub(crate) enum ServedResponse {
     },
 }
 
+/// The accepted peer address with an IPv4-mapped IPv6 address turned into plain IPv4.
+///
+/// Listeners bind `[::]` with `IPV6_V6ONLY` off, so IPv4 clients are reported as
+/// `::ffff:a.b.c.d`; Go's `net` reports them as IPv4. Canonicalising where the peer enters the
+/// request keeps `remote_ip`/`client_ip` ranges, trusted proxies and `{http.request.remote.host}`
+/// consistent.
+fn canonical_peer(remote_addr: Option<SocketAddr>) -> Option<SocketAddr> {
+    remote_addr.map(|address| match address {
+        SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_some() => {
+            SocketAddr::new(address.ip().to_canonical(), address.port())
+        }
+        other => other,
+    })
+}
+
 /// Serve one hyper request through a router with the server's default limits.
 pub async fn serve_request(
     router: Arc<Router>,
@@ -185,21 +200,34 @@ pub(crate) async fn serve_request_with_automatic(
     }
 }
 
-/// Serve one already-buffered request through the router (the HTTP/3 path).
+/// The request body of one HTTP/3 request, as handed to the router.
+#[cfg(feature = "http3")]
+pub(crate) enum H3RequestBody {
+    /// The whole body, already collected (bounded and reserved against the buffered-body budget by
+    /// the caller). Used when a handler in the route tree needs the complete body up front.
+    Buffered(Bytes),
+    /// A body fed chunk by chunk from the QUIC stream while the handler consumes it, so a file of
+    /// any size flows through without being held in memory. The status is set by the body reader
+    /// when the upload fails (timeout, length mismatch, transport error); see [`serve_internal_h3`].
+    Streaming(StreamingBody, Arc<std::sync::atomic::AtomicU16>),
+}
+
+/// Serve one HTTP/3 request through the router.
 ///
-/// HTTP/3 requests arrive through `h3` as `http::Request<()>` plus a stream; the server collects
-/// the request body first (bounded by the server's `max_request_body_size`, matching the buffered
-/// HTTP/1.1 path) and then runs the exact same internal [`caddy_rs_http::Request`] pipeline as
+/// HTTP/3 requests arrive through `h3` as `http::Request<()>` plus a stream. The body is either
+/// already collected (bounded by the buffered-body limit and budget) or a stream the handlers pull
+/// from, bounded lazily by `max_request_body_size` exactly like HTTP/1.1 and HTTP/2. This then runs
+/// the exact same internal [`caddy_rs_http::Request`] pipeline as
 /// HTTP/1.1/HTTP/2: server-level trusted-proxy resolution, `tls.alpn`, local-address variables and
 /// [`caddy_rs_http::Router::handle_upgradable`]. Protocol upgrades (WebSocket/WebTransport) are not
 /// supported over HTTP/3 and are reported as `501 Not Implemented` instead of a silent downgrade.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "http3")]
-pub(crate) async fn serve_internal_buffered(
+pub(crate) async fn serve_internal_h3(
     limits: &ServerLimits,
     router: Arc<Router>,
     parts: http::request::Parts,
-    body: Bytes,
+    body: H3RequestBody,
     remote_addr: Option<SocketAddr>,
     local_addr: Option<SocketAddr>,
     tls: bool,
@@ -230,7 +258,7 @@ pub(crate) async fn serve_internal_buffered(
             );
         }
     }
-    if let Some(limit) = limit {
+    if let (Some(limit), H3RequestBody::Buffered(body)) = (limit, &body) {
         if body.len() as u64 > limit {
             return served_response_with_identity(
                 limits,
@@ -244,15 +272,28 @@ pub(crate) async fn serve_internal_buffered(
     let mut internal = Request::new(parts.method, parts.uri);
     internal.version = parts.version;
     internal.headers = parts.headers;
-    internal.remote_addr = remote_addr;
+    internal.remote_addr = canonical_peer(remote_addr);
     internal.tls = tls;
     internal.tls_connection = tls_connection;
     internal.client_certificate = client_certificate;
     internal.sni = sni;
-    if let Some(access_log) = access_log {
-        internal = internal.with_access_log(access_log);
+    if let Some(access_log) = &access_log {
+        internal = internal.with_access_log(Arc::clone(access_log));
     }
-    internal.body = body;
+    let mut body_failure = None;
+    match body {
+        H3RequestBody::Buffered(body) => internal.body = body,
+        H3RequestBody::Streaming(mut stream, failure) => {
+            body_failure = Some(failure);
+            // The limit is applied lazily by `RequestBody::with_limit`; the shared counter records
+            // the bytes the handlers actually read (Caddy's `bytes_read`).
+            if let Some(access_log) = &access_log {
+                stream = stream.with_counter(access_log.request_bytes());
+            }
+            internal =
+                internal.with_streaming_body(RequestBody::streaming(stream).with_limit(limit));
+        }
+    }
     if let Some(local) = local_addr {
         internal
             .vars
@@ -272,9 +313,28 @@ pub(crate) async fn serve_internal_buffered(
             .insert("tls.alpn".to_string(), alpn.to_string());
     }
     trusted_proxies.apply(&mut internal);
-    match router.handle_upgradable(internal).await {
+    let is_head = internal.method == http::Method::HEAD;
+    let outcome = router.handle_upgradable(internal).await;
+    // The request body failed mid-stream (the client stalled, sent a body that disagrees with its
+    // `Content-Length`, or the stream broke). A proxy upstream may have seen the failed body as a
+    // complete, shorter one and answered success; the client must never be told its upload
+    // succeeded, so the handler's answer is replaced.
+    if let Some(status) = body_failure
+        .as_ref()
+        .map(|failure| failure.load(std::sync::atomic::Ordering::SeqCst))
+        .filter(|status| *status != 0)
+        .and_then(|status| StatusCode::from_u16(status).ok())
+    {
+        let text = if status == StatusCode::REQUEST_TIMEOUT {
+            "408 Request Timeout"
+        } else {
+            "400 Bad Request"
+        };
+        return served_response_with_identity(limits, status_response(status, text));
+    }
+    match outcome {
         Ok(ResponseOutcome::Response(response)) => ServedResponse::Response(
-            to_hyper_streaming_with_identity(response, &limits.server_identity),
+            to_hyper_streaming_with_identity(response, is_head, &limits.server_identity),
         ),
         Ok(ResponseOutcome::Upgrade(_)) => served_response_with_identity(
             limits,
@@ -452,7 +512,7 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
     // `http.matchers.protocol` matcher keys off (Caddy's `r.Proto`).
     internal.version = parts.version;
     internal.headers = parts.headers;
-    internal.remote_addr = remote_addr;
+    internal.remote_addr = canonical_peer(remote_addr);
     internal.tls = tls;
     internal.tls_connection = tls_connection;
     internal.client_certificate = client_certificate;
@@ -575,9 +635,10 @@ pub(crate) async fn serve_request_with_automatic_upgradable(
     // the whole handler chain, before any handler runs.
     trusted_proxies.apply(&mut internal);
 
+    let is_head = internal.method == http::Method::HEAD;
     match router.handle_upgradable(internal).await {
         Ok(ResponseOutcome::Response(response)) => ServedResponse::Response(
-            to_hyper_streaming_with_identity(response, &limits.server_identity),
+            to_hyper_streaming_with_identity(response, is_head, &limits.server_identity),
         ),
         Ok(ResponseOutcome::Upgrade(upgraded)) => {
             let Some(on_upgrade) = on_upgrade else {
@@ -768,9 +829,10 @@ fn served_response_with_identity(
 /// Convert an internal response and stamp the server identity onto it.
 fn to_hyper_streaming_with_identity(
     response: StreamingResponse,
+    head: bool,
     identity: &caddy_rs_core::ResolvedIdentity,
 ) -> hyper::Response<Body> {
-    let mut response = to_hyper_streaming(response);
+    let mut response = to_hyper_streaming_for(response, head);
     apply_server_identity(&mut response, identity);
     response
 }
@@ -778,6 +840,13 @@ fn to_hyper_streaming_with_identity(
 /// Convert an internal (possibly streaming) response to a hyper response, applying the framing
 /// policy documented at the top of this module.
 pub fn to_hyper_streaming(response: StreamingResponse) -> hyper::Response<Body> {
+    to_hyper_streaming_for(response, false)
+}
+
+/// [`to_hyper_streaming`] aware of the request method. A `HEAD` response carries no body by
+/// definition, so its declared `Content-Length` (the length a GET would send, as Go's
+/// `ServeContent` reports it) is kept even though the body is empty.
+pub fn to_hyper_streaming_for(response: StreamingResponse, head: bool) -> hyper::Response<Body> {
     let StreamingResponse {
         status,
         mut headers,
@@ -790,6 +859,7 @@ pub fn to_hyper_streaming(response: StreamingResponse) -> hyper::Response<Body> 
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<u64>().ok());
     let keep_content_length = match (declared, exact_size) {
+        (Some(_), Some(0)) if head => true,
         (Some(declared), Some(exact)) => declared == exact,
         _ => false,
     };
@@ -836,6 +906,21 @@ mod tests {
     use super::*;
     use http::HeaderValue;
 
+    /// The default listener binds `[::]` dual-stack, so an IPv4 client's address arrives
+    /// IPv4-mapped. Go reports such peers as plain IPv4, and every matcher/placeholder expects
+    /// that form (SEC-MEDIUM-PROXY review).
+    #[test]
+    fn mapped_peers_enter_the_request_as_plain_ipv4() {
+        let mapped: SocketAddr = "[::ffff:203.0.113.5]:4242".parse().unwrap();
+        assert_eq!(
+            canonical_peer(Some(mapped)),
+            Some("203.0.113.5:4242".parse().unwrap())
+        );
+        let v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        assert_eq!(canonical_peer(Some(v6)), Some(v6));
+        assert_eq!(canonical_peer(None), None);
+    }
+
     #[test]
     fn declared_content_length_parses_valid_headers_only() {
         let mut headers = http::HeaderMap::new();
@@ -858,6 +943,119 @@ mod tests {
             HeaderValue::from_static("not-a-number"),
         );
         assert_eq!(declared_content_length(&headers), None);
+    }
+
+    /// B2 round 2: a HEAD response has an empty body but must keep the declared `Content-Length`
+    /// (Go sends the length GET would), while a 304 (no length staged) and GET keep their rules.
+    #[tokio::test]
+    async fn head_keeps_the_declared_content_length() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big.bin"), vec![7u8; 700_000]).unwrap();
+        let routes = serde_json::json!([{ "handle": [{
+            "handler": "file_server", "root": dir.path().to_string_lossy(), "hide": []
+        }]}]);
+        let router = caddy_rs_http::RouterBuilder::new()
+            .build(routes.as_array().unwrap())
+            .unwrap();
+        let send = |method: http::Method, etag: Option<HeaderValue>| {
+            let router = &router;
+            async move {
+                let mut request = caddy_rs_http::Request::new(method, "/big.bin".parse().unwrap());
+                if let Some(etag) = etag {
+                    request.headers.insert(http::header::IF_NONE_MATCH, etag);
+                }
+                let Ok(ResponseOutcome::Response(response)) =
+                    router.handle_upgradable(request).await
+                else {
+                    panic!("expected a response");
+                };
+                response
+            }
+        };
+        let head = send(http::Method::HEAD, None).await;
+        let etag = head.headers.get(http::header::ETAG).unwrap().clone();
+        let converted = to_hyper_streaming_for(head, true);
+        assert_eq!(
+            converted.headers().get(http::header::CONTENT_LENGTH),
+            Some(&HeaderValue::from_static("700000")),
+            "HEAD must keep the length GET would send"
+        );
+        let not_modified = send(http::Method::GET, Some(etag)).await;
+        assert_eq!(not_modified.status, StatusCode::NOT_MODIFIED);
+        let converted = to_hyper_streaming_for(not_modified, false);
+        assert!(!converted
+            .headers()
+            .contains_key(http::header::CONTENT_LENGTH));
+        // A GET whose declared length disagrees with its (empty) body still loses the header.
+        let mut mismatched = StreamingResponse::from_buffered(caddy_rs_http::Response::bytes(
+            StatusCode::OK,
+            "text/plain",
+            Vec::<u8>::new(),
+        ));
+        mismatched
+            .headers
+            .insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("5"));
+        let converted = to_hyper_streaming_for(mismatched, false);
+        assert!(!converted
+            .headers()
+            .contains_key(http::header::CONTENT_LENGTH));
+    }
+
+    /// SEC-MEDIUM-HTTP B2 review: a streamed static file (over the 256 KiB threshold) must keep
+    /// its `Content-Length` after `to_hyper_streaming`, like Go's `ServeContent`, for the full
+    /// 200, a single-range 206 and a multipart 206; otherwise HTTP/1.1 falls back to chunked
+    /// framing and HTTP/2/3 clients get no length.
+    #[tokio::test]
+    async fn streamed_static_files_keep_content_length_through_to_hyper_streaming() {
+        let dir = tempfile::tempdir().unwrap();
+        let content: Vec<u8> = (0..700_000usize).map(|index| (index % 251) as u8).collect();
+        std::fs::write(dir.path().join("big.bin"), &content).unwrap();
+        let routes = serde_json::json!([{ "handle": [{
+            "handler": "file_server", "root": dir.path().to_string_lossy(), "hide": []
+        }]}]);
+        let router = caddy_rs_http::RouterBuilder::new()
+            .build(routes.as_array().unwrap())
+            .unwrap();
+
+        for (range, status) in [
+            (None, StatusCode::OK),
+            (Some("bytes=5-399999"), StatusCode::PARTIAL_CONTENT),
+            (
+                Some("bytes=0-199999,300000-599999"),
+                StatusCode::PARTIAL_CONTENT,
+            ),
+        ] {
+            let mut request =
+                caddy_rs_http::Request::new(http::Method::GET, "/big.bin".parse().unwrap());
+            if let Some(range) = range {
+                request
+                    .headers
+                    .insert(http::header::RANGE, HeaderValue::from_str(range).unwrap());
+            }
+            let Ok(ResponseOutcome::Response(response)) = router.handle_upgradable(request).await
+            else {
+                panic!("expected a response for {range:?}");
+            };
+            assert!(
+                matches!(response.body, caddy_rs_http::Body::Stream(_)),
+                "{range:?} must take the streaming path"
+            );
+            let hyper_response = to_hyper_streaming(response);
+            assert_eq!(hyper_response.status(), status, "{range:?}");
+            let declared = hyper_response
+                .headers()
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("Content-Length was dropped for {range:?}"));
+            assert_eq!(
+                hyper_response.body().exact_size(),
+                Some(declared),
+                "{range:?}"
+            );
+            let body = hyper_response.into_body().into_bytes().await.unwrap();
+            assert_eq!(body.len() as u64, declared, "{range:?}");
+        }
     }
 }
 

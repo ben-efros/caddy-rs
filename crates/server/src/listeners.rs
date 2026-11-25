@@ -49,7 +49,7 @@ use tokio_rustls::TlsAcceptor;
 use caddy_rs_admin::access_log::AccessLogContext;
 use caddy_rs_admin::{common_name_from_subject, AdminApi, AdminRequest, SharedRequestRecorder};
 use caddy_rs_core::{Generation, GenerationStore, ListenAddr, Network};
-use caddy_rs_http::{Body, Router};
+use caddy_rs_http::{Body, Router, StreamingBody};
 use caddy_rs_proxy::trusted_proxies::ServerTrustedProxies;
 
 #[cfg(unix)]
@@ -257,6 +257,22 @@ pub(crate) struct ListenerHandle {
     pub(crate) task: JoinHandle<()>,
     pub(crate) bound: String,
     pub(crate) socket_addr: Option<SocketAddr>,
+    /// For a Unix admin listener: the socket path and the identity of the file this listener
+    /// created there (the `/stop` exit path removes it only if it is still that file).
+    pub(crate) unix_socket: Option<(std::path::PathBuf, SocketIdentity)>,
+}
+
+/// How an admin listener is bound, decided by the caller from the generation being applied and the
+/// process role (not re-derived from whatever generation happens to be active).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AdminBindOptions {
+    /// The generation being applied sets `stock_compat true`: replace a Unix socket
+    /// unconditionally like stock Caddy, and lift the body cap/slots.
+    pub stock_compat: bool,
+    /// This process is the child of a zero-downtime upgrade. The parent keeps serving its admin
+    /// socket until the child reports ready, so a socket that still accepts is expected and is
+    /// replaced (the parent's cleanup then leaves the replaced path alone: different inode).
+    pub replace_live: bool,
 }
 
 impl ListenerHandle {
@@ -368,6 +384,7 @@ pub(crate) async fn bind(
                 task,
                 bound: socket_addr.to_string(),
                 socket_addr: Some(socket_addr),
+                unix_socket: None,
             })
         }
         // Windows has AF_UNIX at the OS level but tokio exposes Unix-domain listeners only on
@@ -428,6 +445,7 @@ pub(crate) async fn bind(
                 task,
                 bound: path,
                 socket_addr: None,
+                unix_socket: None,
             })
         }
         #[cfg(feature = "http3")]
@@ -499,6 +517,7 @@ pub(crate) async fn bind(
                 task,
                 bound: socket_addr.to_string(),
                 socket_addr: Some(socket_addr),
+                unix_socket: None,
             })
         }
         #[cfg(not(feature = "http3"))]
@@ -1065,10 +1084,14 @@ fn spawn_udp_accept_loop(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let active = Arc::new(AtomicUsize::new(0));
+        // Set when the loop ends because of a graceful shutdown (not a force, and not the endpoint
+        // closing): in-flight HTTP/3 requests are then allowed to finish before the endpoint closes.
+        let mut graceful = false;
         loop {
             tokio::select! {
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
+                        graceful = changed.is_ok();
                         break;
                     }
                 }
@@ -1109,6 +1132,39 @@ fn spawn_udp_accept_loop(
                 }
             }
         }
+        if graceful && !*force.borrow() {
+            // Keep the endpoint (and the UDP socket) open so requests already in flight can finish,
+            // like the TCP listeners drain; every connection task closes its own connection once
+            // its requests are done. Closing the endpoint straight away (as this used to) cut every
+            // in-flight upload and download off.
+            //
+            // The wait runs in a DETACHED task: this accept-loop task is joined by the reload code
+            // (`ListenerHandle::stop` while removing a listener), which must not wait for in-flight
+            // requests (the runtime's contract: "the reload itself does not wait for them"), and a
+            // force signal must stay responsive. New connections are refused outright during the
+            // drain so clients fail fast instead of timing out on the handshake.
+            tokio::spawn(async move {
+                let drained = tracker.wait_drained(None);
+                tokio::pin!(drained);
+                loop {
+                    tokio::select! {
+                        _ = &mut drained => break,
+                        changed = force.changed() => {
+                            if changed.is_err() || *force.borrow() {
+                                break;
+                            }
+                        }
+                        incoming = endpoint.accept() => match incoming {
+                            Some(incoming) => incoming.refuse(),
+                            None => break,
+                        },
+                    }
+                }
+                endpoint.close(0u32.into(), b"listener closed");
+                let _ = tokio::time::timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
+            });
+            return;
+        }
         // Close the endpoint and all its connections (removal/reload); the per-connection tasks
         // observe the closed connections and end, releasing their permits and trackers.
         endpoint.close(0u32.into(), b"listener closed");
@@ -1143,330 +1199,50 @@ async fn serve_h3_connection(
                 return;
             }
         };
+    // In-flight request tasks of this connection. Dropping the set (any exit path) aborts them.
+    let mut requests: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
+                    // Graceful: tell the client (GOAWAY) that no new requests will be accepted
+                    // and let requests already in flight finish (an upload may still be
+                    // arriving); `force` cuts the wait short.
+                    drain_h3_connection(&mut h3_connection, &mut requests, &mut force).await;
                     connection.close(0u32.into(), b"");
                     break;
                 }
             }
             changed = force.changed() => {
                 if changed.is_err() || *force.borrow() {
+                    requests.abort_all();
                     connection.close(0u32.into(), b"");
                     break;
                 }
             }
+            // Reap finished request tasks so the set does not grow with the connection's lifetime.
+            Some(_) = requests.join_next(), if !requests.is_empty() => {}
             accepted = h3_connection.accept() => {
                 match accepted {
                     Ok(Some(resolver)) => {
-                        let (mut request, mut stream) = match resolver.resolve_request().await {
-                            Ok(pair) => pair,
-                            Err(error) => {
-                                tracing::debug!(%error, "HTTP/3 request resolution failed");
-                                continue;
-                            }
-                        };
-                        let started = std::time::Instant::now();
-                        let method = request.method().as_str().to_string();
-                        // Caddy's metrics labels and request-size histogram are computed before
-                        // the request is consumed (`modules/caddyhttp/metrics.go:314-368`).
-                        let host = request_host(request.headers(), request.uri());
-                        let is_https = true;
-                        let request_size = approximate_request_size(
-                            request.method(),
-                            request.version(),
-                            request.uri(),
-                            request.headers(),
-                        );
-                        let mut snapshot = context.access_log.is_enabled().then(|| {
-                            RequestSnapshot::capture_http3(
-                                &request,
-                                Some(remote_addr),
-                                Some(&tls_info),
-                            )
-                        });
-                        if let Some(snapshot) = snapshot.as_mut() {
-                            snapshot.resolve_client_ip(&context.trusted_proxies);
-                        }
-                        // One shared observation context per request: the access logger and the
-                        // metrics recorder both read the handler/error fields the router publishes,
-                        // and the access-log half stays a no-op when no sink is active.
-                        let access_log_context = Some({
-                            let access_log = Arc::new(AccessLogContext::new());
-                            access_log.start(started);
-                            access_log
-                        });
-                        let _request_guard = request_started(
-                            &context.recorder,
-                            &context.server_name,
-                            &host,
-                            is_https,
-                        );
-                        // RFC 9114 has no HTTP/1.1-style `Upgrade`, and caddy-rs has no HTTP/3
-                        // request-stream tunnel for RFC 8441 extended CONNECT. Reject every
-                        // upgrade-style request before routing so a WebSocket/extended-CONNECT
-                        // request can never be silently served as an ordinary request. Caddy
-                        // v2.11.9: quic-go rejects a plain `Upgrade` header with H3_MESSAGE_ERROR
-                        // (no HTTP response) and its reverse_proxy tunnels extended CONNECT; this
-                        // build's loud 501 is the documented divergence (DIV-0004).
-                        if h3_upgrade_request(&request) {
-                            let mut headers = http::HeaderMap::new();
-                            headers.insert(
-                                http::header::CONTENT_TYPE,
-                                http::HeaderValue::from_static("text/plain; charset=utf-8"),
-                            );
-                            let response = http::Response::builder()
-                                .status(http::StatusCode::NOT_IMPLEMENTED)
-                                .header(
-                                    http::header::CONTENT_TYPE,
-                                    "text/plain; charset=utf-8",
-                                )
-                                .body(())
-                                .unwrap_or_else(|_| http::Response::new(()));
-                            let _ = stream.send_response(response).await;
-                            let body = H3_UPGRADE_UNSUPPORTED_BODY;
-                            let _ = stream.send_data(Bytes::from_static(body.as_bytes())).await;
-                            let _ = stream.finish().await;
-                            observe_request(
-                                &context.recorder,
-                                &context.access_log,
-                                &context.access_log_policy,
-                                &context.server_name,
-                                &method,
-                                snapshot.as_ref(),
-                                started,
-                                501,
-                                body.len() as u64,
-                                &headers,
-                                // Rejected before the request pipeline exists, so there is no
-                                // per-request access-log context and no body write to report.
-                                None,
-                                None,
-                                &host,
-                                is_https,
-                                request_size,
-                                std::time::Instant::now(),
-                            );
-                            continue;
-                        }
-                        // HTTP/3 always buffers the body, so it is always bounded.
-                        let limit = Some(context.limits.buffered_body_limit());
-                        let mut body = BytesMut::new();
-                        let mut too_large = false;
-                        // Process-wide budget shared with the HTTP/1 and HTTP/2 buffered path; held until
-                        // this request's response has been produced.
-                        let mut reservation = crate::limits::BufferedBodyReservation::default();
-                        let mut overloaded = false;
-                        loop {
-                            match stream.recv_data().await {
-                                Ok(Some(mut chunk)) => {
-                                    let chunk = chunk.copy_to_bytes(chunk.remaining());
-                                    if let Some(limit) = limit {
-                                        if body.len() as u64 + chunk.len() as u64 > limit {
-                                            too_large = true;
-                                            break;
-                                        }
-                                    }
-                                    if !reservation.try_grow(chunk.len()) {
-                                        overloaded = true;
-                                        break;
-                                    }
-                                    body.extend_from_slice(&chunk);
-                                }
-                                Ok(None) => break,
-                                Err(error) => {
-                                    tracing::debug!(%error, "HTTP/3 request body read failed");
-                                    break;
-                                }
-                            }
-                        }
-                        if let Some(access_log_context) = &access_log_context {
-                            // The HTTP/3 path buffers the request body here; report the bytes
-                            // actually read from the transport (Caddy's `bytes_read`).
-                            access_log_context.request_bytes().set(body.len() as u64);
-                        }
-                        if too_large || overloaded {
-                            let (refusal_status, refusal_body): (http::StatusCode, &'static [u8]) =
-                                if overloaded {
-                                    (
-                                        http::StatusCode::SERVICE_UNAVAILABLE,
-                                        b"503 Service Unavailable",
-                                    )
-                                } else {
-                                    (
-                                        http::StatusCode::PAYLOAD_TOO_LARGE,
-                                        b"413 Request Entity Too Large",
-                                    )
-                                };
-                            let response = http::Response::builder()
-                                .status(refusal_status)
-                                .body(())
-                                .unwrap_or_else(|_| http::Response::new(()));
-                            let _ = stream.send_response(response).await;
-                            let _ = stream
-                                .send_data(Bytes::from_static(refusal_body))
-                                .await;
-                            let _ = stream.finish().await;
-                            observe_request(
-                                &context.recorder,
-                                &context.access_log,
-                                &context.access_log_policy,
-                                &context.server_name,
-                                &method,
-                                snapshot.as_ref(),
-                                started,
-                                refusal_status.as_u16(),
-                                0,
-                                &http::HeaderMap::new(),
-                                access_log_context.as_ref(),
-                                None,
-                                &host,
-                                is_https,
-                                request_size,
-                                std::time::Instant::now(),
-                            );
-                            continue;
-                        }
-                        // HTTP/3 carries `:authority` in the request URI; synthesize the Host
-                        // header so Caddy host matching/placeholders behave like h1/h2.
-                        if !request.headers().contains_key(http::header::HOST) {
-                            if let Some(authority) = request.uri().authority() {
-                                if let Ok(value) = http::HeaderValue::from_str(authority.as_str()) {
-                                    request
-                                        .headers_mut()
-                                        .insert(http::header::HOST, value);
-                                }
-                            }
-                        }
-                        let (mut parts, ()) = request.into_parts();
-                        parts.version = http::Version::HTTP_3;
-                        let Some(router) = context.router.clone() else {
-                            let headers = http::HeaderMap::new();
-                            observe_request(
-                                &context.recorder,
-                                &context.access_log,
-                                &context.access_log_policy,
-                                &context.server_name,
-                                &method,
-                                snapshot.as_ref(),
-                                started,
-                                503,
-                                0,
-                                &headers,
-                                access_log_context.as_ref(),
-                                None,
-                                &host,
-                                is_https,
-                                request_size,
-                                std::time::Instant::now(),
-                            );
-                            let response = http::Response::builder()
-                                .status(http::StatusCode::SERVICE_UNAVAILABLE)
-                                .body(())
-                                .unwrap_or_else(|_| http::Response::new(()));
-                            let _ = stream.send_response(response).await;
-                            let _ = stream.finish().await;
-                            continue;
-                        };
-                        let served = crate::http::serve_internal_buffered(
-                            &context.limits,
-                            router,
-                            parts,
-                            body.freeze(),
-                            Some(remote_addr),
-                            Some(local_addr),
-                            true,
-                            Some("h3"),
-                            Arc::clone(&context.trusted_proxies),
-                            h3_client_certificate(&connection, context.client_auth_verified),
-                            request_tls_connection(Some(&tls_info)),
-                            (!tls_info.server_name.is_empty())
-                                .then(|| tls_info.server_name.clone()),
-                            access_log_context.clone(),
-                        )
-                        .await;
-                        let hyper_response = match served {
-                            ServedResponse::Response(response) => response,
-                            ServedResponse::Upgraded { response, .. } => response,
-                        };
-                        let (response_parts, response_body) = hyper_response.into_parts();
-                        let mut response_headers = response_parts.headers;
-                        // A buffered body has a known length, so keep the Caddy-compatible
-                        // `Content-Length`; a streamed body is sent chunk by chunk without one and
-                        // is never collected, so a large file does not have to fit in memory.
-                        let known_size = response_body.exact_size();
-                        if let Some(size) = known_size {
-                            if !response_headers.contains_key(http::header::CONTENT_LENGTH)
-                                && response_parts.status != http::StatusCode::NO_CONTENT
-                                && response_parts.status != http::StatusCode::NOT_MODIFIED
-                            {
-                                if let Ok(value) = http::HeaderValue::from_str(&size.to_string()) {
-                                    response_headers.insert(http::header::CONTENT_LENGTH, value);
-                                }
-                            }
-                        }
-                        let mut response = http::Response::builder()
-                            .status(response_parts.status)
-                            .body(())
-                            .unwrap_or_else(|_| http::Response::new(()));
-                        for (name, value) in &response_headers {
-                            response.headers_mut().append(name.clone(), value.clone());
-                        }
-                        if let Err(error) = stream.send_response(response).await {
-                            tracing::debug!(%error, "HTTP/3 response headers failed");
-                            continue;
-                        }
-                        // Caddy's `response_duration_seconds` is time to response headers.
-                        let response_started = std::time::Instant::now();
-                        let mut body = std::pin::pin!(response_body);
-                        let mut sent = 0_u64;
-                        let mut failed = false;
-                        while let Some(frame) = body.frame().await {
-                            let Ok(frame) = frame else {
-                                failed = true;
-                                break;
-                            };
-                            let Ok(data) = frame.into_data() else {
-                                continue;
-                            };
-                            sent += data.len() as u64;
-                            if method == "HEAD" || data.is_empty() {
-                                continue;
-                            }
-                            if let Err(error) = stream.send_data(data).await {
-                                tracing::debug!(%error, "HTTP/3 response body failed");
-                                failed = true;
-                                break;
-                            }
-                        }
-                        let _ = stream.finish().await;
-                        let write_error = failed
-                            .then(|| format!("response body write failed after {sent} bytes"));
-                        observe_request(
-                            &context.recorder,
-                            &context.access_log,
-                            &context.access_log_policy,
-                            &context.server_name,
-                            &method,
-                            snapshot.as_ref(),
-                            started,
-                            response_parts.status.as_u16(),
-                            sent,
-                            &response_headers,
-                            access_log_context.as_ref(),
-                            write_error.as_deref(),
-                            &host,
-                            is_https,
-                            request_size,
-                            response_started,
-                        );
-                        if failed {
-                            continue;
-                        }
-                        continue;
+                        // One task per request stream: a slow upload or download must not block
+                        // other requests on this connection (quic-go serves each stream in its own
+                        // goroutine). The task set is drained on shutdown.
+                        requests.spawn(serve_h3_request(
+                            resolver,
+                            context.clone(),
+                            connection.clone(),
+                            tls_info.clone(),
+                            remote_addr,
+                            local_addr,
+                        ));
                     }
-                    Ok(None) => break,
+                    Ok(None) => {
+                        // The client closed the connection gracefully (GOAWAY): requests it already
+                        // started are still answered.
+                        drain_h3_requests(&mut requests, &mut force).await;
+                        break;
+                    }
                     Err(error) => {
                         tracing::debug!(%error, "HTTP/3 connection closed");
                         break;
@@ -1474,6 +1250,574 @@ async fn serve_h3_connection(
                 }
             }
         }
+    }
+}
+
+/// Gracefully drain one HTTP/3 connection: send GOAWAY (`max_requests = 0`, no further requests),
+/// keep polling `accept()` so any stream the client opened past the GOAWAY is rejected by h3
+/// (`H3_REQUEST_REJECTED`, which clients retry elsewhere) instead of hanging, and wait for the
+/// in-flight request tasks to finish. `force` aborts them.
+#[cfg(feature = "http3")]
+async fn drain_h3_connection(
+    h3_connection: &mut h3::server::Connection<h3_quinn::Connection, Bytes>,
+    requests: &mut tokio::task::JoinSet<()>,
+    force: &mut watch::Receiver<bool>,
+) {
+    let _ = h3_connection.shutdown(0).await;
+    while !requests.is_empty() {
+        tokio::select! {
+            _ = requests.join_next() => {}
+            accepted = h3_connection.accept() => {
+                if !matches!(accepted, Ok(Some(_))) {
+                    // The connection is closing: only the running requests are left to wait for.
+                    drain_h3_requests(requests, force).await;
+                    return;
+                }
+                // A stream that slipped through is dropped, which refuses it.
+            }
+            changed = force.changed() => {
+                if changed.is_err() || *force.borrow() {
+                    requests.abort_all();
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Wait for the in-flight request tasks of one connection to finish, or abort them when `force`
+/// fires (a second signal, or the grace period ending).
+#[cfg(feature = "http3")]
+async fn drain_h3_requests(
+    requests: &mut tokio::task::JoinSet<()>,
+    force: &mut watch::Receiver<bool>,
+) {
+    while !requests.is_empty() {
+        tokio::select! {
+            _ = requests.join_next() => {}
+            changed = force.changed() => {
+                if changed.is_err() || *force.borrow() {
+                    requests.abort_all();
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Serve one HTTP/3 request stream through the router pipeline.
+///
+/// Runs in its own task (one per request stream, like quic-go's goroutine per stream), so a slow or
+/// stalled request cannot hold up other requests on the same QUIC connection. The body is wrapped
+/// in a single-iteration loop so that the request-level `continue` statements below mean "this
+/// request is finished".
+#[cfg(feature = "http3")]
+#[allow(clippy::never_loop)]
+async fn serve_h3_request(
+    resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
+    context: ConnectionContext,
+    connection: quinn::Connection,
+    tls_info: TlsLogInfo,
+    remote_addr: SocketAddr,
+    local_addr: SocketAddr,
+) {
+    let mut resolver = Some(resolver);
+    for _ in 0..1 {
+        // The body runs exactly once; `take` satisfies the borrow checker for the one-shot loop.
+        let Some(resolver) = resolver.take() else {
+            break;
+        };
+        let (mut request, mut stream) = match resolver.resolve_request().await {
+            Ok(pair) => pair,
+            Err(error) => {
+                tracing::debug!(%error, "HTTP/3 request resolution failed");
+                continue;
+            }
+        };
+        let started = std::time::Instant::now();
+        let method = request.method().as_str().to_string();
+        // Caddy's metrics labels and request-size histogram are computed before
+        // the request is consumed (`modules/caddyhttp/metrics.go:314-368`).
+        let host = request_host(request.headers(), request.uri());
+        let is_https = true;
+        let request_size = approximate_request_size(
+            request.method(),
+            request.version(),
+            request.uri(),
+            request.headers(),
+        );
+        let mut snapshot = context
+            .access_log
+            .is_enabled()
+            .then(|| RequestSnapshot::capture_http3(&request, Some(remote_addr), Some(&tls_info)));
+        if let Some(snapshot) = snapshot.as_mut() {
+            snapshot.resolve_client_ip(&context.trusted_proxies);
+        }
+        // One shared observation context per request: the access logger and the
+        // metrics recorder both read the handler/error fields the router publishes,
+        // and the access-log half stays a no-op when no sink is active.
+        let access_log_context = Some({
+            let access_log = Arc::new(AccessLogContext::new());
+            access_log.start(started);
+            access_log
+        });
+        let _request_guard =
+            request_started(&context.recorder, &context.server_name, &host, is_https);
+        // RFC 9114 has no HTTP/1.1-style `Upgrade`, and caddy-rs has no HTTP/3
+        // request-stream tunnel for RFC 8441 extended CONNECT. Reject every
+        // upgrade-style request before routing so a WebSocket/extended-CONNECT
+        // request can never be silently served as an ordinary request. Caddy
+        // v2.11.9: quic-go rejects a plain `Upgrade` header with H3_MESSAGE_ERROR
+        // (no HTTP response) and its reverse_proxy tunnels extended CONNECT; this
+        // build's loud 501 is the documented divergence (DIV-0004).
+        if h3_upgrade_request(&request) {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            let response = http::Response::builder()
+                .status(http::StatusCode::NOT_IMPLEMENTED)
+                .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                .body(())
+                .unwrap_or_else(|_| http::Response::new(()));
+            let _ = stream.send_response(response).await;
+            let body = H3_UPGRADE_UNSUPPORTED_BODY;
+            let _ = stream.send_data(Bytes::from_static(body.as_bytes())).await;
+            let _ = stream.finish().await;
+            observe_request(
+                &context.recorder,
+                &context.access_log,
+                &context.access_log_policy,
+                &context.server_name,
+                &method,
+                snapshot.as_ref(),
+                started,
+                501,
+                body.len() as u64,
+                &headers,
+                // Rejected before the request pipeline exists, so there is no
+                // per-request access-log context and no body write to report.
+                None,
+                None,
+                &host,
+                is_https,
+                request_size,
+                std::time::Instant::now(),
+            );
+            continue;
+        }
+        // Same rule as HTTP/1.1 and HTTP/2: the body streams to the handlers unless
+        // one of them needs it buffered (`reverse_proxy` retries, FastCGI,
+        // `handle_response`/`forward_auth`) or a body limit is configured for a body
+        // of unknown length (so the 413 can still precede the handler).
+        // A malformed `Content-Length` (several values, a sign, a list that disagrees)
+        // is refused with 400 (RFC 9114 section 4.1.2) before any body is read.
+        let declared = h3_declared_length(request.headers());
+        let header_invalid = declared.is_err();
+        let declared_length = declared.unwrap_or(None);
+        let can_stream = !header_invalid
+            && context.router.as_ref().is_some_and(|router| {
+                !router.requires_buffered_request_body()
+                    && (declared_length.is_some() || context.limits.max_request_body_size.is_none())
+            });
+        // Send and receive halves are independent: the handler can answer (and
+        // stream a response) while the request body is still arriving.
+        let (mut stream, recv_stream) = stream.split();
+        let mut recv_stream = Some(recv_stream);
+        let mut streamed_body = None;
+        // Longest silence tolerated between body reads. HTTP/1 enforces
+        // `read_timeout` per read at the socket; QUIC has no such wrapper, and its
+        // idle timeout is defeated by keep-alive PINGs, so without this a client
+        // that stalls mid-upload holds the handler (and its upstream) forever.
+        let body_idle_timeout = h3_body_idle_timeout(&context.limits);
+        // Cancels the body reader when this request is done (dropping the guard
+        // resolves the reader's `cancelled` receiver), even if the handler
+        // answered without consuming the whole upload.
+        let mut _body_reader = None;
+        // Status the reader records when the streamed upload fails, so the client
+        // is never told success for an upload that did not complete.
+        let body_failure = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        if can_stream {
+            let reader = recv_stream.take().expect("receive half is present");
+            let (chunks, receiver) = tokio::sync::mpsc::channel(H3_BODY_CHANNEL_DEPTH);
+            let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+            _body_reader = Some(cancel);
+            tokio::spawn(pump_h3_request_body(
+                reader,
+                chunks,
+                cancelled,
+                body_idle_timeout,
+                declared_length,
+                Arc::clone(&body_failure),
+            ));
+            streamed_body = Some(StreamingBody::from_chunks(receiver));
+        }
+        // The buffered path is always bounded.
+        let limit = Some(context.limits.buffered_body_limit());
+        let mut body = BytesMut::new();
+        let mut too_large = false;
+        // Process-wide budget shared with the HTTP/1 and HTTP/2 buffered path; held until
+        // this request's response has been produced.
+        let mut reservation = crate::limits::BufferedBodyReservation::default();
+        let mut overloaded = false;
+        // Set when the body could not be read to the end, or does not match the
+        // declared length: the request is refused instead of being routed with a
+        // truncated body.
+        let mut malformed: Option<http::StatusCode> =
+            header_invalid.then_some(http::StatusCode::BAD_REQUEST);
+        while !can_stream && malformed.is_none() {
+            let Some(reader) = recv_stream.as_mut() else {
+                break;
+            };
+            let next = match tokio::time::timeout(body_idle_timeout, reader.recv_data()).await {
+                Ok(next) => next,
+                Err(_elapsed) => {
+                    tracing::debug!("HTTP/3 request body read timed out");
+                    malformed = Some(http::StatusCode::REQUEST_TIMEOUT);
+                    break;
+                }
+            };
+            match next {
+                Ok(Some(mut chunk)) => {
+                    let chunk = chunk.copy_to_bytes(chunk.remaining());
+                    if let Some(limit) = limit {
+                        if body.len() as u64 + chunk.len() as u64 > limit {
+                            too_large = true;
+                            break;
+                        }
+                    }
+                    if !reservation.try_grow(chunk.len()) {
+                        overloaded = true;
+                        break;
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::debug!(%error, "HTTP/3 request body read failed");
+                    malformed = Some(http::StatusCode::BAD_REQUEST);
+                    break;
+                }
+            }
+        }
+        if !can_stream
+            && malformed.is_none()
+            && !too_large
+            && !overloaded
+            && declared_length.is_some_and(|declared| declared != body.len() as u64)
+        {
+            malformed = Some(http::StatusCode::BAD_REQUEST);
+        }
+        if let (false, Some(access_log_context)) = (can_stream, &access_log_context) {
+            // A buffered request body was read in full here; report the bytes
+            // actually read from the transport (Caddy's `bytes_read`). A streamed
+            // body is counted as the handlers consume it.
+            access_log_context.request_bytes().set(body.len() as u64);
+        }
+        if too_large || overloaded || malformed.is_some() {
+            let (refusal_status, refusal_body): (http::StatusCode, &'static [u8]) = if overloaded {
+                (
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    b"503 Service Unavailable",
+                )
+            } else if too_large {
+                (
+                    http::StatusCode::PAYLOAD_TOO_LARGE,
+                    b"413 Request Entity Too Large",
+                )
+            } else if malformed == Some(http::StatusCode::REQUEST_TIMEOUT) {
+                (http::StatusCode::REQUEST_TIMEOUT, b"408 Request Timeout")
+            } else {
+                (http::StatusCode::BAD_REQUEST, b"400 Bad Request")
+            };
+            let response = http::Response::builder()
+                .status(refusal_status)
+                .body(())
+                .unwrap_or_else(|_| http::Response::new(()));
+            let _ = stream.send_response(response).await;
+            let _ = stream.send_data(Bytes::from_static(refusal_body)).await;
+            let _ = stream.finish().await;
+            observe_request(
+                &context.recorder,
+                &context.access_log,
+                &context.access_log_policy,
+                &context.server_name,
+                &method,
+                snapshot.as_ref(),
+                started,
+                refusal_status.as_u16(),
+                0,
+                &http::HeaderMap::new(),
+                access_log_context.as_ref(),
+                None,
+                &host,
+                is_https,
+                request_size,
+                std::time::Instant::now(),
+            );
+            continue;
+        }
+        // HTTP/3 carries `:authority` in the request URI; synthesize the Host
+        // header so Caddy host matching/placeholders behave like h1/h2.
+        if !request.headers().contains_key(http::header::HOST) {
+            if let Some(authority) = request.uri().authority() {
+                if let Ok(value) = http::HeaderValue::from_str(authority.as_str()) {
+                    request.headers_mut().insert(http::header::HOST, value);
+                }
+            }
+        }
+        let (mut parts, ()) = request.into_parts();
+        parts.version = http::Version::HTTP_3;
+        let Some(router) = context.router.clone() else {
+            let headers = http::HeaderMap::new();
+            observe_request(
+                &context.recorder,
+                &context.access_log,
+                &context.access_log_policy,
+                &context.server_name,
+                &method,
+                snapshot.as_ref(),
+                started,
+                503,
+                0,
+                &headers,
+                access_log_context.as_ref(),
+                None,
+                &host,
+                is_https,
+                request_size,
+                std::time::Instant::now(),
+            );
+            let response = http::Response::builder()
+                .status(http::StatusCode::SERVICE_UNAVAILABLE)
+                .body(())
+                .unwrap_or_else(|_| http::Response::new(()));
+            let _ = stream.send_response(response).await;
+            let _ = stream.finish().await;
+            continue;
+        };
+        let request_body = match streamed_body.take() {
+            Some(streaming) => {
+                crate::http::H3RequestBody::Streaming(streaming, Arc::clone(&body_failure))
+            }
+            None => crate::http::H3RequestBody::Buffered(body.freeze()),
+        };
+        let served = crate::http::serve_internal_h3(
+            &context.limits,
+            router,
+            parts,
+            request_body,
+            Some(remote_addr),
+            Some(local_addr),
+            true,
+            Some("h3"),
+            Arc::clone(&context.trusted_proxies),
+            h3_client_certificate(&connection, context.client_auth_verified),
+            request_tls_connection(Some(&tls_info)),
+            (!tls_info.server_name.is_empty()).then(|| tls_info.server_name.clone()),
+            access_log_context.clone(),
+        )
+        .await;
+        let hyper_response = match served {
+            ServedResponse::Response(response) => response,
+            ServedResponse::Upgraded { response, .. } => response,
+        };
+        let (response_parts, response_body) = hyper_response.into_parts();
+        let mut response_headers = response_parts.headers;
+        // A buffered body has a known length, so keep the Caddy-compatible
+        // `Content-Length`; a streamed body is sent chunk by chunk without one and
+        // is never collected, so a large file does not have to fit in memory.
+        let known_size = response_body.exact_size();
+        if let Some(size) = known_size {
+            if !response_headers.contains_key(http::header::CONTENT_LENGTH)
+                && response_parts.status != http::StatusCode::NO_CONTENT
+                && response_parts.status != http::StatusCode::NOT_MODIFIED
+            {
+                if let Ok(value) = http::HeaderValue::from_str(&size.to_string()) {
+                    response_headers.insert(http::header::CONTENT_LENGTH, value);
+                }
+            }
+        }
+        let mut response = http::Response::builder()
+            .status(response_parts.status)
+            .body(())
+            .unwrap_or_else(|_| http::Response::new(()));
+        for (name, value) in &response_headers {
+            response.headers_mut().append(name.clone(), value.clone());
+        }
+        if let Err(error) = stream.send_response(response).await {
+            tracing::debug!(%error, "HTTP/3 response headers failed");
+            continue;
+        }
+        // Caddy's `response_duration_seconds` is time to response headers.
+        let response_started = std::time::Instant::now();
+        let mut body = std::pin::pin!(response_body);
+        let mut sent = 0_u64;
+        let mut failed = false;
+        while let Some(frame) = body.frame().await {
+            let Ok(frame) = frame else {
+                failed = true;
+                break;
+            };
+            let Ok(data) = frame.into_data() else {
+                continue;
+            };
+            sent += data.len() as u64;
+            if method == "HEAD" || data.is_empty() {
+                continue;
+            }
+            if let Err(error) = stream.send_data(data).await {
+                tracing::debug!(%error, "HTTP/3 response body failed");
+                failed = true;
+                break;
+            }
+        }
+        let _ = stream.finish().await;
+        let write_error = failed.then(|| format!("response body write failed after {sent} bytes"));
+        observe_request(
+            &context.recorder,
+            &context.access_log,
+            &context.access_log_policy,
+            &context.server_name,
+            &method,
+            snapshot.as_ref(),
+            started,
+            response_parts.status.as_u16(),
+            sent,
+            &response_headers,
+            access_log_context.as_ref(),
+            write_error.as_deref(),
+            &host,
+            is_https,
+            request_size,
+            response_started,
+        );
+        if failed {
+            continue;
+        }
+        continue;
+    }
+}
+
+/// How many request-body chunks may sit between the QUIC stream and the handler. Small on purpose:
+/// it is the whole read-ahead, so memory per upload is a few chunks regardless of file size.
+#[cfg(feature = "http3")]
+const H3_BODY_CHANNEL_DEPTH: usize = 4;
+
+/// Stand-in for "no timeout" (a negative `read_idle_timeout` and no `read_timeout`): far enough in
+/// the future that it never fires.
+#[cfg(feature = "http3")]
+const H3_BODY_NO_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 24 * 365);
+
+/// The longest silence tolerated between reads of one HTTP/3 request body: the shorter of the
+/// server's `read_timeout` and `read_idle_timeout` (Caddy default 1 minute, negative disables).
+/// A stalled upload otherwise holds its handler and any upstream connection forever, because QUIC
+/// keep-alive PINGs keep the connection itself alive.
+#[cfg(feature = "http3")]
+fn h3_body_idle_timeout(limits: &crate::limits::ServerLimits) -> Duration {
+    [limits.read_timeout, limits.read_idle_timeout]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(H3_BODY_NO_TIMEOUT)
+}
+
+/// Feed one HTTP/3 request body from the QUIC receive half into `chunks`, which the handler reads
+/// as a streaming body.
+///
+/// * The bounded channel is the whole read-ahead: a slow handler stops this task pulling from QUIC,
+///   which closes the stream's flow-control window and slows the client.
+/// * `cancelled` resolves when the request ends (its sender is dropped); the task then just drops
+///   the stream.
+/// * `idle` bounds the silence between reads; on expiry the body fails (the client gets `408`).
+/// * `declared` is the request's `Content-Length`: more data than declared, or a stream that ends
+///   short of it, fails the body (the client gets `400`). Without this a lying length is silently
+///   truncated by the HTTP/1 upstream framing. It only sees data that arrives while the handler is
+///   still reading: if the handler finishes after exactly `declared` bytes, later surplus data is
+///   never observed.
+///
+/// **This function never calls `stop_sending` (or `recv_id`) on the stream, on purpose.** h3-quinn's
+/// `RecvStream` keeps the QUIC stream in an `Option` that is `None` whenever a read future is in
+/// flight, and both methods `unwrap()` it. A read is in flight not only after abandoning
+/// `recv_data()` (timeout, cancel) but also *between* calls: h3 reads ahead after a DATA frame
+/// (looking for trailers or the next frame), so even right after a chunk was delivered the
+/// stream may be absent. Calling `stop_sending` therefore panics intermittently, and with the
+/// `release-minimal` profile (`panic = "abort"`) that lets a client kill the whole process. The
+/// consequence is that the stream is only dropped, so quinn tells the client to stop with
+/// application error code 0 rather than `H3_NO_ERROR` / `H3_MESSAGE_ERROR` / `H3_REQUEST_CANCELLED`
+/// (RFC 9114 section 4.1 says `H3_NO_ERROR` SHOULD be used); the client-visible HTTP status
+/// (`400`/`408`) is unaffected.
+#[cfg(feature = "http3")]
+async fn pump_h3_request_body<S>(
+    mut reader: h3::server::RequestStream<S, Bytes>,
+    chunks: tokio::sync::mpsc::Sender<Result<Bytes, caddy_rs_http::body::BodyError>>,
+    mut cancelled: tokio::sync::oneshot::Receiver<()>,
+    idle: Duration,
+    declared: Option<u64>,
+    failure_status: Arc<std::sync::atomic::AtomicU16>,
+) where
+    S: h3::quic::RecvStream,
+{
+    use std::sync::atomic::Ordering;
+    let fail = |status: u16, error: Box<dyn std::error::Error + Send + Sync>| {
+        // The status is stored before the error is delivered, so a handler that observed the error
+        // always produces an overridden response.
+        failure_status.store(status, Ordering::SeqCst);
+        caddy_rs_http::body::BodyError::Upstream(error)
+    };
+    let mut received: u64 = 0;
+    loop {
+        let next = tokio::select! {
+            _ = &mut cancelled => return,
+            next = tokio::time::timeout(idle, reader.recv_data()) => next,
+        };
+        let error = match next {
+            Err(_elapsed) => fail(
+                408,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "request body read timed out",
+                )),
+            ),
+            Ok(Err(error)) => fail(400, Box::new(error)),
+            Ok(Ok(None)) => match declared {
+                Some(declared) if declared != received => fail(
+                    400,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "request body ended before the declared Content-Length",
+                    )),
+                ),
+                _ => return,
+            },
+            Ok(Ok(Some(mut chunk))) => {
+                let chunk = chunk.copy_to_bytes(chunk.remaining());
+                received += chunk.len() as u64;
+                if declared.is_some_and(|declared| received > declared) {
+                    fail(
+                        400,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "request body is longer than the declared Content-Length",
+                        )),
+                    )
+                } else {
+                    tokio::select! {
+                        _ = &mut cancelled => return,
+                        sent = chunks.send(Ok(chunk)) => {
+                            if sent.is_err() {
+                                // The handler dropped the body.
+                                return;
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+        };
+        let _ = chunks.send(Err(error)).await;
+        return;
     }
 }
 
@@ -1490,7 +1834,7 @@ pub(crate) const H3_UPGRADE_UNSUPPORTED_BODY: &str =
 /// HTTP/3 (RFC 9114) has no HTTP/1.1 `Upgrade` mechanism: a request that carries `Upgrade` is a
 /// WebSocket/other-upgrade attempt that quic-go would reject as malformed. RFC 8441 extended
 /// CONNECT is a `CONNECT` request with a `:protocol` pseudo-header, which `h3` surfaces as an
-/// extension. caddy-rs buffers HTTP/3 requests and has no request-stream tunnel, so both forms are
+/// extension. caddy-rs has no HTTP/3 request-stream tunnel, so both forms are
 /// rejected loudly instead of being handed to the router as ordinary requests. A plain `CONNECT`
 /// without `:protocol` is not an upgrade and keeps the existing routing behaviour.
 #[cfg(feature = "http3")]
@@ -1830,34 +2174,45 @@ async fn serve_wrapped<I>(
     context: ConnectionContext,
     permit: ConnectionPermit,
     generation: Option<Arc<Generation>>,
-    shutdown: watch::Receiver<bool>,
-    force: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<bool>,
+    mut force: watch::Receiver<bool>,
     tracked: TrackedConnection,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (stream, remote_override, local_override, proxy_vars) = match context
-        .wrappers
-        .proxy_protocol()
-    {
-        Some(settings) => match crate::proxy_protocol::wrap(stream, peer, local, settings).await {
-            Ok(wrapped) => wrapped,
-            Err(error) => {
-                tracing::warn!(
-                    peer = ?peer,
-                    %error,
-                    "rejecting connection: PROXY protocol wrapper failed"
-                );
-                return;
-            }
-        },
-        None => (
-            PrefixedStream::new(stream, Vec::new()),
-            None,
-            None,
-            Vec::new(),
-        ),
-    };
+    let (stream, remote_override, local_override, proxy_vars) =
+        match context.wrappers.proxy_protocol() {
+            Some(settings) => match bounded_handshake(
+                crate::proxy_protocol::wrap(stream, peer, local, settings),
+                // The wrapper enforces its own (default 10 s) header deadline; this only adds the
+                // shutdown signals.
+                Duration::from_secs(86_400),
+                &mut shutdown,
+                &mut force,
+            )
+            .await
+            .unwrap_or_else(|abort| {
+                Err(crate::proxy_protocol::ProxyProtocolError::Io(
+                    io::Error::other(format!("connection abandoned during shutdown: {abort:?}")),
+                ))
+            }) {
+                Ok(wrapped) => wrapped,
+                Err(error) => {
+                    tracing::warn!(
+                        peer = ?peer,
+                        %error,
+                        "rejecting connection: PROXY protocol wrapper failed"
+                    );
+                    return;
+                }
+            },
+            None => (
+                PrefixedStream::new(stream, Vec::new()),
+                None,
+                None,
+                Vec::new(),
+            ),
+        };
     serve_accepted(
         stream,
         remote_override.or(peer),
@@ -1873,6 +2228,51 @@ async fn serve_wrapped<I>(
     .await;
 }
 
+/// How long a connection still in its TLS handshake (or PROXY header read) may live after a
+/// graceful stop begins. Go's `Server.Shutdown` closes connections that never got past `StateNew`
+/// once they are a few seconds old rather than waiting for them.
+const HANDSHAKE_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Why a pre-request phase (PROXY header, TLS handshake) was abandoned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhaseAbort {
+    /// The budget ran out.
+    TimedOut,
+    /// A graceful stop began and [`HANDSHAKE_SHUTDOWN_GRACE`] elapsed.
+    ShutdownGrace,
+    /// A forced shutdown.
+    Forced,
+}
+
+/// Drive `phase` to completion, but give up after `budget`, when a forced shutdown arrives, or
+/// [`HANDSHAKE_SHUTDOWN_GRACE`] after a graceful one begins. Without this a half-open handshake
+/// ignored the shutdown signals and kept its tracker guard (and task) until its own budget ended.
+async fn bounded_handshake<F: Future>(
+    phase: F,
+    budget: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+    force: &mut watch::Receiver<bool>,
+) -> Result<F::Output, PhaseAbort> {
+    use tokio::time::Instant;
+    tokio::pin!(phase);
+    let budget_end = Instant::now() + budget;
+    let mut grace_end: Option<Instant> = None;
+    loop {
+        let (deadline, on_deadline) = match grace_end {
+            Some(grace_end) if grace_end < budget_end => (grace_end, PhaseAbort::ShutdownGrace),
+            _ => (budget_end, PhaseAbort::TimedOut),
+        };
+        tokio::select! {
+            output = &mut phase => return Ok(output),
+            _ = tokio::time::sleep_until(deadline) => return Err(on_deadline),
+            _ = force.changed() => return Err(PhaseAbort::Forced),
+            _ = shutdown.changed(), if grace_end.is_none() => {
+                grace_end = Some(Instant::now() + HANDSHAKE_SHUTDOWN_GRACE);
+            }
+        }
+    }
+}
+
 /// Terminate TLS when the listener is a TLS listener, then serve the connection.
 #[allow(clippy::too_many_arguments)]
 async fn serve_accepted<I>(
@@ -1883,8 +2283,8 @@ async fn serve_accepted<I>(
     context: ConnectionContext,
     permit: ConnectionPermit,
     generation: Option<Arc<Generation>>,
-    shutdown: watch::Receiver<bool>,
-    force: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<bool>,
+    mut force: watch::Receiver<bool>,
     tracked: TrackedConnection,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1909,30 +2309,51 @@ async fn serve_accepted<I>(
     let access_log_policy = context.access_log_policy;
     if let Some(tls) = context.tls {
         let acceptor = TlsAcceptor::from(tls);
+        // Go bounds the handshake by min(read_timeout, read_header_timeout); the connection is
+        // dropped when the client does not finish it in time (SEC-MEDIUM-ADMIN-SERVER A4).
+        let handshake_timeout = limits.tls_handshake_timeout();
         let tls_stream = match external_key {
             // A token-held key signs inside the PKCS#11 token: hold a token handshake permit and
             // bound the whole handshake by the token budget (T-TLS-097).
             Some(pool) => {
-                match caddy_rs_tls::tls_server::accept_external_key_handshake(
-                    acceptor, stream, pool,
+                match bounded_handshake(
+                    caddy_rs_tls::tls_server::accept_external_key_handshake(acceptor, stream, pool),
+                    handshake_timeout,
+                    &mut shutdown,
+                    &mut force,
                 )
                 .await
                 {
-                    Ok(stream) => stream,
-                    Err(error) => {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
                         // Budget exhaustion and token failures are per-connection errors: log at
                         // debug and drop the connection, like the handshake failure below.
                         tracing::debug!(%error, "TLS handshake failed");
                         return;
                     }
+                    Err(abort) => {
+                        tracing::debug!(?handshake_timeout, ?abort, "TLS handshake abandoned");
+                        return;
+                    }
                 }
             }
-            None => match acceptor.accept(stream).await {
-                Ok(stream) => stream,
-                Err(error) => {
+            None => match bounded_handshake(
+                acceptor.accept(stream),
+                handshake_timeout,
+                &mut shutdown,
+                &mut force,
+            )
+            .await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(error)) => {
                     // TLS handshake failures are client-side errors (wrong SNI, protocol
                     // mismatch); log at debug and drop the connection like Caddy does.
                     tracing::debug!(%error, "TLS handshake failed");
+                    return;
+                }
+                Err(abort) => {
+                    tracing::debug!(?handshake_timeout, ?abort, "TLS handshake abandoned");
                     return;
                 }
             },
@@ -2590,7 +3011,17 @@ async fn serve_connection<I, S>(
     builder
         .http1()
         .timer(TokioTimer::new())
-        .header_read_timeout(Some(limits.read_header_timeout))
+        // hyper's header timer also runs while a keep-alive connection waits for its next request,
+        // where Go applies `IdleTimeout` instead. Listeners that opt into request-scoped read
+        // timers therefore give it the idle budget (their first-byte wait still uses the header
+        // budget); everyone else keeps `read_header_timeout`.
+        .header_read_timeout(Some(
+            if limits.read_timeout_scope == crate::limits::ReadTimeoutScope::BodyReads {
+                limits.idle_timeout
+            } else {
+                limits.read_header_timeout
+            },
+        ))
         .max_buf_size(
             limits
                 .max_header_bytes
@@ -2599,7 +3030,10 @@ async fn serve_connection<I, S>(
     let mut http2 = builder.http2();
     configure_h2_auto_server(&mut http2, &limits);
 
-    let io = TimedIo::new(io, limits.read_timeout, limits.write_timeout);
+    let mut io = TimedIo::new(io, limits.read_timeout, limits.write_timeout);
+    if limits.read_timeout_scope == crate::limits::ReadTimeoutScope::BodyReads {
+        io = io.with_read_gate(Arc::clone(&activity), limits.read_header_timeout);
+    }
     let connection = builder.serve_connection_with_upgrades(TokioIo::new(io), service);
     tokio::pin!(connection);
     let idle = idle_after(activity, limits.idle_timeout);
@@ -2644,12 +3078,38 @@ async fn serve_connection<I, S>(
 #[derive(Debug, Default)]
 struct ConnectionActivity {
     in_flight: AtomicUsize,
+    /// Request bodies currently being read. With [`ReadTimeoutScope::BodyReads`] the per-read
+    /// timer runs only while this is non-zero.
+    body_reads: AtomicUsize,
+    /// Requests started so far; lets the transport tell "the request this header timer was armed
+    /// for has begun" without racing a request that starts and ends between two polls.
+    started: std::sync::atomic::AtomicU64,
     notify: tokio::sync::Notify,
 }
 
+/// Marks a request body read in flight; see [`ConnectionActivity::begin_body_read`].
+struct BodyReadGuard(Arc<ConnectionActivity>);
+
+impl Drop for BodyReadGuard {
+    fn drop(&mut self) {
+        self.0.body_reads.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl ConnectionActivity {
+    /// Mark the start of a request-body read; the guard marks its end when dropped.
+    fn begin_body_read(self: &Arc<Self>) -> BodyReadGuard {
+        self.body_reads.fetch_add(1, Ordering::AcqRel);
+        BodyReadGuard(Arc::clone(self))
+    }
+
+    fn reading_body(&self) -> bool {
+        self.body_reads.load(Ordering::Acquire) != 0
+    }
+
     /// Mark the start of one request. The returned guard marks the end when dropped.
     fn begin(self: &Arc<Self>) -> InFlightGuard {
+        self.started.fetch_add(1, Ordering::AcqRel);
         self.in_flight.fetch_add(1, Ordering::AcqRel);
         self.notify.notify_one();
         InFlightGuard(Arc::clone(self))
@@ -2731,6 +3191,14 @@ struct TimedIo<I> {
     write_timeout: Option<Duration>,
     read_timer: Option<Pin<Box<tokio::time::Sleep>>>,
     write_timer: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// When set, request-scoped read timers (see [`crate::limits::ReadTimeoutScope::BodyReads`]):
+    /// the per-read timer runs only while a request body is read, and a request whose first byte
+    /// arrived on an otherwise idle connection must deliver its headers within `head_budget`
+    /// in total (Go's `ReadHeaderTimeout`), however slowly the bytes trickle.
+    read_gate: Option<Arc<ConnectionActivity>>,
+    head_budget: Option<Duration>,
+    /// The armed header timer and the `started` count it was armed at.
+    head_timer: Option<(Pin<Box<tokio::time::Sleep>>, u64)>,
 }
 
 impl<I> TimedIo<I> {
@@ -2741,7 +3209,16 @@ impl<I> TimedIo<I> {
             write_timeout,
             read_timer: None,
             write_timer: None,
+            read_gate: None,
+            head_budget: None,
+            head_timer: None,
         }
+    }
+
+    fn with_read_gate(mut self, gate: Arc<ConnectionActivity>, head_budget: Duration) -> Self {
+        self.read_gate = Some(gate);
+        self.head_budget = Some(head_budget);
+        self
     }
 }
 
@@ -2752,8 +3229,52 @@ impl<I: AsyncRead + Unpin> AsyncRead for TimedIo<I> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        let before = buf.filled().len();
         let result = Pin::new(&mut this.inner).poll_read(cx, buf);
-        apply_io_timeout(&mut this.read_timer, this.read_timeout, cx, result)
+        let Some(gate) = this.read_gate.clone() else {
+            return apply_io_timeout(&mut this.read_timer, this.read_timeout, cx, result);
+        };
+        let started = gate.started.load(Ordering::Acquire);
+        // A request began since the header timer was armed (or one is running): its headers
+        // arrived, the timer has done its job.
+        if this
+            .head_timer
+            .as_ref()
+            .is_some_and(|(_, armed_at)| *armed_at != started)
+        {
+            this.head_timer = None;
+        }
+        // First byte of a new HTTP/1 request on an idle connection (a request method starts
+        // with a letter; HTTP/2 frames after the preface do not): start the header budget.
+        if let (Poll::Ready(Ok(())), Some(budget)) = (&result, this.head_budget) {
+            let first = buf.filled().get(before).copied();
+            if this.head_timer.is_none()
+                && gate.in_flight.load(Ordering::Acquire) == 0
+                && !gate.reading_body()
+                && first.is_some_and(|byte| byte.is_ascii_alphabetic())
+            {
+                this.head_timer = Some((Box::pin(tokio::time::sleep(budget)), started));
+            }
+        }
+        let timeout = if gate.reading_body() {
+            this.read_timeout
+        } else {
+            this.read_timer = None;
+            None
+        };
+        let mut result = apply_io_timeout(&mut this.read_timer, timeout, cx, result);
+        if result.is_pending() {
+            if let Some((timer, _)) = this.head_timer.as_mut() {
+                if timer.as_mut().poll(cx).is_ready() {
+                    this.head_timer = None;
+                    result = Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "request headers did not arrive within the header timeout",
+                    )));
+                }
+            }
+        }
+        result
     }
 }
 
@@ -2816,12 +3337,404 @@ fn error_response() -> hyper::Response<Body> {
 /// connection task, and an anonymous `service_fn` type cannot express that bound.
 struct AdminService {
     api: AdminApi,
+    /// Shared by every connection of one listener: bounds the admin requests reading a body.
+    body_slots: Arc<AdminBodySlots>,
+    /// The connection's activity record: a body read in flight switches the read timer on.
+    activity: Arc<ConnectionActivity>,
+    /// Who is on the other end, for per-peer upload fairness.
+    peer: String,
+}
+
+/// Upload slots of one admin listener: [`ADMIN_MAX_CONCURRENT_BODIES`] in total, of which one peer
+/// may hold at most [`ADMIN_MAX_BODIES_PER_PEER`], so a single client (or certificate) that
+/// trickles bodies cannot starve everyone else.
+struct AdminBodySlots {
+    total: Arc<tokio::sync::Semaphore>,
+    per_peer: std::sync::Mutex<HashMap<String, usize>>,
+    per_peer_limit: usize,
+}
+
+/// One claimed upload slot; released on drop.
+struct BodySlot {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    slots: Arc<AdminBodySlots>,
+    peer: String,
+}
+
+impl AdminBodySlots {
+    /// Upload slots: [`ADMIN_MAX_CONCURRENT_BODIES`] / [`ADMIN_MAX_BODIES_PER_PEER`].
+    fn new() -> Arc<Self> {
+        Self::with_limits(ADMIN_MAX_CONCURRENT_BODIES, ADMIN_MAX_BODIES_PER_PEER)
+    }
+
+    /// Connection slots: [`ADMIN_MAX_CONNECTIONS`] / [`ADMIN_MAX_CONNECTIONS_PER_PEER`].
+    fn for_connections() -> Arc<Self> {
+        Self::with_limits(ADMIN_MAX_CONNECTIONS, ADMIN_MAX_CONNECTIONS_PER_PEER)
+    }
+
+    fn with_limits(total: usize, per_peer_limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            total: Arc::new(tokio::sync::Semaphore::new(total)),
+            per_peer: std::sync::Mutex::new(HashMap::new()),
+            per_peer_limit,
+        })
+    }
+
+    /// Claim a slot for `peer`, or `None` when the listener or the peer is at its limit.
+    fn try_acquire(self: &Arc<Self>, peer: &str) -> Option<BodySlot> {
+        {
+            let mut per_peer = self.per_peer.lock().unwrap_or_else(|e| e.into_inner());
+            let held = per_peer.entry(peer.to_string()).or_insert(0);
+            if *held >= self.per_peer_limit {
+                return None;
+            }
+            *held += 1;
+        }
+        match Arc::clone(&self.total).try_acquire_owned() {
+            Ok(permit) => Some(BodySlot {
+                _permit: permit,
+                slots: Arc::clone(self),
+                peer: peer.to_string(),
+            }),
+            Err(_) => {
+                self.release_peer(peer);
+                None
+            }
+        }
+    }
+
+    fn release_peer(&self, peer: &str) {
+        let mut per_peer = self.per_peer.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(held) = per_peer.get_mut(peer) {
+            *held -= 1;
+            if *held == 0 {
+                per_peer.remove(peer);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn available(&self) -> usize {
+        self.total.available_permits()
+    }
+}
+
+impl Drop for BodySlot {
+    fn drop(&mut self) {
+        self.slots.release_peer(&self.peer);
+    }
+}
+
+/// Wait up to `budget` for the first byte of a connection and hand it back unconsumed.
+///
+/// Go's `ReadHeaderTimeout` runs from accept, but hyper's protocol sniffing (and with it the
+/// header-read timer) starts only once a byte arrives, so a connection that never sends one would
+/// otherwise live until the much longer read/idle timeouts. `None` when the budget expires or the
+/// peer closed or failed before sending anything.
+async fn await_first_byte<I>(mut stream: I, budget: Duration) -> Option<PrefixedStream<I>>
+where
+    I: AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut first = [0_u8; 1];
+    match tokio::time::timeout(budget, stream.read(&mut first)).await {
+        Ok(Ok(read)) if read > 0 => Some(PrefixedStream::new(stream, first[..read].to_vec())),
+        _ => None,
+    }
+}
+
+/// [`await_first_byte`] that also gives up on a forced shutdown (immediately) or a graceful one
+/// ([`HANDSHAKE_SHUTDOWN_GRACE`]), so a silent connection does not keep its tracker guard for the
+/// rest of the header budget after the listener is stopped.
+async fn admit_first_byte<I>(
+    stream: I,
+    budget: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+    force: &mut watch::Receiver<bool>,
+) -> Option<PrefixedStream<I>>
+where
+    I: AsyncRead + Unpin,
+{
+    bounded_handshake(await_first_byte(stream, budget), budget, shutdown, force)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Largest admin request body accepted (SEC-MEDIUM-ADMIN-SERVER A2). Stock Caddy reads `/load`
+/// and `/adapt` bodies with an unbounded `io.Copy`; 64 MiB is far above any real configuration
+/// while stopping a multi-gigabyte POST from exhausting memory. `stock_compat true` lifts it.
+pub(crate) const ADMIN_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Admin requests that may be reading a body at once on one listener. With the 64 MiB per-request
+/// cap this bounds the memory a flood of trickling uploads can pin to 256 MiB; further requests
+/// with a body get `503` until one finishes (`stock_compat true` lifts the bound, like the cap).
+pub(crate) const ADMIN_MAX_CONCURRENT_BODIES: usize = 4;
+
+/// Of those, the most one peer (remote address, or certificate for the mTLS listener) may hold, so
+/// a client that stalls its uploads cannot take every slot and starve authorised callers.
+pub(crate) const ADMIN_MAX_BODIES_PER_PEER: usize = 2;
+
+/// Connections one admin listener keeps open at once (stock Caddy has no cap). File descriptors
+/// are process-wide, so unbounded admin connections could starve the public listeners.
+pub(crate) const ADMIN_MAX_CONNECTIONS: usize = 128;
+
+/// Of those, the most one peer may hold.
+pub(crate) const ADMIN_MAX_CONNECTIONS_PER_PEER: usize = 32;
+
+/// The fairness key of a TCP peer. Every loopback address is one principal: 127.0.0.0/8 is all
+/// local, so a per-address limit would be moot (a local process can bind any 127.x source).
+fn admin_peer_key(ip: std::net::IpAddr) -> String {
+    if ip.is_loopback() {
+        "loopback".to_string()
+    } else {
+        format!("addr:{ip}")
+    }
+}
+
+/// The body cap for the next admin request: [`ADMIN_MAX_BODY_BYTES`], or none when the active
+/// generation sets `stock_compat true`.
+fn admin_body_limit(api: &AdminApi) -> Option<usize> {
+    (!api_stock_compat(api)).then_some(ADMIN_MAX_BODY_BYTES)
+}
+
+/// Whether the active generation sets `stock_compat true`.
+fn api_stock_compat(api: &AdminApi) -> bool {
+    api.store()
+        .current()
+        .is_some_and(|generation| generation.config().stock_compat())
+}
+
+/// Total time one admin request body may take to arrive: stock Caddy's admin `ReadTimeout`, which
+/// Go enforces as one deadline over the whole request. caddy-rs's per-read `read_timeout` alone
+/// lets a client that sends a byte every few seconds hold a body slot (and up to 64 MiB) forever.
+const ADMIN_BODY_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Read one admin request's body: claim an in-flight body slot (when the request announces a body
+/// and `stock_compat` is off), then read under the size cap and [`ADMIN_BODY_DEADLINE`].
+///
+/// `503` when every slot is busy, `408` when the body does not arrive in time, otherwise as
+/// [`read_admin_body`].
+#[allow(clippy::result_large_err)] // the error is the ready-to-send admin response
+async fn read_admin_request_body<B>(
+    api: &AdminApi,
+    slots: &Arc<AdminBodySlots>,
+    peer: &str,
+    activity: &Arc<ConnectionActivity>,
+    headers: &http::HeaderMap,
+    body: B,
+) -> Result<Bytes, caddy_rs_admin::AdminResponse>
+where
+    B: hyper::body::Body<Data = Bytes>,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    use caddy_rs_admin::AdminResponse;
+    use http::StatusCode;
+    let limit = admin_body_limit(api);
+    // Whether a body is coming is a property of the body, not of the headers: an HTTP/2 request
+    // may carry DATA frames with no `content-length`, and chunked HTTP/1 has no length either.
+    let announces_body = !body.is_end_stream() && body.size_hint().exact() != Some(0);
+    let _slot = if limit.is_some() && announces_body {
+        match slots.try_acquire(peer) {
+            Some(slot) => Some(slot),
+            None => {
+                return Err(AdminResponse::api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "too many admin requests are uploading a body; retry shortly",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    // While a body is being read the per-read timer runs; between requests it does not.
+    let _reading = announces_body.then(|| activity.begin_body_read());
+    match tokio::time::timeout(ADMIN_BODY_DEADLINE, read_admin_body(headers, body, limit)).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(AdminResponse::api_error(
+            StatusCode::REQUEST_TIMEOUT,
+            "timed out reading the request body",
+        )),
+    }
+}
+
+/// Read an admin request body under `limit` (`None` = unbounded).
+///
+/// An over-cap body (declared by `Content-Length` or streamed) is `413`; a transport failure
+/// mid-body is `400` rather than the empty body the listeners used to substitute, which ran
+/// `/load` and friends against a silently truncated request.
+#[allow(clippy::result_large_err)] // the error is the ready-to-send admin response
+async fn read_admin_body<B>(
+    headers: &http::HeaderMap,
+    body: B,
+    limit: Option<usize>,
+) -> Result<Bytes, caddy_rs_admin::AdminResponse>
+where
+    B: hyper::body::Body<Data = Bytes>,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    use caddy_rs_admin::AdminResponse;
+    use http::StatusCode;
+    let too_large = || {
+        AdminResponse::api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body exceeds the admin API size limit",
+        )
+    };
+    let Some(limit) = limit else {
+        return body
+            .collect()
+            .await
+            .map(|collected| collected.to_bytes())
+            .map_err(|error| {
+                AdminResponse::api_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("reading request body: {error}"),
+                )
+            });
+    };
+    let declared = headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    if declared.is_some_and(|length| length > limit as u64) {
+        return Err(too_large());
+    }
+    match http_body_util::Limited::new(body, limit).collect().await {
+        Ok(collected) => Ok(collected.to_bytes()),
+        Err(error)
+            if error
+                .downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some() =>
+        {
+            Err(too_large())
+        }
+        Err(error) => Err(AdminResponse::api_error(
+            StatusCode::BAD_REQUEST,
+            format!("reading request body: {error}"),
+        )),
+    }
+}
+
+/// The headers the admin API sees for one request, with `Host` resolved the way Go's net/http
+/// sets `Request.Host` (what Caddy's `checkHost` compares): the URI authority when the request
+/// line carries one (absolute-form HTTP/1.x, or the HTTP/2 `:authority` pseudo-header, which has
+/// no `Host` header at all), otherwise the `Host` header. More than one `Host` header is a `400`,
+/// as in Go. Without this a prior-knowledge HTTP/2 (h2c) request, or an absolute-form target
+/// naming a foreign host, skipped the DNS-rebinding check (SEC-MEDIUM-ADMIN-SERVER A1).
+#[allow(clippy::result_large_err)] // the error is the ready-to-send admin response
+fn admin_request_headers(
+    mut headers: http::HeaderMap,
+    uri: &http::Uri,
+    version: http::Version,
+) -> Result<http::HeaderMap, caddy_rs_admin::AdminResponse> {
+    if headers.get_all(http::header::HOST).iter().count() > 1 {
+        return Err(caddy_rs_admin::AdminResponse::api_error(
+            http::StatusCode::BAD_REQUEST,
+            "too many Host headers",
+        ));
+    }
+    // hyper serves an HTTP/1.1 request without `Host`; Go answers `400 missing required Host
+    // header`. Do the same, so a host-less request cannot skip the rebinding check (HTTP/1.0 may
+    // omit it, as in Go; HTTP/2 carries `:authority`).
+    if version == http::Version::HTTP_11
+        && uri.authority().is_none()
+        && !headers.contains_key(http::header::HOST)
+    {
+        return Err(caddy_rs_admin::AdminResponse::api_error(
+            http::StatusCode::BAD_REQUEST,
+            "missing required Host header",
+        ));
+    }
+    if let Some(authority) = uri.authority() {
+        // `URL.Host` has no userinfo.
+        let host = authority
+            .as_str()
+            .rsplit_once('@')
+            .map_or(authority.as_str(), |(_, host)| host);
+        if let Ok(value) = http::HeaderValue::from_str(host) {
+            headers.insert(http::header::HOST, value);
+        }
+    }
+    Ok(headers)
+}
+
+/// Convert an admin response to the hyper response the connection serves.
+fn admin_hyper_response(response: caddy_rs_admin::AdminResponse) -> hyper::Response<Body> {
+    let mut builder = hyper::Response::builder().status(response.status);
+    for (name, value) in &response.headers {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(Body::from_bytes(response.body))
+        .expect("admin response is valid")
+}
+
+/// Serve one admin request on either transport, in the order stock Caddy uses: resolve `Host`,
+/// make the Host/Origin (plaintext) or access-control (mTLS) decision, and only then read the
+/// body. A request that is refused, or whose body is rejected (413/408/503), never has its body
+/// read to the end, so an HTTP/1 connection is closed after the response rather than left with
+/// unread bytes; refusing before the read also means a refused client never holds an upload slot.
+async fn serve_admin_request(
+    api: &AdminApi,
+    slots: &Arc<AdminBodySlots>,
+    activity: &Arc<ConnectionActivity>,
+    peer: &str,
+    identity: caddy_rs_admin::ClientIdentity,
+    request: hyper::Request<Incoming>,
+) -> hyper::Response<Body> {
+    // A request in flight keeps the connection from being reaped as idle (60 s `IdleTimeout`).
+    let _in_flight = activity.begin();
+    let (parts, body) = request.into_parts();
+    let http1 = matches!(
+        parts.version,
+        http::Version::HTTP_10 | http::Version::HTTP_11
+    );
+    let refuse = |response: caddy_rs_admin::AdminResponse| {
+        let mut response = admin_hyper_response(response);
+        if http1 {
+            response.headers_mut().insert(
+                http::header::CONNECTION,
+                http::HeaderValue::from_static("close"),
+            );
+        }
+        response
+    };
+    let headers = match admin_request_headers(parts.headers, &parts.uri, parts.version) {
+        Ok(headers) => headers,
+        Err(rejection) => return refuse(rejection),
+    };
+    let path = parts
+        .uri
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    if let Err(rejection) = api.authorize(&parts.method, &path, &headers, &identity) {
+        return refuse(rejection);
+    }
+    let body = match read_admin_request_body(api, slots, peer, activity, &headers, body).await {
+        Ok(body) => body,
+        Err(rejection) => return refuse(rejection),
+    };
+    let response = api
+        .handle(AdminRequest {
+            method: parts.method,
+            path,
+            headers,
+            body,
+            client_identity: identity,
+        })
+        .await;
+    admin_hyper_response(response)
 }
 
 impl Clone for AdminService {
     fn clone(&self) -> Self {
         Self {
             api: self.api.clone(),
+            body_slots: Arc::clone(&self.body_slots),
+            activity: Arc::clone(&self.activity),
+            peer: self.peer.clone(),
         }
     }
 }
@@ -2834,56 +3747,79 @@ impl hyper::service::Service<hyper::Request<Incoming>> for AdminService {
     >;
 
     fn call(&self, request: hyper::Request<Incoming>) -> Self::Future {
-        let api = self.api.clone();
+        let service = self.clone();
         Box::pin(async move {
-            let (parts, body) = request.into_parts();
-            let body = match body.collect().await {
-                Ok(collected) => collected.to_bytes(),
-                Err(_) => Bytes::new(),
-            };
-            let path = parts
-                .uri
-                .path_and_query()
-                .map(|value| value.as_str().to_string())
-                .unwrap_or_else(|| "/".to_string());
-            let response = api
-                .handle(AdminRequest {
-                    method: parts.method,
-                    path,
-                    headers: parts.headers,
-                    body,
-                    client_identity: caddy_rs_admin::ClientIdentity::NotPresented,
-                })
-                .await;
-            let mut builder = hyper::Response::builder().status(response.status);
-            for (name, value) in &response.headers {
-                builder = builder.header(name, value);
-            }
             Ok::<_, std::convert::Infallible>(
-                builder
-                    .body(Body::from_bytes(response.body))
-                    .expect("admin response is valid"),
+                serve_admin_request(
+                    &service.api,
+                    &service.body_slots,
+                    &service.activity,
+                    &service.peer,
+                    caddy_rs_admin::ClientIdentity::NotPresented,
+                    request,
+                )
+                .await,
             )
         })
     }
 }
 
-/// Removes an admin Unix socket file when its accept loop ends.
+/// The `(device, inode)` of the socket file this process created at the admin path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SocketIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+}
+
+#[cfg(unix)]
+impl SocketIdentity {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+/// Removes the admin Unix socket file we created when its accept loop ends.
 ///
 /// The guard lives inside the listener task, so it runs after the reload/shutdown signal stops the
 /// loop and before `ListenerHandle::stop` returns - the next bind on the same path never sees a
-/// stale socket. A path another process has already recreated is removed too: Caddy owns its
-/// configured admin socket path for the lifetime of the listener.
-struct AdminSocketPath(std::path::PathBuf);
+/// stale socket. Only the very socket this listener created is removed: if the path now holds a
+/// regular file, a symlink, or another process's socket (different inode), it is left alone
+/// (SEC-MEDIUM-ADMIN-SERVER A3). The `lstat` and `unlink` are two calls, so a swap in the
+/// microseconds between them is narrowed, not eliminated: there is no unlink-if-inode primitive.
+#[cfg(unix)]
+struct AdminSocketPath {
+    path: std::path::PathBuf,
+    identity: SocketIdentity,
+}
 
+#[cfg(unix)]
 impl Drop for AdminSocketPath {
     fn drop(&mut self) {
-        match std::fs::remove_file(&self.0) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                tracing::warn!(path = %self.0.display(), %error, "cannot remove admin Unix socket");
+        use std::os::unix::fs::FileTypeExt;
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(metadata)
+                if metadata.file_type().is_socket()
+                    && SocketIdentity::of(&metadata) == self.identity =>
+            {
+                if let Err(error) = std::fs::remove_file(&self.path) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            path = %self.path.display(),
+                            %error,
+                            "cannot remove admin Unix socket"
+                        );
+                    }
+                }
             }
+            Ok(_) => tracing::debug!(
+                path = %self.path.display(),
+                "admin Unix socket path no longer holds our socket; leaving it in place"
+            ),
+            Err(_) => {}
         }
     }
 }
@@ -2899,30 +3835,319 @@ fn set_admin_socket_permissions(path: &std::path::Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
+/// Bind the admin Unix socket without ever exposing it under `socket_path` with umask-derived
+/// permissions, and without deleting anything that is not a socket (SEC-MEDIUM-ADMIN-SERVER A3).
+///
+/// A path we bind ourselves may hold a stale socket from a killed process (Caddy removes it too),
+/// but the previous `exists()` + `remove_file` happily deleted a regular file, and `bind` followed
+/// by `chmod` left the socket connectable per the umask for a moment. Here the type of whatever
+/// sits at the path is checked with `symlink_metadata` (never following links): only a socket is
+/// replaced; a regular file, directory or symlink is a bind error and is left untouched. The
+/// socket is bound inside a freshly created `0700` staging directory next to the final path (its
+/// name is 8 random hex digits from the OS RNG, retried on collision, so it cannot be squatted),
+/// `chmod`ed `0600`, and then installed under the final name by [`install_staged_socket`]. The
+/// staging directory is always removed. Returns the listener and the identity of the socket file
+/// now at `socket_path`, so cleanup removes only that file.
+#[cfg(unix)]
+fn bind_admin_unix_private(
+    socket_path: &std::path::Path,
+) -> std::io::Result<(UnixListener, SocketIdentity)> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
+
+    let existing = match std::fs::symlink_metadata(socket_path) {
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            // (The liveness probe ran before this, in `bind_admin_unix`.)
+            Some(SocketIdentity::of(&metadata))
+        }
+        Ok(_) => {
+            return Err(Error::new(
+                ErrorKind::AlreadyExists,
+                format!(
+                    "refusing to replace {}: it exists and is not a socket",
+                    socket_path.display()
+                ),
+            ));
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let parent = match socket_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    };
+    let mut staging = None;
+    // 8 random hex digits normally; 4 when that would push the staged path past `sun_path` but
+    // the final path itself fits (a squatter then has 65 536 names to guess, still retried on
+    // collision and only able to delay, not redirect, the bind).
+    let parent_length = parent.as_os_str().as_bytes().len();
+    let digits = if parent_length + 1 + 9 + 2 < SUN_PATH_CAPACITY {
+        8
+    } else {
+        4
+    };
+    for _ in 0..16 {
+        let mut random = [0_u8; 4];
+        getrandom::getrandom(&mut random).map_err(Error::other)?;
+        let name = if digits == 8 {
+            format!(
+                ".{:02x}{:02x}{:02x}{:02x}",
+                random[0], random[1], random[2], random[3]
+            )
+        } else {
+            format!(".{:02x}{:02x}", random[0], random[1])
+        };
+        let candidate = parent.join(name);
+        // `sun_path` limits the path the socket is *bound* at, which is the staged one.
+        let bound_length = candidate.join("s").as_os_str().as_bytes().len();
+        if bound_length >= SUN_PATH_CAPACITY
+            || socket_path.as_os_str().as_bytes().len() >= SUN_PATH_CAPACITY
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "admin socket path {} is too long: binding needs {bound_length} bytes \
+                     (the path of a short staging directory next to it plus a socket name), \
+                     but a Unix socket path may hold at most {} bytes plus the trailing NUL \
+                     ({SUN_PATH_CAPACITY}-byte sun_path); use a shorter path",
+                    socket_path.display(),
+                    SUN_PATH_CAPACITY - 1,
+                ),
+            ));
+        }
+        match std::fs::DirBuilder::new().mode(0o700).create(&candidate) {
+            Ok(()) => {
+                staging = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    let staging = staging.ok_or_else(|| {
+        Error::new(
+            ErrorKind::AlreadyExists,
+            format!(
+                "cannot create a unique staging directory next to {}",
+                socket_path.display()
+            ),
+        )
+    })?;
+    let staged_socket = staging.join("s");
+    let result = (|| {
+        let listener = UnixListener::bind(&staged_socket)?;
+        set_admin_socket_permissions(&staged_socket)?;
+        let identity = SocketIdentity::of(&std::fs::symlink_metadata(&staged_socket)?);
+        install_staged_socket(&staged_socket, socket_path, existing)?;
+        Ok((listener, identity))
+    })();
+    let _ = std::fs::remove_file(&staged_socket);
+    let _ = std::fs::remove_dir(&staging);
+    result
+}
+
+/// `sun_path` capacity including the trailing NUL (108 on Linux, 104 on the BSDs and macOS).
+#[cfg(unix)]
+const SUN_PATH_CAPACITY: usize = if cfg!(target_os = "linux") { 108 } else { 104 };
+
+/// Whether a failed `link(2)` means "this filesystem cannot hard-link" (so the re-checked
+/// `rename` fallback applies) rather than a real failure: `EPERM` (for example FUSE and
+/// `fs.protected_hardlinks`), `EOPNOTSUPP`/`ENOTSUP` and `ENOSYS`. `EACCES`, `EMLINK`, `ENOSPC`,
+/// `EDQUOT`, `EROFS`, `EIO` and the like are surfaced to the operator.
+#[cfg(unix)]
+fn hard_link_unsupported(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code) if code == libc::EPERM
+            || code == libc::EOPNOTSUPP
+            || code == libc::ENOTSUP
+            || code == libc::ENOSYS
+    )
+}
+
+/// Move the already-bound, already-`0600` staged socket to its final path without clobbering
+/// anything that is not the stale socket we saw earlier.
+///
+/// * Nothing there: `link(2)` the staged socket in. `link` fails with `EEXIST` instead of
+///   replacing, so a file or symlink created in the meantime is never overwritten (atomic
+///   no-replace; filesystems without hard links fall back to a re-checked `rename`).
+/// * A stale socket there: re-`lstat` immediately before and `rename` over it only if it is still
+///   a socket with the inode seen at the start. `rename` replaces without following links. There
+///   is no portable no-replace-unless-inode primitive (and this crate denies `unsafe`, which rules
+///   out calling `renameat2` directly), so a swap in the microseconds between that check and the
+///   `rename` is narrowed, not eliminated.
+#[cfg(unix)]
+fn install_staged_socket(
+    staged: &std::path::Path,
+    final_path: &std::path::Path,
+    existing: Option<SocketIdentity>,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::FileTypeExt;
+    let changed = || {
+        Error::new(
+            ErrorKind::AlreadyExists,
+            format!(
+                "{} changed while the admin socket was being bound; not replacing it",
+                final_path.display()
+            ),
+        )
+    };
+    match existing {
+        None => match std::fs::hard_link(staged, final_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => Err(changed()),
+            Err(error) if hard_link_unsupported(&error) => {
+                match std::fs::symlink_metadata(final_path) {
+                    Err(error) if error.kind() == ErrorKind::NotFound => {
+                        std::fs::rename(staged, final_path)
+                    }
+                    Ok(_) => Err(changed()),
+                    Err(error) => Err(error),
+                }
+            }
+            // Permission, quota, link-count and other real failures are reported, not papered
+            // over with a rename that would then be allowed to replace.
+            Err(error) => Err(error),
+        },
+        Some(expected) => match std::fs::symlink_metadata(final_path) {
+            Ok(metadata)
+                if metadata.file_type().is_socket()
+                    && SocketIdentity::of(&metadata) == expected =>
+            {
+                std::fs::rename(staged, final_path)
+            }
+            Ok(_) => Err(changed()),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                install_staged_socket(staged, final_path, None)
+            }
+            Err(error) => Err(error),
+        },
+    }
+}
+
+/// What probing an existing admin socket found.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum SocketProbe {
+    /// Something accepts on it (or did not answer within the budget): a running process owns it.
+    Live,
+    /// Nobody is listening: replace it.
+    Stale,
+    /// Could not tell; carries the reason.
+    Unknown(String),
+}
+
+/// Interpret the outcome of connecting to an existing admin socket.
+///
+/// `owner_uid` is the socket file's owner and `our_uid` this process's (when known). A connect
+/// refused with a permission error to a socket owned by someone else is a stale socket of another
+/// user (for example a crashed `sudo caddy-rs run`) that this process could never have been
+/// talking to: it counts as stale, and the later replace fails clearly if the directory does not
+/// let us unlink it. A timeout counts as live: wrongly refusing is the safe error.
+#[cfg(unix)]
+fn classify_probe(
+    outcome: Result<(), &std::io::Error>,
+    timed_out: bool,
+    owner_uid: u32,
+    our_uid: Option<u32>,
+) -> SocketProbe {
+    use std::io::ErrorKind;
+    if timed_out {
+        return SocketProbe::Live;
+    }
+    match outcome {
+        Ok(()) => SocketProbe::Live,
+        Err(error) => match error.kind() {
+            ErrorKind::ConnectionRefused | ErrorKind::NotFound => SocketProbe::Stale,
+            ErrorKind::PermissionDenied if our_uid.is_some_and(|uid| uid != owner_uid) => {
+                SocketProbe::Stale
+            }
+            _ => SocketProbe::Unknown(error.to_string()),
+        },
+    }
+}
+
+/// This process's effective uid without `unsafe` (Linux; `None` elsewhere): the owner of
+/// `/proc/self`.
+#[cfg(unix)]
+fn current_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").ok().map(|m| m.uid())
+}
+
+/// Liveness probe for an existing admin socket at `socket_path`: refuse to replace one a running
+/// process still accepts on (typically a second instance with the same admin path), since
+/// stealing it would silently redirect that instance's admin clients. Does nothing when the path
+/// is absent or is not a socket (the bind reports non-sockets itself). Async with a 1 s budget so
+/// a wedged peer cannot block the runtime.
+#[cfg(unix)]
+async fn probe_existing_admin_socket(socket_path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let Ok(metadata) = std::fs::symlink_metadata(socket_path) else {
+        return Ok(());
+    };
+    if !metadata.file_type().is_socket() {
+        return Ok(());
+    }
+    let attempt = tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio::net::UnixStream::connect(socket_path),
+    )
+    .await;
+    let (outcome, timed_out) = match &attempt {
+        Ok(Ok(_)) => (Ok(()), false),
+        Ok(Err(error)) => (Err(error), false),
+        Err(_elapsed) => (Ok(()), true),
+    };
+    match classify_probe(outcome, timed_out, metadata.uid(), current_uid()) {
+        SocketProbe::Stale => Ok(()),
+        SocketProbe::Live => Err(Error::new(
+            ErrorKind::AddrInUse,
+            format!(
+                "admin socket {} is in use by a running process; stop it, choose another admin \
+                 address, or set stock_compat to replace it anyway",
+                socket_path.display()
+            ),
+        )),
+        SocketProbe::Unknown(reason) => Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "cannot tell whether admin socket {} is stale: {reason}",
+                socket_path.display()
+            ),
+        )),
+    }
+}
+
 /// Bind the admin API to a Unix domain socket.
 #[cfg(unix)]
 async fn bind_admin_unix(
     configured: &str,
     path: &str,
     api: AdminApi,
+    options: AdminBindOptions,
 ) -> Result<ListenerHandle, Error> {
     let socket_path = std::path::Path::new(path);
-    // Unlike an inherited socket, a path we bind ourselves may hold a stale file from a killed
-    // process; `bind(2)` refuses an existing path, so remove it first (Caddy does the same).
-    if socket_path.exists() {
-        std::fs::remove_file(socket_path).map_err(|error| Error::bind(configured, error))?;
+    if !(options.stock_compat || options.replace_live) {
+        probe_existing_admin_socket(socket_path)
+            .await
+            .map_err(|error| Error::bind(configured, error))?;
     }
-    let listener =
-        UnixListener::bind(socket_path).map_err(|error| Error::bind(configured, error))?;
-    if let Err(error) = set_admin_socket_permissions(socket_path) {
-        let _ = std::fs::remove_file(socket_path);
-        return Err(Error::bind(configured, error));
-    }
+    let (listener, identity) =
+        bind_admin_unix_private(socket_path).map_err(|error| Error::bind(configured, error))?;
     let (shutdown, mut receiver) = watch::channel(false);
     let (force, mut force_receiver) = watch::channel(false);
     let tracker = Arc::new(ConnectionTracker::default());
     let loop_tracker = Arc::clone(&tracker);
-    let cleanup = AdminSocketPath(socket_path.to_path_buf());
+    let cleanup = AdminSocketPath {
+        path: socket_path.to_path_buf(),
+        identity,
+    };
+    let body_slots = AdminBodySlots::new();
+    let conn_slots = AdminBodySlots::for_connections();
     let task = tokio::spawn(async move {
         let _cleanup = cleanup;
         loop {
@@ -2939,14 +4164,36 @@ async fn bind_admin_unix(
                 }
                 accepted = listener.accept() => {
                     let Ok((stream, _peer)) = accepted else { continue };
-                    let connection_shutdown = receiver.clone();
-                    let connection_force = force_receiver.clone();
+                    // Past the per-listener (or per-peer) connection cap the connection is
+                    // refused by dropping it.
+                    let Some(conn_slot) = conn_slots.try_acquire("unix") else { continue };
+                    let mut connection_shutdown = receiver.clone();
+                    let mut connection_force = force_receiver.clone();
                     let tracked = loop_tracker.guard();
-                    let service = AdminService { api: api.clone() };
+                    let service = AdminService {
+                        api: api.clone(),
+                        body_slots: Arc::clone(&body_slots),
+                        activity: Arc::new(ConnectionActivity::default()),
+                        // Every client of the socket is the same local principal.
+                        peer: "unix".to_string(),
+                    };
                     tokio::spawn(async move {
                         let _tracked = tracked;
-                        let limits = Arc::new(ServerLimits::default());
-                        let activity = Arc::new(ConnectionActivity::default());
+                        let _conn_slot = conn_slot;
+                        let limits = Arc::new(ServerLimits::admin());
+                        // Go's ReadHeaderTimeout runs from accept; hyper's protocol sniffing does
+                        // not start it until the first byte, so bound a silent connection here.
+                        let Some(stream) = admit_first_byte(
+                            stream,
+                            limits.read_header_timeout,
+                            &mut connection_shutdown,
+                            &mut connection_force,
+                        )
+                        .await
+                        else {
+                            return;
+                        };
+                        let activity = Arc::clone(&service.activity);
                         serve_connection(
                             stream,
                             service,
@@ -2968,7 +4215,22 @@ async fn bind_admin_unix(
         task,
         bound: configured.to_string(),
         socket_addr: None,
+        unix_socket: Some((socket_path.to_path_buf(), identity)),
     })
+}
+
+/// [`bind_admin_with`] with options derived from the active generation, for tests.
+#[cfg(test)]
+pub(crate) async fn bind_admin(
+    configured: &str,
+    api: AdminApi,
+    binder: BinderRef<'_>,
+) -> Result<ListenerHandle, Error> {
+    let options = AdminBindOptions {
+        stock_compat: api_stock_compat(&api),
+        replace_live: false,
+    };
+    bind_admin_with(configured, api, binder, options).await
 }
 
 /// Bind the admin API listener.
@@ -2976,10 +4238,11 @@ async fn bind_admin_unix(
 /// Supports the same transports as Caddy's `admin.listen`: TCP (`[host]:port`) and Unix domain
 /// sockets (`unix/<absolute path>`, bound with owner-only permissions). The Unix socket file is
 /// removed when the listener stops, so reloads never leave stale sockets behind.
-pub(crate) async fn bind_admin(
+pub(crate) async fn bind_admin_with(
     configured: &str,
     api: AdminApi,
     #[cfg_attr(not(feature = "graceful-restart"), allow(unused_variables))] binder: BinderRef<'_>,
+    options: AdminBindOptions,
 ) -> Result<ListenerHandle, Error> {
     let address = ListenAddr::parse(configured).map_err(|reason| Error::Listen {
         listen: configured.to_string(),
@@ -2987,7 +4250,7 @@ pub(crate) async fn bind_admin(
     })?;
     if address.network == Network::Unix {
         #[cfg(unix)]
-        return bind_admin_unix(configured, &address.address, api).await;
+        return bind_admin_unix(configured, &address.address, api, options).await;
         // Windows: no tokio Unix-domain listener, and no owner-only socket file to protect the
         // admin API with. Refuse rather than fall back to something weaker.
         #[cfg(not(unix))]
@@ -3010,6 +4273,8 @@ pub(crate) async fn bind_admin(
     let (force, mut force_receiver) = watch::channel(false);
     let tracker = Arc::new(ConnectionTracker::default());
     let loop_tracker = Arc::clone(&tracker);
+    let body_slots = AdminBodySlots::new();
+    let conn_slots = AdminBodySlots::for_connections();
     let task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -3024,16 +4289,35 @@ pub(crate) async fn bind_admin(
                     }
                 }
                 accepted = listener.accept() => {
-                    let Ok((stream, _peer)) = accepted else { continue };
+                    let Ok((stream, peer_addr)) = accepted else { continue };
+                    let peer = admin_peer_key(peer_addr.ip());
+                    let Some(conn_slot) = conn_slots.try_acquire(&peer) else { continue };
                     let api = api.clone();
-                    let connection_shutdown = receiver.clone();
-                    let connection_force = force_receiver.clone();
+                    let mut connection_shutdown = receiver.clone();
+                    let mut connection_force = force_receiver.clone();
                     let tracked = loop_tracker.guard();
-                    let service = AdminService { api };
+                    let service = AdminService {
+                        api,
+                        body_slots: Arc::clone(&body_slots),
+                        activity: Arc::new(ConnectionActivity::default()),
+                        peer,
+                    };
                     tokio::spawn(async move {
                         let _tracked = tracked;
-                        let limits = Arc::new(ServerLimits::default());
-                        let activity = Arc::new(ConnectionActivity::default());
+                        let _conn_slot = conn_slot;
+                        let limits = Arc::new(ServerLimits::admin());
+                        // See the Unix listener: bound a connection that never sends a byte.
+                        let Some(stream) = admit_first_byte(
+                            stream,
+                            limits.read_header_timeout,
+                            &mut connection_shutdown,
+                            &mut connection_force,
+                        )
+                        .await
+                        else {
+                            return;
+                        };
+                        let activity = Arc::clone(&service.activity);
                         serve_connection(
                             stream,
                             service,
@@ -3055,6 +4339,7 @@ pub(crate) async fn bind_admin(
         task,
         bound: socket_addr.to_string(),
         socket_addr: Some(socket_addr),
+        unix_socket: None,
     })
 }
 
@@ -3192,6 +4477,8 @@ pub(crate) async fn bind_admin_remote(
     let (force, mut force_receiver) = watch::channel(false);
     let tracker = Arc::new(ConnectionTracker::default());
     let loop_tracker = Arc::clone(&tracker);
+    let body_slots = AdminBodySlots::new();
+    let conn_slots = AdminBodySlots::for_connections();
     let task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -3206,62 +4493,76 @@ pub(crate) async fn bind_admin_remote(
                     }
                 }
                 accepted = listener.accept() => {
-                    let Ok((stream, _peer)) = accepted else { continue };
+                    let Ok((stream, peer_addr)) = accepted else { continue };
+                    let Some(conn_slot) =
+                        conn_slots.try_acquire(&admin_peer_key(peer_addr.ip())) else { continue };
                     let api = api.clone();
                     let acceptor = acceptor.clone();
-                    let connection_shutdown = receiver.clone();
-                    let connection_force = force_receiver.clone();
+                    let mut connection_shutdown = receiver.clone();
+                    let mut connection_force = force_receiver.clone();
                     let tracked = loop_tracker.guard();
+                    let body_slots = Arc::clone(&body_slots);
                     tokio::spawn(async move {
                         let _tracked = tracked;
+                        let _conn_slot = conn_slot;
+                        let limits = Arc::new(ServerLimits::admin());
                         // Mandatory mutual TLS: a missing or untrusted client certificate fails
                         // here and the connection is dropped before any admin request is parsed.
-                        let tls = match acceptor.accept(stream).await {
-                            Ok(tls) => tls,
-                            Err(error) => {
+                        // The budget is the admin server's own (stock: ReadHeaderTimeout 5 s, the
+                        // smallest of its three timeouts), not the public servers' 1 minute.
+                        let tls = match bounded_handshake(
+                            acceptor.accept(stream),
+                            limits.tls_handshake_timeout(),
+                            &mut connection_shutdown,
+                            &mut connection_force,
+                        )
+                        .await
+                        {
+                            Ok(Ok(tls)) => tls,
+                            Ok(Err(error)) => {
                                 tracing::debug!(%error, "remote admin TLS handshake failed");
+                                return;
+                            }
+                            Err(abort) => {
+                                tracing::debug!(?abort, "remote admin TLS handshake abandoned");
                                 return;
                             }
                         };
                         let identity = remote_admin_client_identity(
                             tls.get_ref().1.peer_certificates(),
                         );
-                        let service = service_fn(move |request: hyper::Request<Incoming>| {
-                            let api = api.clone();
-                            let identity = identity.clone();
-                            async move {
-                                let (parts, body) = request.into_parts();
-                                let body = match body.collect().await {
-                                    Ok(collected) => collected.to_bytes(),
-                                    Err(_) => Bytes::new(),
-                                };
-                                let path = parts
-                                    .uri
-                                    .path_and_query()
-                                    .map(|value| value.as_str().to_string())
-                                    .unwrap_or_else(|| "/".to_string());
-                                let response = api
-                                    .handle(AdminRequest {
-                                        method: parts.method,
-                                        path,
-                                        headers: parts.headers,
-                                        body,
-                                        client_identity: identity,
-                                    })
-                                    .await;
-                                let mut builder = hyper::Response::builder().status(response.status);
-                                for (name, value) in &response.headers {
-                                    builder = builder.header(name, value);
-                                }
-                                Ok::<_, std::convert::Infallible>(
-                                    builder
-                                        .body(Body::from_bytes(response.body))
-                                        .expect("admin response is valid"),
-                                )
+                        // Upload fairness is per certificate, not per address: every client behind
+                        // one proxy shares an address, but each certificate is one principal.
+                        let peer = match &identity {
+                            caddy_rs_admin::ClientIdentity::Verified(client) => {
+                                format!("cert:{}:{}", client.issuer, client.serial)
                             }
-                        });
-                        let limits = Arc::new(ServerLimits::default());
+                            _ => admin_peer_key(peer_addr.ip()),
+                        };
                         let activity = Arc::new(ConnectionActivity::default());
+                        let service = {
+                            let activity = Arc::clone(&activity);
+                            service_fn(move |request: hyper::Request<Incoming>| {
+                                let api = api.clone();
+                                let identity = identity.clone();
+                                let body_slots = Arc::clone(&body_slots);
+                                let activity = Arc::clone(&activity);
+                                let peer = peer.clone();
+                                async move {
+                                    Ok::<_, std::convert::Infallible>(
+                                        serve_admin_request(
+                                            &api,
+                                            &body_slots,
+                                            &activity,
+                                            &peer,
+                                            identity,
+                                            request,
+                                        )
+                                        .await,
+                                    )
+                                }
+                            })
+                        };
                         serve_connection(
                             tls,
                             service,
@@ -3283,6 +4584,7 @@ pub(crate) async fn bind_admin_remote(
         task,
         bound: socket_addr.to_string(),
         socket_addr: Some(socket_addr),
+        unix_socket: None,
     })
 }
 
@@ -3712,6 +5014,45 @@ mod remote_admin_tests {
         handle.stop().await;
     }
 
+    /// A client whose role does not allow `POST /load` is refused before its body is read, so it
+    /// cannot pin upload slots with trickling bodies and starve authorised callers.
+    #[tokio::test]
+    async fn an_unauthorised_remote_request_is_refused_without_reading_its_body() {
+        if !openssl_available() {
+            eprintln!("skipping: the `openssl` CLI is not available to mint the test certificates");
+            return;
+        }
+        let certificates = test_certificates("unread-body");
+        let (_api, port, handle) = start_remote(&certificates).await;
+        let mut stream = connect(
+            &certificates,
+            Some((&certificates.client_pem, &certificates.client_key_pem)),
+            port,
+        )
+        .await
+        .expect("valid client certificate completes the handshake");
+        stream
+            .write_all(
+                b"POST /load HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+                  Content-Length: 1000\r\n\r\n{",
+            )
+            .await
+            .expect("write");
+        stream.flush().await.expect("flush");
+        let mut buffer = [0_u8; 512];
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut buffer))
+                .await
+                .expect("a refusal must arrive without waiting for the body")
+                .expect("read");
+        assert!(
+            buffer[..read].starts_with(b"HTTP/1.1 403"),
+            "{:?}",
+            String::from_utf8_lossy(&buffer[..read])
+        );
+        handle.stop().await;
+    }
+
     #[tokio::test]
     async fn missing_client_certificate_fails_the_handshake() {
         if !openssl_available() {
@@ -3885,6 +5226,887 @@ mod client_certificate_tests {
     }
 }
 
+/// Virtual-time tests for [`bounded_handshake`]: a half-open handshake must observe the shutdown
+/// signals (SEC-MEDIUM-ADMIN-SERVER A4 follow-up).
+#[cfg(test)]
+mod bounded_handshake_tests {
+    use super::{bounded_handshake, PhaseAbort, HANDSHAKE_SHUTDOWN_GRACE};
+    use std::time::Duration;
+    use tokio::sync::watch;
+
+    fn channels() -> (
+        watch::Sender<bool>,
+        watch::Sender<bool>,
+        watch::Receiver<bool>,
+        watch::Receiver<bool>,
+    ) {
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (force, force_rx) = watch::channel(false);
+        (shutdown, force, shutdown_rx, force_rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completes_when_the_phase_finishes_first() {
+        let (_s, _f, mut shutdown, mut force) = channels();
+        let result = bounded_handshake(
+            async { 7_u8 },
+            Duration::from_secs(60),
+            &mut shutdown,
+            &mut force,
+        )
+        .await;
+        assert_eq!(result, Ok(7));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn times_out_at_the_budget() {
+        let (_s, _f, mut shutdown, mut force) = channels();
+        let started = tokio::time::Instant::now();
+        let result = bounded_handshake(
+            std::future::pending::<()>(),
+            Duration::from_secs(60),
+            &mut shutdown,
+            &mut force,
+        )
+        .await;
+        assert_eq!(result, Err(PhaseAbort::TimedOut));
+        assert_eq!(started.elapsed(), Duration::from_secs(60));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forced_shutdown_abandons_immediately() {
+        let (_s, force, mut shutdown, mut force_rx) = channels();
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move {
+            bounded_handshake(
+                std::future::pending::<()>(),
+                Duration::from_secs(3600),
+                &mut shutdown,
+                &mut force_rx,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        force.send(true).unwrap();
+        assert_eq!(task.await.unwrap(), Err(PhaseAbort::Forced));
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn graceful_shutdown_caps_the_remaining_budget() {
+        let (shutdown_tx, _f, mut shutdown, mut force) = channels();
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move {
+            bounded_handshake(
+                std::future::pending::<()>(),
+                Duration::from_secs(3600),
+                &mut shutdown,
+                &mut force,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        shutdown_tx.send(true).unwrap();
+        assert_eq!(task.await.unwrap(), Err(PhaseAbort::ShutdownGrace));
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(2) + HANDSHAKE_SHUTDOWN_GRACE
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_nearly_spent_budget_is_not_extended_by_the_shutdown_grace() {
+        let (shutdown_tx, _f, mut shutdown, mut force) = channels();
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move {
+            bounded_handshake(
+                std::future::pending::<()>(),
+                Duration::from_secs(3),
+                &mut shutdown,
+                &mut force,
+            )
+            .await
+        });
+        shutdown_tx.send(true).unwrap();
+        assert_eq!(task.await.unwrap(), Err(PhaseAbort::TimedOut));
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+    }
+}
+
+/// Unit tests for the bounded admin request-body read (SEC-MEDIUM-ADMIN-SERVER A2).
+#[cfg(test)]
+mod admin_body_tests {
+    use super::{admin_body_limit, read_admin_body, ADMIN_MAX_BODY_BYTES};
+    use bytes::Bytes;
+    use caddy_rs_admin::AdminApi;
+    use caddy_rs_core::GenerationStore;
+    use http::{HeaderMap, StatusCode};
+    use http_body_util::Full;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    /// A body that yields `data` and then fails, like a connection dropped mid-request.
+    struct Failing(Option<Bytes>);
+
+    impl hyper::body::Body for Failing {
+        type Data = Bytes;
+        type Error = std::io::Error;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+            match self.0.take() {
+                Some(data) => Poll::Ready(Some(Ok(hyper::body::Frame::data(data)))),
+                None => Poll::Ready(Some(Err(std::io::Error::other("connection reset")))),
+            }
+        }
+    }
+
+    fn body_of(length: usize) -> Full<Bytes> {
+        Full::new(Bytes::from(vec![b'a'; length]))
+    }
+
+    #[tokio::test]
+    async fn body_within_the_limit_is_returned_and_the_boundary_is_inclusive() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            read_admin_body(&headers, body_of(10), Some(10))
+                .await
+                .unwrap()
+                .len(),
+            10,
+            "exactly the limit is accepted"
+        );
+        assert_eq!(
+            read_admin_body(&headers, body_of(0), Some(10))
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        let rejected = read_admin_body(&headers, body_of(11), Some(10))
+            .await
+            .expect_err("one byte over");
+        assert_eq!(rejected.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(String::from_utf8_lossy(&rejected.body).contains("\"error\""));
+    }
+
+    #[tokio::test]
+    async fn declared_content_length_over_the_limit_is_rejected_before_reading() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CONTENT_LENGTH, "11".parse().unwrap());
+        // The body itself is empty: only the header can trigger the rejection.
+        let rejected = read_admin_body(&headers, body_of(0), Some(10))
+            .await
+            .expect_err("declared length over the cap");
+        assert_eq!(rejected.status, StatusCode::PAYLOAD_TOO_LARGE);
+        headers.insert(http::header::CONTENT_LENGTH, "10".parse().unwrap());
+        assert!(read_admin_body(&headers, body_of(10), Some(10))
+            .await
+            .is_ok());
+        // A malformed Content-Length is ignored here (hyper rejects it before the service runs).
+        headers.insert(http::header::CONTENT_LENGTH, "abc".parse().unwrap());
+        assert!(read_admin_body(&headers, body_of(3), Some(10))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn unbounded_read_accepts_any_size() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            read_admin_body(&headers, body_of(4096), None)
+                .await
+                .unwrap()
+                .len(),
+            4096
+        );
+    }
+
+    #[tokio::test]
+    async fn read_failures_are_400_not_an_empty_body() {
+        let headers = HeaderMap::new();
+        for limit in [Some(1024), None] {
+            let rejected = read_admin_body(
+                &headers,
+                Failing(Some(Bytes::from_static(b"{\"a\":"))),
+                limit,
+            )
+            .await
+            .expect_err("a failed read must not become an empty body");
+            assert_eq!(rejected.status, StatusCode::BAD_REQUEST, "limit {limit:?}");
+        }
+    }
+
+    #[test]
+    fn stock_compat_lifts_the_admin_body_cap() {
+        let store = Arc::new(GenerationStore::with_builtin_registry());
+        let api = AdminApi::new(Arc::clone(&store));
+        assert_eq!(
+            admin_body_limit(&api),
+            Some(ADMIN_MAX_BODY_BYTES),
+            "no active generation: capped"
+        );
+        for (stock_compat, expected) in [(false, Some(ADMIN_MAX_BODY_BYTES)), (true, None)] {
+            let config = caddy_rs_core::Config::from_value(
+                serde_json::json!({"stock_compat": stock_compat}),
+            )
+            .expect("config");
+            store.load(config).expect("load");
+            assert_eq!(
+                admin_body_limit(&api),
+                expected,
+                "stock_compat {stock_compat}"
+            );
+        }
+    }
+}
+
+/// Connection-level limits of the plaintext TCP admin listener: stock Caddy's admin `http.Server`
+/// runs with `ReadTimeout` 10 s, `ReadHeaderTimeout` 5 s and `IdleTimeout` 60 s, and the body
+/// cap alone left many trickling connections each free to hold up to 64 MiB.
+#[cfg(test)]
+mod admin_limits_tests {
+    use super::bind_admin;
+    use caddy_rs_admin::AdminApi;
+    use caddy_rs_core::GenerationStore;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    fn api() -> AdminApi {
+        AdminApi::new(Arc::new(GenerationStore::with_builtin_registry()))
+    }
+
+    async fn listener() -> (super::ListenerHandle, SocketAddr) {
+        let handle = bind_admin("127.0.0.1:0", api(), None)
+            .await
+            .expect("bind admin listener");
+        let address = handle.socket_addr.expect("bound address");
+        (handle, address)
+    }
+
+    #[tokio::test]
+    async fn a_silent_admin_connection_is_dropped_after_the_header_timeout() {
+        let (handle, address) = listener().await;
+        let mut stream = TcpStream::connect(address).await.expect("connect");
+        let started = Instant::now();
+        let mut buffer = [0_u8; 256];
+        let outcome = tokio::time::timeout(Duration::from_secs(8), stream.read(&mut buffer)).await;
+        assert!(
+            outcome.is_ok(),
+            "a connection that never sends a request must be closed (stock ReadHeaderTimeout 5 s)"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_secs(4),
+            "not closed early: {:?}",
+            started.elapsed()
+        );
+        handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_silent_admin_connection_is_dropped_by_a_forced_stop_not_after_the_budget() {
+        let (handle, address) = listener().await;
+        let mut stream = TcpStream::connect(address).await.expect("connect");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let started = Instant::now();
+        handle.stop_forcibly().await;
+        let mut buffer = [0_u8; 16];
+        let outcome =
+            tokio::time::timeout(Duration::from_millis(1500), stream.read(&mut buffer)).await;
+        assert!(
+            outcome.is_ok(),
+            "a forced stop must drop a connection that has sent nothing ({:?})",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admit_first_byte_observes_shutdown_and_passes_traffic() {
+        use super::admit_first_byte;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (force_tx, force_rx) = tokio::sync::watch::channel(false);
+        let (mut shutdown, mut force) = (shutdown_rx.clone(), force_rx.clone());
+        // Traffic: the first byte is handed back unconsumed.
+        let (mut client, server) = tokio::io::duplex(64);
+        client.write_all(b"G").await.unwrap();
+        let admitted = admit_first_byte(server, Duration::from_secs(5), &mut shutdown, &mut force)
+            .await
+            .expect("a byte arrived");
+        let mut replay = Vec::new();
+        let mut admitted = admitted;
+        let mut one = [0_u8; 1];
+        admitted.read_exact(&mut one).await.unwrap();
+        replay.extend_from_slice(&one);
+        assert_eq!(replay, b"G");
+        // Silence + forced shutdown: gone immediately, long before the 5 s budget.
+        let (_client, server) = tokio::io::duplex(64);
+        let (mut shutdown, mut force) = (shutdown_rx.clone(), force_rx.clone());
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move {
+            admit_first_byte(server, Duration::from_secs(5), &mut shutdown, &mut force)
+                .await
+                .is_none()
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        force_tx.send(true).unwrap();
+        assert!(task.await.unwrap());
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        drop(shutdown_tx);
+    }
+
+    /// A body that never produces a frame, like a client trickling nothing.
+    struct Stalled;
+
+    impl hyper::body::Body for Stalled {
+        type Data = bytes::Bytes;
+        type Error = std::io::Error;
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<bytes::Bytes>, Self::Error>>>
+        {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_admin_body_times_out_with_408_and_frees_its_slot() {
+        let api = api();
+        let slots = super::AdminBodySlots::new();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::CONTENT_LENGTH, "10".parse().unwrap());
+        let activity = Arc::new(super::ConnectionActivity::default());
+        let rejected =
+            super::read_admin_request_body(&api, &slots, "peer", &activity, &headers, Stalled)
+                .await
+                .expect_err("a body that never arrives is rejected");
+        assert_eq!(rejected.status, http::StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(
+            slots.available(),
+            super::ADMIN_MAX_CONCURRENT_BODIES,
+            "the slot is released"
+        );
+        assert!(!activity.reading_body(), "the body-read marker is cleared");
+    }
+
+    #[test]
+    fn slots_are_capped_per_peer_and_in_total_and_released_on_drop() {
+        let slots = super::AdminBodySlots::new();
+        let a1 = slots.try_acquire("a").expect("first");
+        let _a2 = slots.try_acquire("a").expect("second");
+        assert!(slots.try_acquire("a").is_none(), "per-peer cap");
+        let _b1 = slots.try_acquire("b").expect("other peer");
+        let _b2 = slots.try_acquire("b").expect("other peer, second");
+        assert!(slots.try_acquire("c").is_none(), "global cap");
+        assert!(slots.try_acquire("a").is_none());
+        drop(a1);
+        let _c = slots
+            .try_acquire("c")
+            .expect("a release frees a global slot");
+        assert_eq!(slots.available(), 0);
+    }
+
+    /// Connect from the loopback address `source` (127.0.0.x are all local on Linux), so tests can
+    /// act as different peers.
+    async fn connect_from(source: &str, address: SocketAddr) -> TcpStream {
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket
+            .bind(format!("{source}:0").parse().unwrap())
+            .expect("bind source");
+        socket.connect(address).await.expect("connect")
+    }
+
+    /// Start a request from `source` that announces a 1000-byte body and sends one byte, then
+    /// stalls: it holds one upload slot until the stream is dropped.
+    async fn hold_slot(source: &str, address: SocketAddr) -> TcpStream {
+        let mut stream = connect_from(source, address).await;
+        stream
+            .write_all(
+                b"POST /load HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+                  Content-Length: 1000\r\n\r\n{",
+            )
+            .await
+            .expect("write partial request");
+        stream
+    }
+
+    /// Status of a small `POST /load` from `source`.
+    async fn probe_status(source: &str, address: SocketAddr) -> u16 {
+        let mut stream = connect_from(source, address).await;
+        stream
+            .write_all(
+                b"POST /load HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+                  Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+            )
+            .await
+            .expect("write request");
+        let mut response = Vec::new();
+        let _ =
+            tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut response)).await;
+        String::from_utf8_lossy(&response)
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Poll (bounded) until a probe from `source` is refused with 503: the holders register their
+    /// slots asynchronously, so there is no fixed sleep that is both short and safe.
+    async fn eventually_503(source: &str, address: SocketAddr) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if probe_status(source, address).await == 503 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn one_peer_cannot_take_more_than_its_share_of_the_upload_slots() {
+        let (handle, address) = listener().await;
+        // 2 = ADMIN_MAX_BODIES_PER_PEER: two stalled uploads from 127.0.0.1 ...
+        let _holders = [
+            hold_slot("127.0.0.1", address).await,
+            hold_slot("127.0.0.1", address).await,
+        ];
+        assert!(
+            eventually_503("127.0.0.1", address).await,
+            "a third upload from the same peer must be refused"
+        );
+        // 127.0.0.0/8 is all local: every loopback source is the same principal, so another
+        // loopback address does not get a fresh share (a per-address limit would be moot).
+        assert!(
+            eventually_503("127.0.0.2", address).await,
+            "loopback aliases share one principal's limit"
+        );
+        handle.stop().await;
+    }
+
+    #[test]
+    fn loopback_peers_are_one_principal_and_other_addresses_are_distinct() {
+        use super::admin_peer_key;
+        let key = |text: &str| admin_peer_key(text.parse().unwrap());
+        assert_eq!(key("127.0.0.1"), key("127.9.9.9"));
+        assert_eq!(key("127.0.0.1"), key("::1"));
+        assert_ne!(key("192.0.2.1"), key("192.0.2.2"));
+        assert_ne!(key("192.0.2.1"), key("127.0.0.1"));
+    }
+
+    /// Connections are capped per peer (and per listener): fd exhaustion is process-wide, so
+    /// unbounded admin connections could starve the public listeners. Silent connections hold
+    /// their slot through the 5 s first-byte gate, so over-cap ones are visibly refused at once.
+    #[tokio::test]
+    async fn connections_beyond_the_per_peer_cap_are_refused_at_once() {
+        let (handle, address) = listener().await;
+        let mut held = Vec::new();
+        for _ in 0..super::ADMIN_MAX_CONNECTIONS_PER_PEER {
+            held.push(TcpStream::connect(address).await.expect("connect"));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut extra = TcpStream::connect(address).await.expect("connect");
+        let mut buffer = [0_u8; 8];
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), extra.read(&mut buffer)).await;
+        assert!(
+            matches!(outcome, Ok(Ok(0)) | Ok(Err(_))),
+            "the connection past the cap must be dropped immediately, not after the 5 s gate \
+             ({:?}, {outcome:?})",
+            started.elapsed()
+        );
+        drop(held);
+        handle.stop().await;
+    }
+
+    #[test]
+    fn the_listener_wide_cap_applies_across_peers() {
+        let slots = super::AdminBodySlots::with_limits(3, 2);
+        let _a = [
+            slots.try_acquire("a").unwrap(),
+            slots.try_acquire("a").unwrap(),
+        ];
+        let _b = slots.try_acquire("b").unwrap();
+        assert!(slots.try_acquire("c").is_none(), "listener-wide cap");
+        assert!(slots.try_acquire("a").is_none(), "per-peer cap");
+    }
+
+    /// A request whose headers trickle in must finish them within the 5 s header budget in total
+    /// (Go's `ReadHeaderTimeout`), even on a keep-alive connection that already served a request:
+    /// the 60 s budget is for the idle wait *between* requests only.
+    #[tokio::test]
+    async fn a_trickled_request_header_is_cut_off_after_the_header_budget() {
+        let (handle, address) = listener().await;
+        let mut stream = TcpStream::connect(address).await.expect("connect");
+        let request = b"GET /config/ HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        stream.write_all(request).await.unwrap();
+        let mut buffer = [0_u8; 4096];
+        let read = stream.read(&mut buffer).await.expect("first response");
+        assert!(buffer[..read].starts_with(b"HTTP/1.1 200"));
+        // The second request: one byte a second, never finishing its headers.
+        let started = Instant::now();
+        let closed = async {
+            for byte in b"GET /config/ HTTP/1.1\r\nHost: loc" {
+                if stream.write_all(&[*byte]).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let mut probe = [0_u8; 64];
+                if let Ok(Ok(0)) | Ok(Err(_)) =
+                    tokio::time::timeout(Duration::from_millis(10), stream.read(&mut probe)).await
+                {
+                    return;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(9), closed)
+            .await
+            .expect("a trickling request must be closed within about 5 s");
+        assert!(
+            started.elapsed() >= Duration::from_secs(4),
+            "not cut off early: {:?}",
+            started.elapsed()
+        );
+        handle.stop().await;
+    }
+
+    /// HTTP/2 streams without a `content-length` used to take no slot at all (only the headers
+    /// were inspected), so 250 streams per connection x many connections each held up to 64 MiB.
+    #[tokio::test]
+    async fn http2_streams_without_content_length_take_upload_slots() {
+        let (handle, address) = listener().await;
+        let tcp = TcpStream::connect(address).await.expect("connect");
+        let (mut sender, connection) = h2::client::handshake(tcp).await.expect("h2 handshake");
+        tokio::spawn(connection);
+        let request = || {
+            http::Request::builder()
+                .method("POST")
+                .uri("http://localhost/load")
+                .body(())
+                .unwrap()
+        };
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            sender = sender.ready().await.expect("ready");
+            let (response, stream) = sender.send_request(request(), false).expect("send");
+            held.push((response, stream)); // open, never finished
+        }
+        let mut refused = false;
+        for _ in 0..80 {
+            sender = sender.ready().await.expect("ready");
+            let (response, mut body) = sender.send_request(request(), false).expect("send");
+            body.send_data(bytes::Bytes::from_static(b"{}"), true)
+                .expect("body");
+            if let Ok(Ok(response)) = tokio::time::timeout(Duration::from_secs(2), response).await {
+                if response.status() == 503 {
+                    refused = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            refused,
+            "a third body-carrying HTTP/2 stream from the same peer must be refused"
+        );
+        handle.stop().await;
+    }
+
+    /// Go's `ReadTimeout` covers one request; between requests only `IdleTimeout` (60 s) applies.
+    /// The per-read timer used to run during the idle wait too, closing a keep-alive connection
+    /// after 10 s.
+    /// A graceful stop must close an idle keep-alive admin connection promptly, or a drain (the
+    /// runtime waits for ordinary connections before forcing) is held open by it.
+    #[tokio::test]
+    async fn a_graceful_stop_closes_an_idle_keep_alive_admin_connection() {
+        let (handle, address) = listener().await;
+        let mut stream = TcpStream::connect(address).await.expect("connect");
+        stream
+            .write_all(b"GET /config/ HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buffer = [0_u8; 4096];
+        let read = stream.read(&mut buffer).await.expect("response");
+        assert!(buffer[..read].starts_with(b"HTTP/1.1 200"));
+        handle.begin_graceful();
+        let closed = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buffer)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+            "an idle keep-alive connection must close on graceful shutdown: {closed:?}"
+        );
+        handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn an_idle_keep_alive_connection_survives_past_the_read_timeout() {
+        let (handle, address) = listener().await;
+        let mut stream = TcpStream::connect(address).await.expect("connect");
+        let request = b"GET /config/ HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        stream.write_all(request).await.unwrap();
+        let mut buffer = [0_u8; 4096];
+        let read = stream.read(&mut buffer).await.expect("first response");
+        assert!(buffer[..read].starts_with(b"HTTP/1.1 200"));
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        stream
+            .write_all(request)
+            .await
+            .expect("the idle connection is still open after 12 s");
+        let read = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buffer))
+            .await
+            .expect("second response arrives")
+            .expect("read");
+        assert!(
+            buffer[..read].starts_with(b"HTTP/1.1 200"),
+            "second request on the idle connection: {:?}",
+            String::from_utf8_lossy(&buffer[..read])
+        );
+        handle.stop().await;
+    }
+}
+
+/// End-to-end tests of the admin DNS-rebinding `Host` check (SEC-MEDIUM-ADMIN-SERVER A1) on a real
+/// listener with a non-zero, known port. A listener configured with port 0 turns the check off
+/// (the port is unknown to the allow-list), so these bind a port first and then configure it.
+#[cfg(test)]
+mod admin_host_check_tests {
+    use super::{admin_request_headers, bind_admin};
+    use caddy_rs_admin::{AdminApi, OriginPolicy};
+    use caddy_rs_core::{AdminConfig, GenerationStore};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    async fn listener() -> (super::ListenerHandle, SocketAddr) {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe port");
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let listen = format!("127.0.0.1:{port}");
+        let policy = OriginPolicy::from_admin(Some(&AdminConfig {
+            listen: Some(listen.clone()),
+            ..AdminConfig::default()
+        }));
+        let api = AdminApi::new(Arc::new(GenerationStore::with_builtin_registry()))
+            .with_origin_policy(policy);
+        let handle = bind_admin(&listen, api, None).await.expect("bind admin");
+        let address = handle.socket_addr.expect("bound address");
+        assert_eq!(address.port(), port);
+        (handle, address)
+    }
+
+    /// Send a raw HTTP/1.1 request and return its status code.
+    async fn status_of(address: SocketAddr, request: &str) -> u16 {
+        let mut stream = TcpStream::connect(address).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            stream.read_to_end(&mut response),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&response);
+        text.split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("no status line in {text:?}"))
+    }
+
+    fn get(target: &str, headers: &[String]) -> String {
+        let mut request = format!("GET {target} HTTP/1.1\r\nConnection: close\r\n");
+        for header in headers {
+            request.push_str(header);
+            request.push_str("\r\n");
+        }
+        request.push_str("\r\n");
+        request
+    }
+
+    #[tokio::test]
+    async fn own_host_is_served_and_foreign_host_is_refused_with_and_without_origin_headers() {
+        let (handle, address) = listener().await;
+        let own = format!("Host: {address}");
+        let foreign = format!("Host: evil.example:{}", address.port());
+        let origin = format!("Origin: http://{address}");
+        let cross_site = "Sec-Fetch-Mode: cors".to_string();
+
+        for (extra, label) in [
+            (vec![], "no Origin or Sec-Fetch-Mode"),
+            (vec![origin.clone()], "Origin"),
+            (
+                vec![origin.clone(), cross_site.clone()],
+                "Origin + Sec-Fetch-Mode",
+            ),
+            (vec![cross_site.clone()], "Sec-Fetch-Mode alone"),
+        ] {
+            let mut with_own = vec![own.clone()];
+            with_own.extend(extra.clone());
+            let status = status_of(address, &get("/config/", &with_own)).await;
+            // `Sec-Fetch-Mode` alone has no Origin to validate, which Caddy rejects with 403
+            // after the Host passed; every other combination with the own Host is served.
+            let expected = if label == "Sec-Fetch-Mode alone" {
+                403
+            } else {
+                200
+            };
+            assert_eq!(status, expected, "own Host, {label}");
+
+            let mut with_foreign = vec![foreign.clone()];
+            with_foreign.extend(extra);
+            assert_eq!(
+                status_of(address, &get("/config/", &with_foreign)).await,
+                403,
+                "foreign Host must be refused, {label}"
+            );
+        }
+        handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn absolute_form_target_host_wins_over_the_host_header() {
+        let (handle, address) = listener().await;
+        let own = format!("Host: {address}");
+        let evil = format!("http://evil.example:{}/config/", address.port());
+        assert_eq!(
+            status_of(address, &get(&evil, std::slice::from_ref(&own))).await,
+            403,
+            "Go uses the request-line host, so a foreign absolute-form target is a rebinding attempt"
+        );
+        let good = format!("http://{address}/config/");
+        let foreign = format!("Host: evil.example:{}", address.port());
+        assert_eq!(
+            status_of(address, &get(&good, &[foreign])).await,
+            200,
+            "and an own absolute-form target is served whatever the header says"
+        );
+        handle.stop().await;
+    }
+
+    /// A refused request must be refused *before* its body is read: no slot, no memory, and the
+    /// 403 arrives although the announced body never does. The body used to be read first, so a
+    /// rebinding page's foreign-Host `POST` pinned a slot (and up to 64 MiB) before its 403.
+    #[tokio::test]
+    async fn a_refused_request_is_answered_without_reading_its_body() {
+        let (handle, address) = listener().await;
+        let foreign = format!("Host: evil.example:{}", address.port());
+        let request = format!(
+            "POST /load HTTP/1.1\r\n{foreign}\r\nContent-Type: application/json\r\n\
+             Content-Length: 1000\r\n\r\n{{"
+        );
+        let started = std::time::Instant::now();
+        let mut stream = TcpStream::connect(address).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut buffer = [0_u8; 512];
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut buffer))
+                .await
+                .expect("a 403 must arrive without waiting for the body")
+                .expect("read");
+        assert!(
+            buffer[..read].starts_with(b"HTTP/1.1 403"),
+            "{:?}",
+            String::from_utf8_lossy(&buffer[..read])
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // Nothing is left holding a slot: the connection is closed after the refusal.
+        let mut rest = Vec::new();
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_to_end(&mut rest),
+        )
+        .await;
+        assert!(
+            closed.is_ok(),
+            "the connection is closed after refusing an unread body"
+        );
+        handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn multiple_host_headers_are_a_400_like_go() {
+        let (handle, address) = listener().await;
+        let own = format!("Host: {address}");
+        assert_eq!(
+            status_of(address, &get("/config/", &[own.clone(), own])).await,
+            400
+        );
+        handle.stop().await;
+    }
+
+    /// Prior-knowledge HTTP/2 carries only `:authority` (no `Host` header), so the check used to
+    /// be skipped entirely for h2c clients.
+    #[tokio::test]
+    async fn http2_authority_is_checked_like_the_host_header() {
+        let (handle, address) = listener().await;
+        let request = |authority: String| async move {
+            let tcp = TcpStream::connect(address).await.expect("connect");
+            let (mut sender, connection) = h2::client::handshake(tcp).await.expect("h2 handshake");
+            tokio::spawn(connection);
+            let request = http::Request::builder()
+                .uri(format!("http://{authority}/config/"))
+                .body(())
+                .unwrap();
+            let (response, _) = sender.send_request(request, true).expect("send");
+            response.await.expect("response").status().as_u16()
+        };
+        assert_eq!(request(address.to_string()).await, 200);
+        assert_eq!(
+            request(format!("evil.example:{}", address.port())).await,
+            403,
+            "a foreign :authority over h2c must be refused"
+        );
+        handle.stop().await;
+    }
+
+    #[test]
+    fn request_headers_resolve_host_like_go() {
+        let uri = |text: &str| text.parse::<http::Uri>().unwrap();
+        let with_host = |value: &str| {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(http::header::HOST, value.parse().unwrap());
+            headers
+        };
+        use http::Version as V;
+        // Origin-form keeps the header.
+        let resolved =
+            admin_request_headers(with_host("a.example"), &uri("/x"), V::HTTP_11).unwrap();
+        assert_eq!(resolved.get(http::header::HOST).unwrap(), "a.example");
+        // An authority (absolute-form / :authority) replaces it; userinfo is not part of the host.
+        let resolved = admin_request_headers(
+            with_host("a.example"),
+            &uri("http://u:p@b.example:1/x"),
+            V::HTTP_11,
+        )
+        .unwrap();
+        assert_eq!(resolved.get(http::header::HOST).unwrap(), "b.example:1");
+        // And supplies it when the header is absent (HTTP/2).
+        let resolved = admin_request_headers(
+            http::HeaderMap::new(),
+            &uri("http://c.example/x"),
+            V::HTTP_2,
+        )
+        .unwrap();
+        assert_eq!(resolved.get(http::header::HOST).unwrap(), "c.example");
+        // HTTP/1.0 may omit Host (as in Go): still absent.
+        let resolved =
+            admin_request_headers(http::HeaderMap::new(), &uri("/x"), V::HTTP_10).unwrap();
+        assert!(resolved.get(http::header::HOST).is_none());
+        // HTTP/1.1 without Host: 400 like Go.
+        let rejected =
+            admin_request_headers(http::HeaderMap::new(), &uri("/x"), V::HTTP_11).unwrap_err();
+        assert_eq!(rejected.status, http::StatusCode::BAD_REQUEST);
+        // Two Host headers: 400.
+        let mut headers = with_host("a.example");
+        headers.append(http::header::HOST, "b.example".parse().unwrap());
+        let rejected = admin_request_headers(headers, &uri("/x"), V::HTTP_11).unwrap_err();
+        assert_eq!(rejected.status, http::StatusCode::BAD_REQUEST);
+    }
+}
+
 /// Tests for the Unix-domain-socket admin listener (`admin.listen: "unix/<path>"`).
 #[cfg(all(test, unix))]
 mod admin_unix_tests {
@@ -3947,15 +6169,49 @@ mod admin_unix_tests {
         );
     }
 
+    /// Send raw request bytes to a unix admin listener and return the response head, giving up
+    /// after a short deadline (an unfixed server waits forever for the announced body).
+    async fn raw_exchange(path: &Path, request: &[u8]) -> String {
+        let mut stream = UnixStream::connect(path).await.expect("connect");
+        stream.write_all(request).await.expect("write request");
+        let mut response = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            stream.read_to_end(&mut response),
+        )
+        .await;
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
     #[tokio::test]
-    async fn replaces_a_stale_path_and_can_rebind_after_stop() {
+    async fn oversized_admin_request_bodies_are_rejected_with_413() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let (configured, path) = unix_listen(directory.path());
-        // A crashed process leaves the path behind; binding must reclaim it.
-        std::fs::write(&path, b"stale").expect("plant stale path");
+        let handle = bind_admin(&configured, api(), None).await.expect("bind");
+        // Announced length beyond the cap: rejected from the header, without reading a byte.
+        let response = raw_exchange(
+            &path,
+            b"POST /load HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+              Content-Type: application/json\r\nContent-Length: 4294967296\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 413"),
+            "an over-cap Content-Length must be answered 413: {response}"
+        );
+        handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn replaces_a_stale_socket_and_can_rebind_after_stop() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (configured, path) = unix_listen(directory.path());
+        // A crashed process leaves its socket file behind; binding must reclaim it.
+        drop(std::os::unix::net::UnixListener::bind(&path).expect("plant stale socket"));
+        assert!(path.exists());
         let handle = bind_admin(&configured, api(), None)
             .await
-            .expect("bind over a stale path");
+            .expect("bind over a stale socket");
         assert!(path.exists());
         handle.stop().await;
         assert!(!path.exists());
@@ -3964,6 +6220,369 @@ mod admin_unix_tests {
             .expect("rebind after stop");
         handle.stop().await;
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn refuses_to_delete_a_regular_file_at_the_socket_path() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (configured, path) = unix_listen(directory.path());
+        std::fs::write(&path, b"precious").expect("plant regular file");
+        let error = bind_admin(&configured, api(), None)
+            .await
+            .err()
+            .expect("a regular file must not be replaced");
+        assert!(error.to_string().contains("not a socket"), "{error}");
+        assert_eq!(
+            std::fs::read(&path).expect("file survives"),
+            b"precious",
+            "the regular file is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_to_delete_a_symlink_or_directory_at_the_socket_path() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (configured, path) = unix_listen(directory.path());
+        let victim = directory.path().join("victim");
+        std::fs::write(&victim, b"victim").expect("victim file");
+        std::os::unix::fs::symlink(&victim, &path).expect("plant symlink");
+        assert!(bind_admin(&configured, api(), None).await.is_err());
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .expect("symlink survives")
+                .file_type()
+                .is_symlink(),
+            "the symlink itself is not removed"
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim");
+        std::fs::remove_file(&path).unwrap();
+        // A dangling symlink is refused too (`exists()` reports false for it).
+        std::os::unix::fs::symlink(directory.path().join("missing"), &path).unwrap();
+        assert!(bind_admin(&configured, api(), None).await.is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(bind_admin(&configured, api(), None).await.is_err());
+        assert!(path.is_dir());
+    }
+
+    /// Best-effort probe for the creation window (SEC-MEDIUM-ADMIN-SERVER A3): a watcher thread
+    /// polls the parent directory while the listener is bound and re-bound many times, and every
+    /// time it sees the final socket path it checks the mode. It is probabilistic, not
+    /// deterministic: the pre-fix `bind`-then-`chmod` window is a few microseconds wide, so this
+    /// can pass on old code by missing it. The deterministic guarantees (staging directory is gone,
+    /// only the final socket remains, mode 0600, failed binds leave nothing behind) are asserted
+    /// in `staging_leaves_only_the_socket_behind`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watcher_never_observes_the_socket_with_wider_than_owner_permissions() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (configured, path) = unix_listen(directory.path());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = {
+            let stop = Arc::clone(&stop);
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let mut observed = 0_usize;
+                let mut worst = 0_u32;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+                        observed += 1;
+                        worst = worst.max(metadata.permissions().mode() & 0o077);
+                    }
+                }
+                (observed, worst)
+            })
+        };
+        for _ in 0..200 {
+            let handle = bind_admin(&configured, api(), None).await.expect("bind");
+            handle.stop().await;
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (observed, worst) = watcher.join().expect("watcher thread");
+        assert_eq!(
+            worst, 0,
+            "saw the socket with group/other bits ({observed} samples)"
+        );
+    }
+
+    #[tokio::test]
+    async fn staging_leaves_only_the_socket_behind() {
+        // The socket is bound inside a private 0700 staging directory and moved into place, so
+        // no path under the configured name ever has umask-derived permissions. After bind the
+        // staging directory is gone and only the socket remains.
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (configured, path) = unix_listen(directory.path());
+        let handle = bind_admin(&configured, api(), None).await.expect("bind");
+        let names: Vec<_> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![std::ffi::OsString::from("admin.sock")],
+            "{names:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        handle.stop().await;
+        // A failed bind (non-socket in the way) leaves no staging directory behind either.
+        std::fs::write(&path, b"x").unwrap();
+        assert!(bind_admin(&configured, api(), None).await.is_err());
+        let names: Vec<_> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![std::ffi::OsString::from("admin.sock")],
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn probe_outcomes_are_classified_for_stale_other_user_and_wedged_sockets() {
+        use super::{classify_probe, SocketProbe};
+        use std::io::{Error, ErrorKind};
+        let refused = Error::from(ErrorKind::ConnectionRefused);
+        let denied = Error::from(ErrorKind::PermissionDenied);
+        let other = Error::other("boom");
+        assert_eq!(
+            classify_probe(Ok(()), false, 1000, Some(1000)),
+            SocketProbe::Live
+        );
+        assert_eq!(
+            classify_probe(Err(&refused), false, 1000, Some(1000)),
+            SocketProbe::Stale
+        );
+        // A wedged peer that never accepts within the budget counts as live (safe error).
+        assert_eq!(
+            classify_probe(Ok(()), true, 1000, Some(1000)),
+            SocketProbe::Live
+        );
+        // EACCES on a socket another user owns (a crashed `sudo caddy-rs run`): stale.
+        assert_eq!(
+            classify_probe(Err(&denied), false, 0, Some(1000)),
+            SocketProbe::Stale
+        );
+        // EACCES on our own socket, or when we cannot tell who we are: report, do not guess.
+        assert!(matches!(
+            classify_probe(Err(&denied), false, 1000, Some(1000)),
+            SocketProbe::Unknown(_)
+        ));
+        assert!(matches!(
+            classify_probe(Err(&denied), false, 0, None),
+            SocketProbe::Unknown(_)
+        ));
+        assert!(matches!(
+            classify_probe(Err(&other), false, 0, Some(1000)),
+            SocketProbe::Unknown(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn explicit_bind_options_decide_replacement_not_the_stores_current_generation() {
+        use super::{bind_admin_with, AdminBindOptions};
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (configured, path) = unix_listen(directory.path());
+        // The api's store has no generation (stock_compat false there), but the generation being
+        // applied says stock_compat true, or this is an upgrade child: replace the live socket.
+        for options in [
+            AdminBindOptions {
+                stock_compat: true,
+                replace_live: false,
+            },
+            AdminBindOptions {
+                stock_compat: false,
+                replace_live: true,
+            },
+        ] {
+            let first = bind_admin(&configured, api(), None).await.expect("bind");
+            let second = bind_admin_with(&configured, api(), None, options)
+                .await
+                .expect("explicit options replace a live socket");
+            assert!(path.exists());
+            second.stop().await;
+            first.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn an_http11_request_without_host_is_a_400_like_go() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (configured, path) = unix_listen(directory.path());
+        let handle = bind_admin(&configured, api(), None).await.expect("bind");
+        let response =
+            raw_exchange(&path, b"GET /config/ HTTP/1.1\r\nConnection: close\r\n\r\n").await;
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_second_listener_does_not_steal_a_live_admin_socket() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (configured, path) = unix_listen(directory.path());
+        let first = bind_admin(&configured, api(), None).await.expect("bind");
+        let error = bind_admin(&configured, api(), None)
+            .await
+            .err()
+            .expect("a live socket must not be replaced");
+        assert!(
+            error.to_string().contains("in use by a running process"),
+            "{error}"
+        );
+        // The first instance still owns the path and still answers.
+        let response = raw_exchange(
+            &path,
+            b"GET /config/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        first.stop().await;
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn stock_compat_replaces_a_live_admin_socket_like_stock_caddy() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (configured, path) = unix_listen(directory.path());
+        let first = bind_admin(&configured, api(), None).await.expect("bind");
+        let store = Arc::new(GenerationStore::with_builtin_registry());
+        store
+            .load(
+                caddy_rs_core::Config::from_value(serde_json::json!({"stock_compat": true}))
+                    .expect("config"),
+            )
+            .expect("load");
+        let second = bind_admin(&configured, AdminApi::new(store), None)
+            .await
+            .expect("stock_compat replaces unconditionally");
+        assert!(path.exists());
+        second.stop().await;
+        first.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_final_path_that_fits_binds_when_only_the_short_staging_name_does() {
+        // Parent of 98 bytes: the 8-digit staged path would be 110 bytes (> 107), the 4-digit one
+        // 106; the final path is 105.
+        let (_base, directory) = directory_of_length(98);
+        let path = directory.join("a.sock");
+        assert!(path.as_os_str().len() <= 107);
+        let configured = format!("unix/{}", path.display());
+        let handle = bind_admin(&configured, api(), None)
+            .await
+            .expect("falls back to the short staging name");
+        handle.stop().await;
+    }
+
+    #[test]
+    fn only_unsupported_hard_links_fall_back_to_rename() {
+        let errno = std::io::Error::from_raw_os_error;
+        for code in [libc::EPERM, libc::EOPNOTSUPP, libc::ENOSYS] {
+            assert!(super::hard_link_unsupported(&errno(code)), "errno {code}");
+        }
+        for code in [
+            libc::EACCES,
+            libc::EMLINK,
+            libc::ENOSPC,
+            libc::EDQUOT,
+            libc::EROFS,
+            libc::EIO,
+            libc::EEXIST,
+            libc::ENOENT,
+            libc::EXDEV,
+        ] {
+            assert!(!super::hard_link_unsupported(&errno(code)), "errno {code}");
+        }
+        assert!(!super::hard_link_unsupported(&std::io::Error::other("x")));
+    }
+
+    #[tokio::test]
+    async fn stopping_does_not_delete_a_file_or_foreign_socket_that_replaced_ours() {
+        // The cleanup used to `remove_file` whatever sat at the path, including a regular file or
+        // another process's socket put there after we bound (SEC-MEDIUM-ADMIN-SERVER A3).
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (configured, path) = unix_listen(directory.path());
+        let handle = bind_admin(&configured, api(), None).await.expect("bind");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"precious").unwrap();
+        handle.stop().await;
+        assert_eq!(
+            std::fs::read(&path).expect("the replacement file survives the stop"),
+            b"precious"
+        );
+        std::fs::remove_file(&path).unwrap();
+
+        let handle = bind_admin(&configured, api(), None).await.expect("bind");
+        std::fs::remove_file(&path).unwrap();
+        let foreign = std::os::unix::net::UnixListener::bind(&path).expect("foreign socket");
+        handle.stop().await;
+        assert!(
+            std::fs::symlink_metadata(&path).is_ok(),
+            "another process's socket at the path is not ours to delete"
+        );
+        drop(foreign);
+    }
+
+    #[tokio::test]
+    async fn a_predictable_staging_name_cannot_block_the_bind() {
+        // The staging directory used to be `.caddy-rs-admin-<pid>-<counter>`: in a world-writable
+        // parent anyone could pre-create those names and make every bind fail.
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (configured, path) = unix_listen(directory.path());
+        for counter in 0..256 {
+            let name = format!(".caddy-rs-admin-{}-{counter}", std::process::id());
+            std::fs::create_dir(directory.path().join(name)).unwrap();
+        }
+        let handle = bind_admin(&configured, api(), None)
+            .await
+            .expect("a pre-created guessable name must not block the bind");
+        assert!(path.exists());
+        handle.stop().await;
+    }
+
+    /// A temporary directory whose path is exactly `length` bytes long.
+    fn directory_of_length(length: usize) -> (tempfile::TempDir, PathBuf) {
+        let base = tempfile::tempdir().expect("temporary directory");
+        let used = base.path().as_os_str().len();
+        let filler = "d".repeat(length - used - 1);
+        let nested = base.path().join(filler);
+        std::fs::create_dir(&nested).expect("nested directory");
+        assert_eq!(nested.as_os_str().len(), length);
+        (base, nested)
+    }
+
+    #[tokio::test]
+    async fn staging_does_not_cost_much_of_the_108_byte_socket_path_budget() {
+        // `sun_path` holds 107 bytes plus the NUL. The staging name used to add ~28 bytes, so a
+        // socket path that fits could fail to bind; it now adds a short random name.
+        let (_base, directory) = directory_of_length(92);
+        let path = directory.join("a.sock");
+        assert!(path.as_os_str().len() <= 107);
+        let configured = format!("unix/{}", path.display());
+        let handle = bind_admin(&configured, api(), None)
+            .await
+            .expect("a path well within the limit binds");
+        handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn an_over_long_staging_path_is_reported_with_the_configured_path_and_limit() {
+        let (_base, directory) = directory_of_length(100);
+        let path = directory.join("a.sock");
+        assert!(
+            path.as_os_str().len() <= 107,
+            "the final path itself would fit"
+        );
+        let configured = format!("unix/{}", path.display());
+        let error = bind_admin(&configured, api(), None)
+            .await
+            .err()
+            .expect("the staged path is too long to bind");
+        let message = error.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("108"), "{message}");
     }
 }
 
@@ -4325,6 +6944,105 @@ mod bind_capability_tests {
             crate::bindcap::seam_entries(),
             before_entries,
             "a successful bind must not consult the capability seam at all"
+        );
+    }
+}
+
+/// The declared request length of an HTTP/3 request, validated the way RFC 9110 section 8.6 and
+/// RFC 9114 section 4.1.2 require: every `Content-Length` value (several headers, or a comma list)
+/// must be plain decimal digits and all must be equal. `Err` means the request is malformed.
+/// quic-go's HTTP/3 body enforces the declared length itself; the h3 crate does not, and Rust's
+/// `str::parse::<u64>` would also accept a leading `+`.
+#[cfg(feature = "http3")]
+fn h3_declared_length(headers: &http::HeaderMap) -> Result<Option<u64>, ()> {
+    let mut found: Option<u64> = None;
+    for value in headers.get_all(http::header::CONTENT_LENGTH) {
+        let text = value.to_str().map_err(|_| ())?;
+        for part in text.split(',') {
+            let part = part.trim();
+            if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(());
+            }
+            let length: u64 = part.parse().map_err(|_| ())?;
+            match found {
+                Some(previous) if previous != length => return Err(()),
+                _ => found = Some(length),
+            }
+        }
+    }
+    Ok(found)
+}
+
+#[cfg(all(test, feature = "http3"))]
+mod h3_declared_length_tests {
+    use super::h3_declared_length;
+
+    fn lengths(values: &[&str]) -> Result<Option<u64>, ()> {
+        let mut headers = http::HeaderMap::new();
+        for value in values {
+            headers.append(
+                http::header::CONTENT_LENGTH,
+                http::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        h3_declared_length(&headers)
+    }
+
+    #[test]
+    fn content_length_is_validated_strictly() {
+        assert_eq!(lengths(&[]), Ok(None));
+        assert_eq!(lengths(&["0"]), Ok(Some(0)));
+        assert_eq!(lengths(&["10"]), Ok(Some(10)));
+        assert_eq!(
+            lengths(&["10", "10"]),
+            Ok(Some(10)),
+            "equal repeats are one value"
+        );
+        assert_eq!(
+            lengths(&["10, 10"]),
+            Ok(Some(10)),
+            "an equal list is one value"
+        );
+        for bad in [
+            &["10", "20"][..],
+            &["10, 20"],
+            &["+10"],
+            &["-1"],
+            &["1e3"],
+            &[""],
+            &["ten"],
+            &["10,"],
+            &["99999999999999999999999"],
+        ] {
+            assert_eq!(lengths(bad), Err(()), "{bad:?} must be malformed");
+        }
+    }
+}
+
+#[cfg(all(test, feature = "http3"))]
+mod h3_stream_hazard_tests {
+    /// h3-quinn's `RecvStream::stop_sending` and `recv_id` `unwrap()` an `Option` that is `None`
+    /// whenever a read is in flight, and h3 reads ahead after a data frame, so calling either
+    /// panics intermittently (and aborts the whole process under `panic = "abort"`). A timing
+    /// dependent crash cannot be reproduced reliably, so this guards the cause instead: no code in
+    /// this file may call them. Comments are ignored; the needles are built with `concat!` so this
+    /// test does not match itself.
+    #[test]
+    fn no_code_calls_h3_receive_stream_methods_that_panic_while_a_read_is_in_flight() {
+        let source = include_str!("listeners.rs");
+        let needles = [concat!(".stop_", "sending("), concat!(".recv_", "id(")];
+        let offenders: Vec<(usize, &str)> = source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let code = line.trim_start();
+                !code.starts_with("//") && needles.iter().any(|needle| code.contains(needle))
+            })
+            .map(|(index, line)| (index + 1, line.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "h3-quinn panics on these while a read is in flight; see `pump_h3_request_body`: {offenders:?}"
         );
     }
 }

@@ -108,6 +108,16 @@ changing host semantics.
 
 - `ConfigSettings` defaults to 80/443; the ports are written to both `http_port`/`https_port` and
   the `pm_http`/`pm_https` `listen` addresses;
+- **No placeholder text from the operator.** The data plane expands Caddy placeholders
+  (`{env.NAME}`, `{file.PATH}`, request placeholders) in header values and in a reverse-proxy
+  `dial`. `caddy-rs-pm-core` therefore rejects `{`/`}` and control characters in the five
+  security-header strings (CSP, `Permissions-Policy`, `X-Frame-Options`, `X-Content-Type-Options`,
+  `Referrer-Policy`) and in the upstream host, with an error naming the field
+  (`security_headers.content_security_policy must not contain ...`). The check runs on host
+  create/update, on global `PUT /security-headers`, at config assembly (so already-stored values
+  fail the next apply instead of leaking) and again inside the compiler. Domains and redirect
+  targets are already restricted to DNS label characters. A stored value that now violates this
+  must be edited before the next apply succeeds.
 - `ConfigSettings::security_headers` is an optional global `security_headers` block; a host
   inherits it unless it sets its own `Host::security_headers` (the host block wins), and the
   effective block is validated during assembly (`ConfigError::InvalidSecurityHeaders`) before any
@@ -333,7 +343,7 @@ Compile, Config}` and carry the relevant path. No error contains plaintext secre
 | `POST` | `/auth/refresh` | Consume the refresh token and return a rotated pair; a reused token is `401` |
 | `POST` | `/auth/logout` | Revoke the presented refresh token (body optional); always `204`, so it is idempotent |
 | `GET` | `/auth/me` | The caller's own `{id, username, role, totp_enabled, auth_epoch}`; needs a bearer token |
-| `POST` | `/auth/totp/setup` | Begin TOTP enrolment; returns `{secret, otpauth_uri}` **once** and leaves the factor pending (login still works by password until confirmed) |
+| `POST` | `/auth/totp/setup` | Begin TOTP enrolment; returns `{secret, otpauth_uri}` **once** and leaves the factor pending (login still works by password until confirmed). With a factor already active it is `409`, unless the body carries the current `{"totpCode": "..."}`, in which case the replacement is stored beside the old factor, which keeps gating login until `confirm`. Any role may call the `/auth/totp/*` routes for its own account; guessing is throttled (`429` + `Retry-After`) |
 | `POST` | `/auth/totp/confirm` | `{"totpCode": "..."}` — activate the pending factor; `409` if nothing is pending or it is already on |
 | `POST` | `/auth/totp/disable` | `{"totpCode": "..."}` — remove the factor; needs a live code, so a session token alone cannot strip it |
 | `GET` | `/users` | Paginated `PublicUser` list (`{items,total,limit,offset}`), sorted by username; requires `users:view` |

@@ -73,10 +73,11 @@ pub use issuer::{
     IssuanceRequest, ProductionAcmeIssuer,
 };
 pub use ocsp::{
-    build_ocsp_request, parse_ocsp_response, staple_for_certificate, DenyOcspTransport,
-    HyperOcspTransport, OcspCertStatus, OcspError, OcspPolicy, OcspRequest, OcspResponse,
-    OcspStapler, OcspTransport, ParsedCertificate, SharedOcspStapler, Staple, StapleOutcome,
-    DEFAULT_OCSP_CHECK_INTERVAL, INITIAL_OCSP_RETRY_DELAY, MAX_OCSP_RETRY_DELAY,
+    build_ocsp_request, parse_ocsp_response, staple_for_certificate, verify_ocsp_response,
+    DenyOcspTransport, HyperOcspTransport, OcspCertStatus, OcspError, OcspPolicy, OcspRequest,
+    OcspResponse, OcspStapler, OcspTransport, ParsedCertificate, ResponderId, SharedOcspStapler,
+    Staple, StapleOutcome, DEFAULT_OCSP_CHECK_INTERVAL, INITIAL_OCSP_RETRY_DELAY,
+    MAX_OCSP_RETRY_DELAY, OCSP_CLOCK_SKEW,
 };
 pub use pkcs11::{
     is_quarantined, open_token, quarantine, HandshakePermit, KeySelector, Pkcs11Budget,

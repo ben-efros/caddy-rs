@@ -8,7 +8,8 @@
 //!
 //! Supported configuration (`apps.http.servers.*.listener_wrappers[i]`):
 //!
-//! * `timeout`: maximum time to read the header (Caddy duration; zero/absent disables it);
+//! * `timeout`: maximum time to read the whole header (Caddy duration; zero/absent means
+//!   go-proxyproto's 10 s default, never "unbounded");
 //! * `allow` / `deny`: CIDR ranges. Allowed peers have a PROXY header required/used (`USE`), denied
 //!   peers have a header rejected (`REJECT`); other peers follow `fallback_policy`;
 //! * `fallback_policy`: `IGNORE` (default; use header when present, accept without one), `USE`
@@ -32,6 +33,9 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
 use caddy_rs_core::{ProxyProtocolConfig, ProxyProtocolPolicy};
+
+/// go-proxyproto's `DefaultReadHeaderTimeout`, used when the wrapper's `timeout` is absent or zero.
+const DEFAULT_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum length of a PROXY protocol v1 header line (including CRLF), per the spec.
 const V1_MAX_LEN: usize = 107;
@@ -69,26 +73,10 @@ impl Cidr {
         Some(Self { base, prefix })
     }
 
+    /// Whether `address` is in the range; an IPv4-mapped IPv6 peer (the listeners are dual-stack)
+    /// is also compared as the IPv4 address it stands for (SEC-MEDIUM-PROXY C2).
     fn contains(&self, address: IpAddr) -> bool {
-        match (self.base, address) {
-            (IpAddr::V4(base), IpAddr::V4(address)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u32::MAX << (32 - self.prefix)
-                };
-                (u32::from(base) & mask) == (u32::from(address) & mask)
-            }
-            (IpAddr::V6(base), IpAddr::V6(address)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u128::MAX << (128 - self.prefix)
-                };
-                (u128::from(base) & mask) == (u128::from(address) & mask)
-            }
-            _ => false,
-        }
+        caddy_rs_core::net::ip_in_net(self.base, self.prefix, address)
     }
 }
 
@@ -104,9 +92,12 @@ pub(crate) struct ProxyProtocolSettings {
 impl ProxyProtocolSettings {
     /// Parse the wrapper options from the core configuration.
     pub(crate) fn from_config(config: &ProxyProtocolConfig) -> Result<Self, String> {
+        // go-proxyproto (what Caddy's wrapper uses) treats a zero `ReadHeaderTimeout` as its
+        // 10 s default rather than "no limit", so an absent or zero `timeout` still bounds the
+        // header read and a silent client cannot hold the connection forever.
         let timeout = match config.timeout {
             Some(timeout) if !timeout.is_zero() => Some(timeout.as_duration()),
-            _ => None,
+            _ => Some(DEFAULT_HEADER_TIMEOUT),
         };
         let allow = config
             .allow
@@ -514,7 +505,14 @@ where
     }
 
     let mut stream = stream;
-    let (parsed, prefix) = read_header(&mut stream, settings.timeout).await?;
+    // One deadline over the whole header (go-proxyproto sets a connection read deadline), so a
+    // client trickling a byte at a time cannot stretch it with per-read timeouts.
+    let (parsed, prefix) = match settings.timeout {
+        Some(timeout) => tokio::time::timeout(timeout, read_header(&mut stream, None))
+            .await
+            .map_err(|_| ProxyProtocolError::Timeout(timeout))??,
+        None => read_header(&mut stream, None).await?,
+    };
     let header = match parsed {
         Some(header) => header,
         None => match policy {
@@ -942,6 +940,101 @@ mod tests {
             allow: Vec::new(),
             deny: Vec::new(),
             fallback: policy,
+        }
+    }
+
+    fn cidr(text: &str) -> Cidr {
+        Cidr::parse_caddy_prefix(text).unwrap()
+    }
+
+    /// The listener is dual-stack, so an IPv4 peer arrives as `::ffff:a.b.c.d`. `deny` used to miss
+    /// it (falling to the fallback policy, which may honour a forged PROXY header: source-IP
+    /// spoofing) and `allow` used to miss the load balancer (SEC-MEDIUM-PROXY C2 review).
+    #[test]
+    fn allow_and_deny_match_ipv4_mapped_peers() {
+        let mut deny = settings(ProxyProtocolPolicy::Use);
+        deny.deny = vec![cidr("203.0.113.0/24")];
+        for peer in ["203.0.113.5", "::ffff:203.0.113.5"] {
+            assert_eq!(
+                deny.effective_policy(Some(peer.parse().unwrap())),
+                EffectivePolicy::RejectHeader,
+                "{peer}"
+            );
+        }
+        assert_eq!(
+            deny.effective_policy(Some("::ffff:198.51.100.5".parse().unwrap())),
+            EffectivePolicy::Required,
+            "outside the deny range follows the fallback"
+        );
+        let mut allow = settings(ProxyProtocolPolicy::Reject);
+        allow.allow = vec![cidr("10.0.0.0/8")];
+        for peer in ["10.1.2.3", "::ffff:10.1.2.3"] {
+            assert_eq!(
+                allow.effective_policy(Some(peer.parse().unwrap())),
+                EffectivePolicy::Required,
+                "{peer}"
+            );
+        }
+        assert_eq!(
+            allow.effective_policy(Some("::ffff:11.1.2.3".parse().unwrap())),
+            EffectivePolicy::RejectHeader
+        );
+    }
+
+    /// End to end through `wrap` with a mapped peer address, the form a dual-stack accept yields.
+    #[tokio::test]
+    async fn wrap_denies_a_mapped_peer_inside_a_deny_range() {
+        let mut deny = settings(ProxyProtocolPolicy::Use);
+        deny.deny = vec![cidr("203.0.113.0/24")];
+        let peer: SocketAddr = "[::ffff:203.0.113.5]:1234".parse().unwrap();
+        let local: SocketAddr = "198.51.100.1:443".parse().unwrap();
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        writer
+            .write_all(b"PROXY TCP4 192.0.2.1 198.51.100.1 1111 443\r\n")
+            .await
+            .unwrap();
+        drop(writer);
+        let result = wrap(reader, Some(peer), Some(local), &deny).await;
+        assert!(result.is_err(), "a denied peer's PROXY header is rejected");
+    }
+
+    /// A client that connects and sends nothing must not hold the connection forever when the
+    /// wrapper has no `timeout`: go-proxyproto defaults a zero `ReadHeaderTimeout` to 10 s
+    /// (SEC-MEDIUM-ADMIN-SERVER A4 follow-up). Virtual time; fails (hangs until the test timeout
+    /// guard) when the read is unbounded.
+    #[tokio::test(start_paused = true)]
+    async fn silent_client_is_dropped_after_the_default_header_timeout() {
+        for config in [serde_json::json!({}), serde_json::json!({"timeout": 0})] {
+            let config: ProxyProtocolConfig = serde_json::from_value(config).unwrap();
+            let settings = ProxyProtocolSettings::from_config(&config).unwrap();
+            let (_client, server) = tokio::io::duplex(64);
+            let peer: SocketAddr = "198.51.100.9:1234".parse().unwrap();
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(60),
+                wrap(server, Some(peer), None, &settings),
+            )
+            .await
+            .expect("an unbounded PROXY header read never finishes");
+            match outcome {
+                Err(ProxyProtocolError::Timeout(after)) => {
+                    assert_eq!(after, Duration::from_secs(10));
+                }
+                Err(other) => panic!("expected a timeout, got {other}"),
+                Ok(_) => panic!("a silent client must not pass the wrapper"),
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_timeout_overrides_the_default() {
+        let config: ProxyProtocolConfig =
+            serde_json::from_value(serde_json::json!({"timeout": 2_000_000_000_i64})).unwrap();
+        let settings = ProxyProtocolSettings::from_config(&config).unwrap();
+        let (_client, server) = tokio::io::duplex(64);
+        match wrap(server, None, None, &settings).await {
+            Err(ProxyProtocolError::Timeout(after)) => assert_eq!(after, Duration::from_secs(2)),
+            Err(other) => panic!("expected a timeout, got {other}"),
+            Ok(_) => panic!("a silent client must not pass the wrapper"),
         }
     }
 

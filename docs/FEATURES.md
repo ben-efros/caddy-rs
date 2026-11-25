@@ -30,9 +30,34 @@ Per-server limits and timeouts are available as `read_timeout`, `write_timeout`,
 extensions: `max_request_body_size` (bytes, `0` means unlimited) and `max_connections` (concurrent
 connections per listener, `0` means unlimited).
 
+On HTTP/3 a request body read that stalls for `read_idle_timeout` (Caddy's field; default one
+minute, a negative value disables it) or `read_timeout`, whichever is shorter, aborts the request
+with `408`, and a body that disagrees with its declared `Content-Length` is a `400`.
+
+Request bodies stream to the handlers on HTTP/1.1, HTTP/2 and HTTP/3, so an upload of any size
+(tens of gigabytes) passes through without being held in memory. A body is **buffered** instead
+only when a handler in the server's route tree needs all of it up front — `reverse_proxy` with
+`retries`/`try_duration`, FastCGI (`php_fastcgi`), `handle_response` (and so `forward_auth`) — or
+when a `max_request_body_size` is configured and the client sends a chunked body with no
+`Content-Length`. The buffering decision is made per server, not per route: one such route makes
+every request on that server buffered. Buffered bodies are bounded in this build even when no limit
+is configured: each request is capped at 128 MiB (`413` over it; a declared `Content-Length` over
+the cap is refused before any byte is read; a larger `max_request_body_size` raises the cap) and
+all in-flight buffered bodies together draw on a 1 GiB process-wide budget, after which new
+buffered requests are answered `503`. Put large-upload endpoints on a server block that has no
+buffering handler (and leave `max_request_body_size` unset, or send a `Content-Length`) so they
+stream. These ceilings are registered as divergences from stock Caddy, which has no default limit;
+see [compatibility/SECURITY-REVIEW-HARDENING.md](compatibility/SECURITY-REVIEW-HARDENING.md).
+
 Server-level `trusted_proxies`, `trusted_proxies_strict`, `trusted_proxies_unix` and
 `client_ip_headers` control how the proxy's forwarding headers are believed. They affect the
 resolved client address used by the `client_ip` matcher, forwarding decisions and access logs.
+When `trusted_proxies_strict` is absent the client IP is the right-most address outside the trusted
+ranges (stock Caddy takes the client-controlled left-most one); `stock_compat true` or an explicit
+`"trusted_proxies_strict": false` restores the stock behaviour
+([SEC-MEDIUM-PROXY](compatibility/SEC-MEDIUM-PROXY.md)). Common breakage: with CDN -> load balancer
+-> caddy and `trusted_proxies` covering only the load balancer, `client_ip` is now the CDN edge
+address; add the CDN ranges to `trusted_proxies`.
 
 The derived `trusted_proxy`/`client_ip` variables are also consumed by `reverse_proxy`,
 `forward_auth` and the `acme_server` external-origin selection, and the per-request decision is
@@ -151,7 +176,7 @@ and the adapter emits the same JSON matcher objects.
 | `rewrite` | `rewrite`, `uri`, `method`, `try_files` | `method`, `uri`, `strip_path_prefix`, `strip_path_suffix`, `uri_substring`, `path_regexp`, `query` | Rewrites the request in Caddy's order: method, URI, prefix strip, suffix strip, substring replacements, regexp replacements, then query operations (`rename`, `set`, `add`, `replace`, `delete`). |
 | `vars` | `vars` | any string, number or boolean field | Sets request variables consumed by later handlers and by `{http.vars.NAME}` placeholders. |
 | `map` | `map` | `source`, `destinations`, `mappings` (`input`/`input_regexp`, `outputs`), `defaults` | Maps a source value to destination placeholders. Mappings are evaluated per destination in order; a matching non-null output wins, otherwise the positional default applies. |
-| `templates` | `templates` | `file_root`, `mime_types`, `delimiters` | Executes buffered response bodies whose content type matches `mime_types` (default `text/html`, `text/plain`, `text/markdown`) as templates. Supports `if`/`else`, `range`, `with`, `define`/`template`, variables, pipelines, field access, and functions including `placeholder`/`ph`, `env`, `include`, `import`, `readFile`, `fileExists`, `html`, `upper`, `lower`, `replace`, `split`, `join`, `truncate` and `stripHTML`. File access is confined to `file_root`. |
+| `templates` | `templates` | `file_root`, `mime_types`, `delimiters`, `env_allow` (caddy-rs extension) | Executes buffered response bodies whose content type matches `mime_types` (default `text/html`, `text/plain`, `text/markdown`) as templates. Supports `if`/`else`, `range`, `with`, `define`/`template`, variables, pipelines, field access, and functions including `placeholder`/`ph`, `env`, `include`, `import`, `readFile`, `fileExists`, `html`, `upper`, `lower`, `replace`, `split`, `join`, `truncate` and `stripHTML`. File access is confined to `file_root`. |
 | `request_body` | `request_body` | `max_size`, `set` | `max_size` bounds how many bytes later handlers may read (exceeding it is `413`); `set` replaces the body with a string and updates `Content-Length`. |
 | `encode` | `encode` | `encodings`, `prefer`, `minimum_length`, `match` | Compresses responses with gzip and zstd. See below. |
 | `authentication` / `basic_auth` | `basic_auth`, `basicauth` | `providers.http_basic` (`accounts`, `hash`, `realm`) | HTTP Basic authentication. See below. |
@@ -211,6 +236,13 @@ The `templates` handler renders with the delimiters `{{` and `}}` by default, co
 functions listed in the handler table. `include`, `import`, `readFile` and `fileExists` resolve
 paths under `file_root` and clamp `..` at that root.
 
+Like stock Caddy, `env` (and `{{placeholder "env.NAME"}}`) can read any process environment
+variable, so a template author can read secrets such as database passwords. When templates are
+untrusted or share a process with secrets, set the caddy-rs extension `env_allow` to an array of
+exact variable names; only those can then be read, and any other name is a template error (HTTP
+500). `env_allow: []` denies all. Absent means stock behaviour. The default `file_root` is the
+request's `{http.vars.root}` (the working directory when empty), as in stock Caddy.
+
 ### Rate limiting
 
 `rate_limit` is a token-bucket limiter implemented as a caddy-rs extension:
@@ -241,6 +273,26 @@ continue down the handler chain, so place the handler before the ones it protect
 `unix//path`, or a placeholder that expands per request. Per-upstream `max_requests` caps how many
 requests may run against that upstream at once.
 
+#### Request-derived dials (SSRF guard)
+
+A dial that contains placeholders (`{http.request.header.X-Backend}:80`) is chosen partly by the
+client, and `dynamic_upstreams` names may be request-derived too. By default such connections are refused when the resolved address is loopback, unspecified, link-local (including
+`169.254.169.254`), multicast, broadcast, `100.64.0.0/10`, `192.0.0.192` or `fd00:ec2::/32`, and
+`unix/` targets are refused (NAT64 `64:ff9b::/96` and 6to4 `2002::/16` forms are judged by the
+embedded IPv4 address). Only dials that can carry request data are guarded: literals, `{env.*}`
+and dynamic sources with such names are not, and every other placeholder (including `{vars.*}`,
+`{system.*}` and `{time.*}`) is. **RFC 1918 and ULA ranges stay reachable**, so a client who controls the
+whole dial can still reach `10.x`, `172.16/12` (for example a Docker API on `172.17.0.1`) or the
+host's LAN address: do not put request data in a dial that must not be client-influenced. The same
+guard covers FastCGI dials of discovered hosts. `dial_allow` (a handler field, or the Caddyfile
+`reverse_proxy { dial_allow <ip|cidr|unix//path>... }` subdirective) is the allow list:
+IP addresses or CIDR ranges that may be dialled despite the rule (`["127.0.0.0/8"]`) and
+`unix/<absolute path>` prefixes (`["unix//run/app"]`). A malformed entry fails at load with the
+JSON path. `stock_compat true` disables the
+guard (stock Caddy dials whatever the expansion yields). The per-expansion client cache is capped
+at 1024 entries (least recently used evicted). See
+[SEC-MEDIUM-PROXY](compatibility/SEC-MEDIUM-PROXY.md).
+
 ### Load balancing
 
 Set `load_balancing.selection_policy` to choose a policy. The default is `random`.
@@ -253,7 +305,7 @@ Set `load_balancing.selection_policy` to choose a policy. The default is `random
 | `random` | `{"policy": "random"}` | Uniformly random healthy upstream. |
 | `random_choose` | `{"policy": "random_choose", "choose": 2}` | Chooses a random sub-pool (at least 2), then the least-loaded member. |
 | `weighted_round_robin` | `{"policy": "weighted_round_robin", "weights": [3, 1]}` | Weighted rotation. |
-| `cookie` | `{"policy": "cookie", "name": "lb", "secret": "...", "max_age": 0, "fallback": "random"}` | Sticky sessions: the cookie value is an HMAC of the selected dial address. A missing or stale cookie falls back to the fallback policy and re-pins the client with `Set-Cookie`. |
+| `cookie` | `{"policy": "cookie", "name": "lb", "secret": "...", "max_age": 0, "fallback": "random"}` | Sticky sessions: the cookie value is an HMAC of the selected dial address. Without a `secret` a random per-process secret is used (stickiness survives reloads, not restarts; `stock_compat true` restores Caddy's empty secret). A missing or stale cookie falls back to the fallback policy and re-pins the client with `Set-Cookie`. |
 | `ip_hash` | `{"policy": "ip_hash"}` | Hashes the peer IP. |
 | `client_ip_hash` | `{"policy": "client_ip_hash"}` | Hashes the resolved client IP. |
 | `uri_hash` | `{"policy": "uri_hash"}` | Hashes the request URI. |
@@ -440,6 +492,17 @@ Trust anchors come from the `ca` module — `tls.ca_pool.source.inline`, `.file`
 `.pki_root`, `.pki_intermediate`, `.storage`, `.http` and `.combined` — or from the
 `trusted_ca_certs`, `trusted_ca_certs_pem_files` and `trusted_leaf_certs` fields. When a trust
 pool or leaf list is configured and no mode is given, the mode is `require_and_verify`.
+
+`request` and `require` ask for a client certificate but do **not** validate it (stock Caddy
+semantics; a configured CA pool is not consulted in these modes). Only `verify_if_given` and
+`require_and_verify` build a chain to the trust pool, so use `require_and_verify` for mutual TLS.
+Because operators routinely read `require` as mTLS, a `request`/`require` policy that pins no exact
+leaf (`trusted_leaf_certs`/`trusted_leaf_cert_file`/`verifiers`) is a **located load error** unless
+`client_authentication.insecure_accept_any_client_cert: true` (Caddyfile `client_auth` subdirective
+`insecure_accept_any_client_cert`) states the intent; a WARN log is emitted when such a listener is
+built. This is a caddy-rs extension (DIV register text in
+[`SEC-MEDIUM-TLS.md`](compatibility/SEC-MEDIUM-TLS.md)): with `stock_compat true` the policy loads
+exactly as in stock Caddy v2.11.9 without acknowledgement, and the extension field is rejected there.
 
 Caddy's implicit default `local` PKI authority is provisioned on demand (Caddy's
 `ProvisionDefaultCA`/`GetCA`): a `pki_root`/`pki_intermediate` source naming `local` without an

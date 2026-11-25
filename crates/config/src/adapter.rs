@@ -3335,6 +3335,7 @@ fn parse_client_auth_option(
     let mut trusted_leaf: Vec<String> = Vec::new();
     let mut ca_pool: Option<Value> = None;
     let mut saw_legacy_ca = false;
+    let mut accept_any_client_cert = false;
     for sub in &option.block {
         match sub.name.as_str() {
             "mode" => {
@@ -3511,6 +3512,18 @@ fn parse_client_auth_option(
                      (tracked as TLS-CLIENT-AUTH)",
                 ))
             }
+            // caddy-rs extension (SEC-MEDIUM D2): emits the JSON `insecure_accept_any_client_cert`
+            // acknowledgement. The runtime rejects it under `stock_compat true` (stock Caddy has
+            // no such field), so no adapt-time flag plumbing is needed here.
+            "insecure_accept_any_client_cert" => {
+                if !sub.args.is_empty() || !sub.block.is_empty() {
+                    return Err(adapter_error(
+                        sub.position.clone(),
+                        "`insecure_accept_any_client_cert` takes no arguments",
+                    ));
+                }
+                accept_any_client_cert = true;
+            }
             other => {
                 return Err(adapter_error(
                     sub.position.clone(),
@@ -3520,6 +3533,9 @@ fn parse_client_auth_option(
         }
     }
     let mut object = Map::new();
+    if accept_any_client_cert {
+        object.insert("insecure_accept_any_client_cert".to_string(), json!(true));
+    }
     if let Some(pool) = ca_pool {
         object.insert("ca".to_string(), pool);
     } else if saw_legacy_ca {
@@ -9457,6 +9473,23 @@ fn reverse_proxy_handler(directive: &Directive, args: &[String]) -> caddy_rs_cor
                 let nanos = parse_duration(duration)
                     .map_err(|message| adapter_error(item.position.clone(), message))?;
                 load_balancing.insert("try_interval".to_string(), json!(nanos));
+            }
+            "dial_allow" => {
+                // caddy-rs extension (SEC-MEDIUM-PROXY C3): IP/CIDR entries and `unix/<abs path>`
+                // prefixes that request-derived dials may reach although the egress guard would
+                // refuse them. Multiple subdirectives accumulate.
+                if !item.block.is_empty() || item.args.is_empty() {
+                    return Err(adapter_error(
+                        item.position.clone(),
+                        "`dial_allow` takes one or more IP addresses, CIDR ranges or `unix/<path>` prefixes",
+                    ));
+                }
+                let entry = object
+                    .entry("dial_allow".to_string())
+                    .or_insert_with(|| json!([]));
+                if let Some(list) = entry.as_array_mut() {
+                    list.extend(item.args.iter().map(|argument| json!(argument)));
+                }
             }
             "flush_interval" => {
                 // Caddy accepts either an integer (nanoseconds) or a duration string and stores

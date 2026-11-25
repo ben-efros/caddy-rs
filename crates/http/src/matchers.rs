@@ -982,30 +982,25 @@ impl IpRange {
         if prefix > max {
             return None;
         }
+        // A range written in the IPv4-mapped form (`::ffff:a.b.c.d/n`, n >= 96) is the IPv4 range.
+        if let IpAddr::V6(v6) = base {
+            if prefix >= 96 {
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    return Some(Self {
+                        base: IpAddr::V4(v4),
+                        prefix: prefix - 96,
+                    });
+                }
+            }
+        }
         Some(Self { base, prefix })
     }
 
-    /// Whether `address` is inside this range.
+    /// Whether `address` is inside this range. An IPv4-mapped IPv6 peer (the default listener is
+    /// dual-stack) is also tried in its IPv4 form, so `203.0.113.0/24` matches
+    /// `::ffff:203.0.113.5` (SEC-MEDIUM-PROXY review).
     pub fn contains(&self, address: IpAddr) -> bool {
-        match (self.base, address) {
-            (IpAddr::V4(base), IpAddr::V4(address)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u32::MAX << (32 - self.prefix)
-                };
-                (u32::from(base) & mask) == (u32::from(address) & mask)
-            }
-            (IpAddr::V6(base), IpAddr::V6(address)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u128::MAX << (128 - self.prefix)
-                };
-                (u128::from(base) & mask) == (u128::from(address) & mask)
-            }
-            _ => false,
-        }
+        caddy_rs_core::net::ip_in_net(self.base, self.prefix, address)
     }
 }
 
@@ -3363,6 +3358,45 @@ mod matcher_network_tls_tests {
         let error =
             build("path_regexp", serde_json::json!({"pattern": "("})).expect_err("invalid pattern");
         assert!(error.to_string().contains(".pattern"), "{error}");
+    }
+
+    /// SEC-MEDIUM-PROXY (review): the default listener is dual-stack, so an IPv4 client can reach
+    /// the matcher as `::ffff:a.b.c.d`. A range must match both spellings, or
+    /// `not remote_ip 203.0.113.0/24` never matches an IPv4 client (deny bypass).
+    #[test]
+    fn ip_ranges_match_ipv4_mapped_peers() {
+        let range = IpRange::parse("203.0.113.0/24").unwrap();
+        assert!(range.contains("203.0.113.5".parse().unwrap()));
+        assert!(range.contains("::ffff:203.0.113.5".parse().unwrap()));
+        assert!(!range.contains("::ffff:198.51.100.5".parse().unwrap()));
+        // A range written in the mapped form still matches the plain IPv4 peer.
+        let mapped = IpRange::parse("::ffff:203.0.113.0/120").unwrap();
+        assert!(mapped.contains("::ffff:203.0.113.9".parse().unwrap()));
+        assert!(mapped.contains("203.0.113.9".parse().unwrap()));
+        assert!(!mapped.contains("203.0.114.9".parse().unwrap()));
+        // `::/0` and `0.0.0.0/0` keep matching everything of their own family.
+        assert!(IpRange::parse("::/0")
+            .unwrap()
+            .contains("::ffff:203.0.113.5".parse().unwrap()));
+
+        for matcher in ["remote_ip", "client_ip"] {
+            let built = build(matcher, serde_json::json!({"ranges": ["203.0.113.0/24"]})).unwrap();
+            let mut request = make_request("/");
+            request.remote_addr = Some("[::ffff:203.0.113.5]:1234".parse().unwrap());
+            assert!(built.matches(&request), "{matcher}");
+        }
+        // The deny shape: `not remote_ip` must see the mapped IPv4 client as inside the range.
+        let negated = build_matcher_set(&serde_json::json!({
+            "not": [{"remote_ip": {"ranges": ["203.0.113.0/24"]}}]
+        }))
+        .expect("`not` matcher set builds");
+        assert_eq!(negated.len(), 1);
+        let mut request = make_request("/");
+        request.remote_addr = Some("[::ffff:203.0.113.5]:1234".parse().unwrap());
+        assert!(!negated[0].matches(&request), "deny must not be bypassed");
+        let mut outside = make_request("/");
+        outside.remote_addr = Some("[::ffff:198.51.100.5]:1234".parse().unwrap());
+        assert!(negated[0].matches(&outside));
     }
 
     #[test]

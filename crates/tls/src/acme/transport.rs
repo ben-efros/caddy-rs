@@ -480,21 +480,50 @@ impl HyperTransport {
                 )
             })
             .collect();
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .map_err(|error| AcmeError::Transport {
-                url: url.clone(),
-                reason: format!("cannot read response body: {error}"),
-            })?
-            .to_bytes()
-            .to_vec();
+        let body = read_limited_body(response.into_body(), MAX_RESPONSE_BODY_BYTES, &url).await?;
         Ok(HttpResponse {
             status,
             headers,
             body,
         })
+    }
+}
+
+/// Upper bound for any ACME/OCSP response body (SEC-MEDIUM D3).
+///
+/// The largest legitimate bodies are certificate bundles (a few tens of KiB; well under 1 MiB even
+/// with long alternate chains), CA directory/order JSON, and OCSP responses (a few KiB). Without a
+/// cap, a hostile or compromised ACME server, OCSP responder (its URL comes from the certificate's
+/// AIA), CA-bundle host or on-path proxy could stream an unbounded body that was buffered whole in
+/// memory. Go's acmez/certmagic read ACME responses through bounded readers as well; 4 MiB leaves
+/// comfortable headroom for bundles with many alternate chains. The live OCSP transport
+/// ([`HyperOcspTransport`](crate::HyperOcspTransport)) goes through this same transport.
+pub const MAX_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Collect `body`, failing with a located transport error as soon as it exceeds `limit` bytes
+/// (a body of exactly `limit` bytes is accepted). The excess is never buffered.
+async fn read_limited_body<B>(body: B, limit: usize, url: &str) -> Result<Vec<u8>>
+where
+    B: hyper::body::Body,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    match http_body_util::Limited::new(body, limit).collect().await {
+        Ok(collected) => Ok(collected.to_bytes().to_vec()),
+        Err(error) => {
+            let reason = if error
+                .downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some()
+            {
+                format!("response body exceeds the {limit} byte limit")
+            } else {
+                format!("cannot read response body: {error}")
+            };
+            Err(AcmeError::Transport {
+                url: url.to_string(),
+                reason,
+            }
+            .into())
+        }
     }
 }
 
@@ -1328,6 +1357,159 @@ mod tests {
             "{connects:?}"
         );
         assert!(connects.len() <= 4, "{connects:?}");
+    }
+
+    // ---- SEC-MEDIUM D3: bounded response bodies ----------------------------------------------
+
+    /// Serve one raw HTTP/1.1 response per connection and return the plain-HTTP base URL. The
+    /// writer closure owns the socket, so a test can stream an unbounded body.
+    async fn raw_http_server<F, Fut>(respond: F) -> String
+    where
+        F: Fn(TcpStream) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let listener = TcpListener::from_std(listener).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(respond(stream));
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    async fn consume_request_head(stream: &mut TcpStream) {
+        let mut seen = Vec::new();
+        let mut byte = [0u8; 1];
+        while !seen.ends_with(b"\r\n\r\n") {
+            if stream.read_exact(&mut byte).await.is_err() {
+                return;
+            }
+            seen.push(byte[0]);
+        }
+    }
+
+    fn plain_transport() -> HyperTransport {
+        HyperTransport::with_root_certificates(
+            parse_pem_certificates(TEST_CERT_PEM.as_bytes()).unwrap(),
+        )
+        .unwrap()
+        .with_timeout(Duration::from_secs(20))
+    }
+
+    #[tokio::test]
+    async fn response_body_at_the_cap_is_accepted() {
+        let url = raw_http_server(|mut stream| async move {
+            consume_request_head(&mut stream).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {MAX_RESPONSE_BODY_BYTES}\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(head.as_bytes()).await;
+            let _ = stream.write_all(&vec![b'a'; MAX_RESPONSE_BODY_BYTES]).await;
+            let _ = stream.shutdown().await;
+        })
+        .await;
+        let response = plain_transport()
+            .request(HttpRequest::get(format!("{url}/exact")))
+            .await
+            .expect("a body of exactly the cap is accepted");
+        assert_eq!(response.body.len(), MAX_RESPONSE_BODY_BYTES);
+    }
+
+    #[tokio::test]
+    async fn response_body_one_byte_over_the_cap_is_rejected() {
+        let url = raw_http_server(|mut stream| async move {
+            consume_request_head(&mut stream).await;
+            let length = MAX_RESPONSE_BODY_BYTES + 1;
+            let head =
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(head.as_bytes()).await;
+            let _ = stream.write_all(&vec![b'a'; length]).await;
+            let _ = stream.shutdown().await;
+        })
+        .await;
+        let error = plain_transport()
+            .request(HttpRequest::get(format!("{url}/over")))
+            .await
+            .expect_err("a body one byte over the cap must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("exceeds") && message.contains(&MAX_RESPONSE_BODY_BYTES.to_string()),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unbounded_chunked_response_stops_at_the_cap() {
+        // No Content-Length: the server keeps streaming 64 KiB chunks until the client goes away.
+        // Without a cap the client would buffer for ever (until the 20s timeout / OOM).
+        let url = raw_http_server(|mut stream| async move {
+            consume_request_head(&mut stream).await;
+            let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+            if stream.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            let chunk = vec![b'a'; 64 * 1024];
+            loop {
+                let frame_head = format!("{:x}\r\n", chunk.len());
+                if stream.write_all(frame_head.as_bytes()).await.is_err()
+                    || stream.write_all(&chunk).await.is_err()
+                    || stream.write_all(b"\r\n").await.is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .await;
+        let started = std::time::Instant::now();
+        let error = plain_transport()
+            .request(HttpRequest::get(format!("{url}/endless")))
+            .await
+            .expect_err("an endless body must be cut off at the cap");
+        assert!(error.to_string().contains("exceeds"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the cap must stop the read well before the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn limited_body_reader_boundaries_and_error_kinds() {
+        // Boundary values on the helper with a tiny limit.
+        for (len, ok) in [(0usize, true), (9, true), (10, true), (11, false)] {
+            let body = Full::new(Bytes::from(vec![b'x'; len]));
+            let result = read_limited_body(body, 10, "http://example.test/").await;
+            assert_eq!(result.is_ok(), ok, "len {len}: {result:?}");
+            if ok {
+                assert_eq!(result.unwrap().len(), len);
+            } else {
+                assert!(result.unwrap_err().to_string().contains("exceeds"));
+            }
+        }
+        // A body error that is not the length limit keeps its own message.
+        struct Failing;
+        impl hyper::body::Body for Failing {
+            type Data = Bytes;
+            type Error = io::Error;
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<std::result::Result<hyper::body::Frame<Bytes>, io::Error>>>
+            {
+                Poll::Ready(Some(Err(io::Error::other("connection reset"))))
+            }
+        }
+        let error = read_limited_body(Failing, 10, "http://example.test/")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("cannot read response body") && error.contains("connection reset"),
+            "{error}"
+        );
+        assert!(!error.contains("exceeds"), "{error}");
     }
 
     #[tokio::test]

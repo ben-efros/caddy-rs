@@ -79,7 +79,7 @@ On **Windows only** (the rules take the platform as a parameter and are unit-tes
 | `\` parent references (`..\x`), `C:` drive prefixes, rooted or UNC (`\x`, `\\host\share`) | 403 | `PathBuf::join` would discard the root. RUSTSEC-2022-0069/-0043/-0082 class. |
 | `:` anywhere (alternate data streams `f::$DATA`, `f.txt:stream`) | 403 | |
 | A component ending in `.` or space (`secret.env.`) | 403 | Win32 strips them after `hide` ran, so `secret.env.` opened `secret.env`. |
-| Reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, `COM0-9`, `LPT0-9`, superscript digits, with or without an extension, any case) | 404 | Opening them reaches a device. |
+| Reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, `COM1-9`, `LPT1-9` (`COM0`/`LPT0` are ordinary names, as in Go), superscript digits, with or without an extension, any case) | 403 | Opening them reaches a device; stock Caddy refuses them as non-local paths (`filepath.IsLocal`). |
 | Characters Windows cannot store (`< > " | ? *`, control characters) | 404 | Would otherwise surface as an invalid-name error. |
 
 Names that merely resemble these (`COM10.txt`, `NULL.txt`, `CONIN.txt`, `contact.html`) are served.

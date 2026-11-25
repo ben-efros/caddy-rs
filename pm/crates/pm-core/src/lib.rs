@@ -780,6 +780,30 @@ pub struct SecurityHeadersHstsConfig {
 impl SecurityHeadersConfig {
     /// Reject configurations that are invalid or unsafe to emit.
     pub fn validate(&self) -> Result<(), CoreError> {
+        // These strings are emitted into the Caddy JSON `security_headers` block, whose values the
+        // data plane expands with the Caddy replacer (`{env.NAME}`, `{file.PATH}`, request
+        // placeholders). None of the five legitimate grammars contains a brace, so reject braces
+        // outright instead of trying to tell a "safe" placeholder from a dangerous one.
+        for (path, value) in [
+            (
+                "security_headers.content_security_policy",
+                &self.content_security_policy,
+            ),
+            (
+                "security_headers.permissions_policy",
+                &self.permissions_policy,
+            ),
+            ("security_headers.x_frame_options", &self.x_frame_options),
+            (
+                "security_headers.x_content_type_options",
+                &self.x_content_type_options,
+            ),
+            ("security_headers.referrer_policy", &self.referrer_policy),
+        ] {
+            if let Some(value) = value {
+                reject_placeholder_text(path, value)?;
+            }
+        }
         if let Some(hsts) = &self.strict_transport_security {
             if hsts.max_age == 0 {
                 return Err(CoreError::Invalid(
@@ -876,6 +900,11 @@ impl Upstream {
 
     pub fn validate(&self) -> Result<(), CoreError> {
         require_non_empty("upstream host", &self.host, 255)?;
+        // The host becomes the `dial` address and, with `preserve_host: false`, a `Host` header
+        // value; both are placeholder-expanded by the data plane. A `{env.X}` would resolve the
+        // environment variable and dial/send it, and `{http.request.header.X}` would let a client
+        // pick the upstream.
+        reject_placeholder_text("upstream host", &self.host)?;
         if self.host.trim() != self.host {
             return Err(CoreError::Invalid(
                 "upstream host must not have leading or trailing whitespace".to_string(),
@@ -1066,7 +1095,13 @@ impl Host {
         }
         validate_pattern_domains(&self.domains)?;
         self.tls.validate_shape()?;
-        self.spec.validate()
+        self.spec.validate()?;
+        // Host create/update and route compilation both gate on this method, so per-host headers
+        // cannot reach the compiler unvalidated.
+        if let Some(security_headers) = &self.security_headers {
+            security_headers.validate()?;
+        }
+        Ok(())
     }
 
     /// Validate the host including its TLS certificate/policy reference.
@@ -1137,6 +1172,28 @@ pub enum CoreError {
         origin: CertificateOrigin,
         domains: Vec<String>,
     },
+}
+
+/// Reject text that the Caddy data plane would treat as a placeholder or that cannot be a header
+/// value: any `{` or `}`, and any control character (which also covers `\r\n` header injection).
+///
+/// The caddy-rs/Caddy replacer expands `{env.NAME}`, `{file.PATH}` and request placeholders in
+/// header values and upstream addresses, so an operator-supplied string containing braces can leak
+/// the process environment or redirect traffic. `field` is the JSON path (or field name) shown in
+/// the error.
+pub fn reject_placeholder_text(field: &str, value: &str) -> Result<(), CoreError> {
+    if value.contains(['{', '}']) {
+        return Err(CoreError::Invalid(format!(
+            "{field} must not contain `{{` or `}}`: braces are expanded as Caddy placeholders \
+             (for example `{{env.NAME}}`) at request time"
+        )));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(CoreError::Invalid(format!(
+            "{field} must not contain control characters"
+        )));
+    }
+    Ok(())
 }
 
 fn require_non_empty(field: &str, value: &str, max: usize) -> Result<(), CoreError> {
@@ -1310,6 +1367,9 @@ pub fn pattern_covers(covering: &str, target: &str) -> bool {
     };
     !label.is_empty() && !label.contains('.')
 }
+
+#[cfg(test)]
+mod tests_placeholders;
 
 #[cfg(test)]
 mod tests {

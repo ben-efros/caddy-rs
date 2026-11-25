@@ -58,6 +58,7 @@ use crate::client::{
     proxy_protocol_authority, KeepAliveConfig, ProxyProtocolVersion, TransportResolver,
     TransportTuning, UpstreamClient,
 };
+use crate::dial_guard::DialGuard;
 use crate::dns::{DnsResolver, ResolverAddress, SystemDnsResolver};
 use crate::dynamic_upstreams::{DynamicUpstreamSource, DynamicUpstreams};
 use crate::fastcgi::{FastCgiError, FastCgiTransport};
@@ -319,25 +320,7 @@ impl IpNet {
     }
 
     fn contains(&self, address: IpAddr) -> bool {
-        match (self.address, address) {
-            (IpAddr::V4(network), IpAddr::V4(candidate)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u32::MAX << (32 - u32::from(self.prefix))
-                };
-                (u32::from(network) & mask) == (u32::from(candidate) & mask)
-            }
-            (IpAddr::V6(network), IpAddr::V6(candidate)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u128::MAX << (128 - u32::from(self.prefix))
-                };
-                (u128::from(network) & mask) == (u128::from(candidate) & mask)
-            }
-            _ => false,
-        }
+        caddy_rs_core::net::ip_in_net(self.address, self.prefix, address)
     }
 }
 
@@ -488,7 +471,7 @@ pub struct ReverseProxyHandler {
     upgrade_clients: Option<Vec<Option<UpstreamClient>>>,
     /// Lazily built clients for dynamic (placeholder) upstream dials, keyed by the expanded dial
     /// address (Caddy pools per resolved address too).
-    dynamic_clients: Mutex<HashMap<String, Arc<DynamicClients>>>,
+    dynamic_clients: Mutex<DynamicClientCache>,
     /// Configured `dynamic_upstreams` source, when present.
     dynamic: Option<Arc<dyn DynamicUpstreamSource>>,
     /// Upstream states provisioned from dynamic discovery, keyed by dial address. Reusing the
@@ -516,6 +499,64 @@ pub struct ReverseProxyHandler {
     /// chain carries an explicit `security_headers` handler (precedence 4: that handler owns the
     /// header set instead).
     security_profile_enabled: bool,
+    /// `dial_allow`: the placeholder-free allow list for request-derived dials (SEC-MEDIUM-PROXY C3).
+    dial_allow: DialGuard,
+    /// Whether request-derived dials are checked against [`Self::dial_allow`] and the built-in
+    /// restricted-address set. `true` on the production path unless `stock_compat true`; `false`
+    /// for direct construction (tests/embedders assert raw proxy behaviour, like
+    /// `security_profile_enabled`).
+    dial_guard_enabled: bool,
+}
+
+/// Maximum number of per-expanded-dial client pairs kept for request-derived dials. Each distinct
+/// expansion would otherwise add a client (and its idle pool) forever, so a client choosing the
+/// expansion could exhaust memory (SEC-MEDIUM-PROXY C3). Least recently used entries are evicted.
+const MAX_DYNAMIC_CLIENTS: usize = 1024;
+/// Maximum number of discovered-upstream states retained once they are no longer in the pool.
+const MAX_DYNAMIC_HOSTS: usize = 1024;
+
+/// LRU cache of per-expanded-dial clients.
+#[derive(Default)]
+struct DynamicClientCache {
+    entries: HashMap<String, (Arc<DynamicClients>, u64)>,
+    tick: u64,
+}
+
+impl DynamicClientCache {
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    fn get(&mut self, key: &str) -> Option<Arc<DynamicClients>> {
+        self.tick += 1;
+        let tick = self.tick;
+        let (clients, used) = self.entries.get_mut(key)?;
+        *used = tick;
+        Some(Arc::clone(clients))
+    }
+
+    /// Insert, evicting the least recently used entry first when the cache is full. Dropping an
+    /// evicted entry releases its pool once in-flight requests finish.
+    fn insert(&mut self, key: String, clients: Arc<DynamicClients>) {
+        if !self.entries.contains_key(&key) && self.entries.len() >= MAX_DYNAMIC_CLIENTS {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(key, _)| key.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.tick += 1;
+        self.entries.insert(key, (clients, self.tick));
+    }
 }
 
 impl ReverseProxyHandler {
@@ -531,6 +572,7 @@ impl ReverseProxyHandler {
             path,
             Arc::new(SystemDnsResolver),
             Some(format!("caddy-rs/{}", env!("CARGO_PKG_VERSION"))),
+            false,
             false,
         )
     }
@@ -548,6 +590,7 @@ impl ReverseProxyHandler {
             resolver,
             Some(format!("caddy-rs/{}", env!("CARGO_PKG_VERSION"))),
             false,
+            false,
         )
     }
 
@@ -563,6 +606,7 @@ impl ReverseProxyHandler {
             path,
             Arc::new(SystemDnsResolver),
             server_software,
+            false,
             false,
         )
     }
@@ -584,6 +628,27 @@ impl ReverseProxyHandler {
             Arc::new(SystemDnsResolver),
             server_software,
             security_profile_enabled,
+            false,
+        )
+    }
+
+    /// Build from Caddy JSON for the production router factories: the generation's `stock_compat`
+    /// selects stock Caddy's defaults where caddy-rs hardens them (the `cookie` policy's empty
+    /// default secret, SEC-MEDIUM-PROXY C5).
+    pub fn from_json_with_stock_compat(
+        value: &Value,
+        path: &str,
+        server_software: Option<String>,
+        security_profile_enabled: bool,
+        stock_compat: bool,
+    ) -> HttpResult<Self> {
+        Self::from_json_full(
+            value,
+            path,
+            Arc::new(SystemDnsResolver),
+            server_software,
+            security_profile_enabled,
+            stock_compat,
         )
     }
 
@@ -593,6 +658,7 @@ impl ReverseProxyHandler {
         resolver: Arc<dyn DnsResolver>,
         server_software: Option<String>,
         security_profile_enabled: bool,
+        stock_compat: bool,
     ) -> HttpResult<Self> {
         let object = value
             .as_object()
@@ -671,18 +737,21 @@ impl ReverseProxyHandler {
 
         let load_balancing = object.get("load_balancing");
         let selection_policy = load_balancing.and_then(|lb| lb.get("selection_policy"));
-        let balancer =
-            balancer::from_selection_policy(selection_policy, &format!("{path}.load_balancing"))
-                .map_err(|error| match error {
-                    balancer::BalancerError::Invalid(message) => invalid(path, message),
-                    balancer::BalancerError::NotImplemented {
-                        feature,
-                        tracking_id,
-                    } => HttpError::NotImplemented {
-                        feature,
-                        tracking_id,
-                    },
-                })?;
+        let balancer = balancer::from_selection_policy_with_stock_compat(
+            selection_policy,
+            &format!("{path}.load_balancing"),
+            stock_compat,
+        )
+        .map_err(|error| match error {
+            balancer::BalancerError::Invalid(message) => invalid(path, message),
+            balancer::BalancerError::NotImplemented {
+                feature,
+                tracking_id,
+            } => HttpError::NotImplemented {
+                feature,
+                tracking_id,
+            },
+        })?;
         let retries = load_balancing
             .and_then(|lb| lb.get("retries"))
             .and_then(Value::as_u64)
@@ -720,6 +789,7 @@ impl ReverseProxyHandler {
         )?;
 
         let trusted_proxies = parse_trusted_proxies(object.get("trusted_proxies"), path)?;
+        let dial_allow = parse_dial_allow(object.get("dial_allow"), path)?;
 
         let (health_check, passive) = parse_health_checks(object.get("health_checks"), path)?;
         let has_dynamic_dial = upstreams.iter().any(|upstream| upstream.is_dynamic());
@@ -772,7 +842,7 @@ impl ReverseProxyHandler {
         Ok(Self {
             clients,
             upgrade_clients,
-            dynamic_clients: Mutex::new(HashMap::new()),
+            dynamic_clients: Mutex::new(DynamicClientCache::default()),
             dynamic,
             dynamic_hosts: Mutex::new(BTreeMap::new()),
             transport,
@@ -791,12 +861,23 @@ impl ReverseProxyHandler {
             trusted_proxies,
             flush_interval,
             security_profile_enabled,
+            dial_allow,
+            dial_guard_enabled: false,
         })
     }
 
     /// Active health-check configuration, if configured.
     pub fn health_check(&self) -> Option<Arc<HealthCheck>> {
         self.health_check.clone()
+    }
+
+    /// Enable or disable the egress guard for request-derived dials (SEC-MEDIUM-PROXY C3).
+    ///
+    /// The router factories pass `!stock_compat`; `stock_compat true` restores stock Caddy, which
+    /// dials whatever a placeholder expansion yields.
+    pub fn with_dial_guard(mut self, enabled: bool) -> Self {
+        self.dial_guard_enabled = enabled;
+        self
     }
 
     /// Upstreams, for health-check scheduling.
@@ -876,7 +957,14 @@ impl ReverseProxyHandler {
         if let Some(fastcgi) = &self.transport.fastcgi {
             let started = std::time::Instant::now();
             let response = fastcgi
-                .forward(upstream, request, method, &path_and_query, body)
+                .forward(
+                    upstream,
+                    request,
+                    method,
+                    &path_and_query,
+                    body,
+                    self.fastcgi_dial_guard(upstream),
+                )
                 .await?;
             let latency = started.elapsed();
             return Ok(Forwarded::Streaming(ForwardedStreamingResponse {
@@ -1168,6 +1256,13 @@ impl ReverseProxyHandler {
                 }
             }
         }
+        // Discovery results can be request-derived (a placeholder in the DNS name), so the retained
+        // state must be bounded (SEC-MEDIUM-PROXY C3): once over the cap, keep only the hosts in the
+        // current pool or with requests in flight; counters of the others restart if they return.
+        if hosts.len() > MAX_DYNAMIC_HOSTS {
+            hosts
+                .retain(|dial, upstream| dials.contains(dial) || upstream.active_connections() > 0);
+        }
         provisioned
     }
 
@@ -1229,8 +1324,48 @@ impl ReverseProxyHandler {
                 ))
             },
         )?);
-        let clients = self.dynamic_clients_for(&resolved, &expanded)?;
+        // SEC-MEDIUM-PROXY C3: a request-derived Unix-socket target must be explicitly allowed.
+        // (TCP targets are checked against the resolved addresses at connect time.) Only dials
+        // that can carry request data are guarded: a literal host, `{env.*}`, or a dynamic source
+        // whose name/port templates are operator-controlled keeps working against loopback.
+        let guarded = self.dial_guard_enabled
+            && if upstream.is_dynamic() {
+                crate::dial_guard::template_is_request_derived(&upstream.dial)
+            } else {
+                self.dynamic
+                    .as_ref()
+                    .is_some_and(|source| source.request_derived())
+            };
+        #[cfg(unix)]
+        if guarded {
+            if let Some(crate::upstream::Transport::Unix { path }) = resolved.transport() {
+                self.dial_allow.check_unix(path).map_err(|message| {
+                    ProxyError::Request(format!(
+                        "upstream `{}`: dial target refused: {message}",
+                        upstream.dial
+                    ))
+                })?;
+            }
+        }
+        let clients = self.dynamic_clients_for(&resolved, &expanded, guarded)?;
         Ok((resolved, clients.main.clone(), clients.upgrade.clone()))
+    }
+
+    /// The egress guard to apply when dialing `target` outside the HTTP client path (FastCGI).
+    ///
+    /// `None` for fixed upstreams and for hosts that do not come from a request-derived source;
+    /// the same classification as [`Self::resolve_target`]. (Placeholder dials are rejected with
+    /// FastCGI at load, so a non-fixed target here is a discovered host.)
+    fn fastcgi_dial_guard(&self, target: &Arc<Upstream>) -> Option<&DialGuard> {
+        let fixed = self
+            .upstreams
+            .iter()
+            .any(|candidate| Arc::ptr_eq(candidate, target));
+        let request_derived = self
+            .dynamic
+            .as_ref()
+            .is_none_or(|source| source.request_derived());
+        (!fixed && self.dial_guard_enabled && request_derived).then_some(&self.dial_allow)
     }
 
     /// Build (or reuse) the per-address clients for a dynamic upstream.
@@ -1238,13 +1373,19 @@ impl ReverseProxyHandler {
         &self,
         resolved: &Arc<Upstream>,
         expanded: &str,
+        guarded: bool,
     ) -> Result<Arc<DynamicClients>, ProxyError> {
+        // Guarded and unguarded clients for the same text must not share a cache entry.
+        let cache_key = if guarded {
+            expanded.to_string()
+        } else {
+            format!("unguarded|{expanded}")
+        };
         if let Some(clients) = self
             .dynamic_clients
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(expanded)
-            .cloned()
+            .get(&cache_key)
         {
             return Ok(clients);
         }
@@ -1259,6 +1400,12 @@ impl ReverseProxyHandler {
         } else {
             None
         };
+        // Clients for request-derived dials refuse restricted resolved addresses at connect time
+        // (SEC-MEDIUM-PROXY C3); fixed upstreams keep the unguarded tuning.
+        let mut tuning = self.transport.tuning.clone();
+        if guarded {
+            tuning.dial_guard = Some(Arc::new(self.dial_allow.clone()));
+        }
         let build = |http1_only: bool| {
             build_upstream_client_for_tuned(
                 transport,
@@ -1267,7 +1414,7 @@ impl ReverseProxyHandler {
                 http1_only,
                 self.transport.proxy_protocol,
                 self.transport.dial_timeout,
-                &self.transport.tuning,
+                &tuning,
             )
             .map_err(|message| {
                 ProxyError::Request(format!(
@@ -1286,7 +1433,7 @@ impl ReverseProxyHandler {
         self.dynamic_clients
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(expanded.to_string(), Arc::clone(&clients));
+            .insert(cache_key, Arc::clone(&clients));
         Ok(clients)
     }
 
@@ -1764,7 +1911,7 @@ impl Handler for ReverseProxyHandler {
                     mark_proxy_failure(&request);
                     return Ok(Outcome::Respond(Response::text(
                         StatusCode::BAD_GATEWAY,
-                        format!("502 Bad Gateway: cannot read request body: {error}"),
+                        bad_gateway_body(&format!("cannot read request body: {error}")),
                     )));
                 }
             }
@@ -1816,7 +1963,7 @@ impl Handler for ReverseProxyHandler {
                         mark_proxy_failure(&request);
                         let mut response = Response::text(
                             StatusCode::BAD_GATEWAY,
-                            format!("502 Bad Gateway: {error}"),
+                            bad_gateway_body(&error.to_string()),
                         );
                         merge_selection_cookie(&mut response, &selection);
                         return Ok(Outcome::Respond(response));
@@ -1836,10 +1983,8 @@ impl Handler for ReverseProxyHandler {
                     // itself: a handler-chain error (see `mark_proxy_failure`). Unreachable today
                     // because retries imply a buffered body, marked for uniformity.
                     mark_proxy_failure(&request);
-                    let mut response = Response::text(
-                        StatusCode::BAD_GATEWAY,
-                        format!("502 Bad Gateway: {message}"),
-                    );
+                    let mut response =
+                        Response::text(StatusCode::BAD_GATEWAY, bad_gateway_body(message));
                     merge_selection_cookie(&mut response, &selection);
                     return Ok(Outcome::Respond(response));
                 }
@@ -2008,7 +2153,7 @@ impl Handler for ReverseProxyHandler {
                     return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
                         Response::text(
                             StatusCode::BAD_GATEWAY,
-                            format!("502 Bad Gateway: cannot read request body: {error}"),
+                            bad_gateway_body(&format!("cannot read request body: {error}")),
                         ),
                     )));
                 }
@@ -2058,7 +2203,7 @@ impl Handler for ReverseProxyHandler {
                         mark_proxy_failure(&request);
                         let mut response = Response::text(
                             StatusCode::BAD_GATEWAY,
-                            format!("502 Bad Gateway: {error}"),
+                            bad_gateway_body(&error.to_string()),
                         );
                         merge_selection_cookie(&mut response, &selection);
                         return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
@@ -2079,10 +2224,8 @@ impl Handler for ReverseProxyHandler {
                     // Same as the buffered path: an unreplayable body fails the attempt, which is
                     // a handler-chain error (see `mark_proxy_failure`).
                     mark_proxy_failure(&request);
-                    let mut response = Response::text(
-                        StatusCode::BAD_GATEWAY,
-                        format!("502 Bad Gateway: {message}"),
-                    );
+                    let mut response =
+                        Response::text(StatusCode::BAD_GATEWAY, bad_gateway_body(message));
                     merge_selection_cookie(&mut response, &selection);
                     return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
                         response,
@@ -2185,30 +2328,30 @@ impl Handler for ReverseProxyHandler {
                         // `copy_response` needs the complete upstream body; buffer it only when
                         // the configuration asks for it (other response handlers drop or replace
                         // the body).
-                        let (buffered_upstream_body, upstream_stream) = if self
-                            .handle_response
-                            .requires_upstream_body()
-                        {
-                            match forwarded.body.into_bytes().await {
-                                Ok(body) => (Some(body), None),
-                                Err(error) => {
-                                    // `copy_response` could not read the upstream body, so the
-                                    // response handler fails the request: a handler-chain error
-                                    // (see `mark_proxy_failure`).
-                                    mark_proxy_failure(&request);
-                                    let mut response = Response::text(
-                                        StatusCode::BAD_GATEWAY,
-                                        format!("502 Bad Gateway: cannot read upstream response body: {error}"),
-                                    );
-                                    merge_selection_cookie(&mut response, &selection);
-                                    return Ok(StreamingOutcome::Respond(
-                                        StreamingResponse::from_buffered(response),
-                                    ));
+                        let (buffered_upstream_body, upstream_stream) =
+                            if self.handle_response.requires_upstream_body() {
+                                match forwarded.body.into_bytes().await {
+                                    Ok(body) => (Some(body), None),
+                                    Err(error) => {
+                                        // `copy_response` could not read the upstream body, so the
+                                        // response handler fails the request: a handler-chain error
+                                        // (see `mark_proxy_failure`).
+                                        mark_proxy_failure(&request);
+                                        let mut response = Response::text(
+                                            StatusCode::BAD_GATEWAY,
+                                            bad_gateway_body(&format!(
+                                                "cannot read upstream response body: {error}"
+                                            )),
+                                        );
+                                        merge_selection_cookie(&mut response, &selection);
+                                        return Ok(StreamingOutcome::Respond(
+                                            StreamingResponse::from_buffered(response),
+                                        ));
+                                    }
                                 }
-                            }
-                        } else {
-                            (None, Some(forwarded.body))
-                        };
+                            } else {
+                                (None, Some(forwarded.body))
+                            };
                         if let Some(result) = self.handle_response.evaluate(
                             &request,
                             forwarded.status,
@@ -2458,6 +2601,33 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
     HOP_BY_HOP_HEADERS
         .iter()
         .any(|hop| name.as_str().eq_ignore_ascii_case(hop))
+}
+
+/// Parse the handler's `dial_allow` list (SEC-MEDIUM-PROXY C3): IP/CIDR entries and `unix/<absolute path>`
+/// prefixes that request-derived dials may reach even though the guard would refuse them. A malformed
+/// entry is a located load-time error, never silently dropped.
+fn parse_dial_allow(value: Option<&Value>, path: &str) -> HttpResult<DialGuard> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(DialGuard::default());
+    };
+    let entries = value.as_array().ok_or_else(|| {
+        invalid(
+            &format!("{path}.dial_allow"),
+            "`dial_allow` must be an array of IP addresses, CIDR ranges or `unix/<path>` prefixes",
+        )
+    })?;
+    let mut allowed = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let entry_path = format!("{path}.dial_allow[{index}]");
+        let text = entry
+            .as_str()
+            .ok_or_else(|| invalid(&entry_path, "`dial_allow` entries must be strings"))?;
+        DialGuard::from_allow_entries(&[text.to_string()])
+            .map_err(|message| invalid(&entry_path, message))?;
+        allowed.push(text.to_string());
+    }
+    DialGuard::from_allow_entries(&allowed)
+        .map_err(|message| invalid(&format!("{path}.dial_allow"), message))
 }
 
 fn parse_trusted_proxies(value: Option<&Value>, path: &str) -> HttpResult<Vec<IpNet>> {
@@ -3287,17 +3457,34 @@ fn parse_health_checks(
     Ok((active, passive))
 }
 
+/// The body of a proxy-generated `502 Bad Gateway`.
+///
+/// The detail (dial templates, attacker-controlled placeholder expansions, resolver and I/O errors)
+/// is logged, never reflected to the client (SEC-MEDIUM-PROXY C5). Stock Caddy answers these
+/// failures with an empty 502 body, so the client sees no more than it does there. The detail is
+/// logged debug-escaped so request-derived control characters cannot forge log lines.
+fn bad_gateway_body(detail: &str) -> &'static str {
+    // `tracing` at debug level, not a synchronous stderr write: any client can trigger this per
+    // request, and a blocking write to a backpressured stderr would stall the async worker.
+    tracing::debug!(detail = ?detail, "reverse_proxy: 502 Bad Gateway");
+    "502 Bad Gateway"
+}
+
 /// The handler factory installed in the HTTP router builder.
 pub fn handler_factory() -> CustomHandlerFactory {
     Arc::new(|value: &Value, path: &str, context: &HandlerBuildContext| {
         let name = value.get("handler").and_then(Value::as_str);
         if name == Some("reverse_proxy") {
-            Ok(Some(Arc::new(ReverseProxyHandler::from_json_with_profile(
-                value,
-                path,
-                Some(format!("caddy-rs/{}", env!("CARGO_PKG_VERSION"))),
-                security_profile_enabled(context),
-            )?)))
+            Ok(Some(Arc::new(
+                ReverseProxyHandler::from_json_with_stock_compat(
+                    value,
+                    path,
+                    Some(format!("caddy-rs/{}", env!("CARGO_PKG_VERSION"))),
+                    security_profile_enabled(context),
+                    context.stock_compat,
+                )?
+                .with_dial_guard(!context.stock_compat),
+            )))
         } else {
             Ok(None)
         }
@@ -3326,12 +3513,16 @@ pub fn handler_factory_with_status_sink_and_server_software(
         move |value: &Value, path: &str, context: &HandlerBuildContext| {
             let name = value.get("handler").and_then(Value::as_str);
             if name == Some("reverse_proxy") {
-                let handler = Arc::new(ReverseProxyHandler::from_json_with_profile(
-                    value,
-                    path,
-                    server_software.clone(),
-                    security_profile_enabled(context),
-                )?);
+                let handler = Arc::new(
+                    ReverseProxyHandler::from_json_with_stock_compat(
+                        value,
+                        path,
+                        server_software.clone(),
+                        security_profile_enabled(context),
+                        context.stock_compat,
+                    )?
+                    .with_dial_guard(!context.stock_compat),
+                );
                 sink.register(&handler);
                 let shared: SharedHandler = handler;
                 Ok(Some(shared))
@@ -3796,7 +3987,10 @@ mod tests {
         .await;
         let router = Arc::new(build_chain_router(vec![serde_json::json!({
             "handler": "reverse_proxy",
-            "upstreams": [{"dial": "{http.request.hostport}"}]
+            "upstreams": [{"dial": "{http.request.hostport}"}],
+            // The test upstream is on loopback; request-derived dials to loopback need an explicit
+            // allow entry (SEC-MEDIUM-PROXY C3).
+            "dial_allow": ["127.0.0.0/8"]
         })]));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listener_address = listener.local_addr().unwrap();
@@ -3957,9 +4151,27 @@ mod tests {
             panic!("expected a 502 response");
         };
         assert_eq!(response.status, StatusCode::BAD_GATEWAY);
-        let body = body_text(&response);
-        assert!(body.contains("empty after placeholder expansion"), "{body}");
-        assert!(body.contains("{http.request.header.X-Upstream}"), "{body}");
+        // The body is generic (SEC-MEDIUM-PROXY C5): the dial template and the attacker-controlled
+        // expansion are logged, never reflected to the client. The located detail stays on the
+        // internal error that gets logged.
+        assert_eq!(body_text(&response), "502 Bad Gateway");
+        let upstream = Arc::clone(&handler.upstreams()[0]);
+        let detail = handler
+            .resolve_target(
+                &upstream,
+                &get_request("/dynamic", Some("203.0.113.7:5555")),
+            )
+            .err()
+            .expect("empty expansion fails")
+            .to_string();
+        assert!(
+            detail.contains("empty after placeholder expansion"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("{http.request.header.X-Upstream}"),
+            "{detail}"
+        );
 
         // A non-address expansion is rejected before dialing.
         let mut request = get_request("/dynamic", Some("203.0.113.7:5555"));
@@ -3970,9 +4182,18 @@ mod tests {
             panic!("expected a 502 response");
         };
         assert_eq!(response.status, StatusCode::BAD_GATEWAY);
-        let body = body_text(&response);
-        assert!(body.contains("invalid dial address"), "{body}");
-        assert!(body.contains("not an address"), "{body}");
+        assert_eq!(body_text(&response), "502 Bad Gateway");
+        let mut request = get_request("/dynamic", Some("203.0.113.7:5555"));
+        request
+            .headers
+            .insert("x-upstream", "not an address".parse().unwrap());
+        let detail = handler
+            .resolve_target(&upstream, &request)
+            .err()
+            .expect("invalid expansion fails")
+            .to_string();
+        assert!(detail.contains("invalid dial address"), "{detail}");
+        assert!(detail.contains("not an address"), "{detail}");
     }
 
     #[tokio::test]
@@ -3998,6 +4219,485 @@ mod tests {
             StatusCode::OK,
             "missing known-but-empty placeholder must be removed, not kept literally"
         );
+    }
+
+    /// Handler whose dial is the request header `X-Backend`, with the SEC-MEDIUM-PROXY C3 egress
+    /// guard on (the production default) and the given extra handler fields.
+    fn ssrf_handler(extra: Value, guard: bool) -> ReverseProxyHandler {
+        let mut value = serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "{http.request.header.X-Backend}"}]
+        });
+        for (key, field) in extra.as_object().cloned().unwrap_or_default() {
+            value[key] = field;
+        }
+        build_handler(value).with_dial_guard(guard)
+    }
+
+    fn backend_request(backend: &str) -> Request {
+        let mut request = get_request("/ssrf", Some("203.0.113.7:5555"));
+        request
+            .headers
+            .insert("x-backend", backend.parse().unwrap());
+        request
+    }
+
+    async fn status_for(handler: &ReverseProxyHandler, backend: &str) -> StatusCode {
+        let Outcome::Respond(response) = handler.handle(backend_request(backend)).await.unwrap()
+        else {
+            panic!("expected a response");
+        };
+        response.status
+    }
+
+    #[tokio::test]
+    async fn request_derived_dials_cannot_reach_restricted_addresses_by_default() {
+        let (broken, connections) = spawn_broken_upstream().await;
+        let handler = ssrf_handler(serde_json::json!({}), true);
+        let loopback_port = broken.rsplit_once(':').unwrap().1;
+        for backend in [
+            broken.clone(),
+            "169.254.169.254:80".to_string(),
+            "[::1]:80".to_string(),
+            "[fe80::1]:80".to_string(),
+            "[::ffff:169.254.169.254]:80".to_string(),
+            "0.0.0.0:80".to_string(),
+            // A host name that resolves to loopback is refused at connect time.
+            format!("localhost:{loopback_port}"),
+            "unix//var/run/docker.sock".to_string(),
+        ] {
+            assert_eq!(
+                status_for(&handler, &backend).await,
+                StatusCode::BAD_GATEWAY,
+                "{backend} must be refused"
+            );
+        }
+        assert_eq!(
+            connections.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no connection may reach the restricted loopback upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn dial_allow_and_stock_compat_permit_what_the_guard_denies() {
+        let echo = spawn_echo_upstream().await;
+        // Allowed by the placeholder-free `dial_allow` list.
+        let allowed = ssrf_handler(serde_json::json!({"dial_allow": ["127.0.0.0/8"]}), true);
+        assert_eq!(status_for(&allowed, &echo).await, StatusCode::OK);
+        // The allow list is not a wildcard: other restricted targets stay refused.
+        assert_eq!(
+            status_for(&allowed, "169.254.169.254:80").await,
+            StatusCode::BAD_GATEWAY
+        );
+        // `stock_compat true` (guard off) is stock Caddy: anything the expansion yields is dialed.
+        let stock = ssrf_handler(serde_json::json!({}), false);
+        assert_eq!(status_for(&stock, &echo).await, StatusCode::OK);
+    }
+
+    /// Handler-level trusted-proxy ranges follow the shared mapped-address semantics.
+    #[test]
+    fn handler_ip_nets_match_mapped_spellings_both_ways() {
+        let plain = IpNet::parse("10.0.0.0/8").unwrap();
+        assert!(plain.contains("::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!plain.contains("::ffff:11.1.2.3".parse().unwrap()));
+        let mapped = IpNet::parse("::ffff:10.0.0.0/104").unwrap();
+        assert!(mapped.contains("10.1.2.3".parse().unwrap()));
+        assert!(mapped.contains("::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!mapped.contains("11.1.2.3".parse().unwrap()));
+    }
+
+    /// `bad_gateway_body` runs once per failing request and the detail is client-influenced, so it
+    /// must not write synchronously to stderr (log flood, blocking on a backpressured pipe).
+    #[test]
+    fn bad_gateway_body_does_not_write_to_stderr() {
+        let source = include_str!("handler.rs");
+        let start = source
+            .find("fn bad_gateway_body")
+            .expect("function present");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").expect("function end")];
+        assert!(!body.contains("eprintln!"), "{body}");
+        assert!(body.contains("tracing::"), "{body}");
+    }
+
+    /// A `dynamic_upstreams` source stand-in that returns one fixed host.
+    #[derive(Debug)]
+    struct TestSource {
+        dial: String,
+        request_derived: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::dynamic_upstreams::DynamicUpstreamSource for TestSource {
+        async fn get_upstreams(
+            &self,
+            _request: &caddy_rs_http::Request,
+        ) -> Result<Vec<String>, String> {
+            Ok(vec![self.dial.clone()])
+        }
+        fn reset_cache(&self, _request: &caddy_rs_http::Request) {}
+        fn describe(&self) -> String {
+            "test source".to_string()
+        }
+        fn request_derived(&self) -> bool {
+            self.request_derived
+        }
+    }
+
+    fn connections(counter: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Discovery hosts are guarded only when the source's name/port templates are request-derived
+    /// (SEC-MEDIUM-PROXY C3 review): `dynamic_upstreams { name localhost }` or Consul answering
+    /// 127.0.0.1 must keep working with the guard on.
+    #[tokio::test]
+    async fn dynamic_source_hosts_are_guarded_only_when_request_derived() {
+        for (request_derived, guard, expect_connections) in [
+            (false, true, 1),
+            (true, true, 0),
+            (true, false, 1),
+            (false, false, 1),
+        ] {
+            let (broken, counter) = spawn_broken_upstream().await;
+            let handler = build_handler(serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": []
+            }))
+            .with_dynamic_source(Arc::new(TestSource {
+                dial: broken,
+                request_derived,
+            }))
+            .with_dial_guard(guard);
+            let _ = handler
+                .handle(get_request("/dyn", Some("203.0.113.7:5555")))
+                .await;
+            assert_eq!(
+                connections(&counter),
+                expect_connections,
+                "request_derived={request_derived} guard={guard}"
+            );
+        }
+    }
+
+    /// The same classification for placeholder dials: `{env.*}` and literals are operator
+    /// controlled and keep working against loopback; request data is guarded.
+    #[tokio::test]
+    async fn placeholder_dials_are_guarded_only_when_request_derived() {
+        let (broken, counter) = spawn_broken_upstream().await;
+        let port = broken.rsplit_once(':').unwrap().1.to_string();
+        {
+            // Serialise the process-environment writes (they race other readers otherwise); the
+            // variables are unique to this test and set before any request runs.
+            static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _guard = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::env::set_var("CADDY_RS_C3_BACKEND", &broken);
+            std::env::set_var("CADDY_RS_C3_PORT", &port);
+        }
+        for (dial, request_derived) in [
+            ("{env.CADDY_RS_C3_BACKEND}", false),
+            ("127.0.0.1:{env.CADDY_RS_C3_PORT}", false),
+            ("{http.request.header.X-Backend}", true),
+            ("127.0.0.1:{http.request.header.X-Port}", true),
+            (
+                "{env.CADDY_RS_C3_BACKEND}{http.request.header.X-Empty}",
+                true,
+            ),
+        ] {
+            let before = connections(&counter);
+            let handler = build_handler(serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": dial}]
+            }))
+            .with_dial_guard(true);
+            let mut request = get_request("/p", Some("203.0.113.7:5555"));
+            request.headers.insert("x-backend", broken.parse().unwrap());
+            request.headers.insert("x-port", port.parse().unwrap());
+            let _ = handler.handle(request).await;
+            let reached = connections(&counter) - before;
+            assert_eq!(
+                reached,
+                usize::from(!request_derived),
+                "`{dial}` request_derived={request_derived}"
+            );
+        }
+    }
+
+    /// `Replacer::get` only resolves `env.*` itself; `system.*`, `time.*` and `$VAR` fall through to
+    /// request variables, and a `vars` handler expands its KEYS from the request. So a client can
+    /// create a variable with one of those names (second-round review): only `env.*` may be treated
+    /// as operator-controlled.
+    #[tokio::test]
+    async fn vars_handler_cannot_smuggle_request_data_into_system_placeholders() {
+        use caddy_rs_http::Handler as _;
+        let vars = caddy_rs_http::VarsHandler::from_json(
+            &serde_json::json!({
+                "handler": "vars",
+                "{http.request.header.K}": "{http.request.header.V}"
+            }),
+            "vars",
+        )
+        .unwrap();
+        for (dial, name) in [
+            ("{system.hostname}", "system.hostname"),
+            ("{time.now.unix}", "time.now.unix"),
+            ("{$SMUGGLED}", "$SMUGGLED"),
+        ] {
+            let (broken, counter) = spawn_broken_upstream().await;
+            let handler = build_handler(serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": dial}]
+            }))
+            .with_dial_guard(true);
+            let mut request = get_request("/v", Some("203.0.113.7:5555"));
+            request.headers.insert("k", name.parse().unwrap());
+            request.headers.insert("v", broken.parse().unwrap());
+            let Outcome::Continue(request) = vars.handle(request).await.unwrap() else {
+                panic!("vars continues");
+            };
+            let _ = handler.handle(request).await;
+            assert_eq!(connections(&counter), 0, "`{dial}` reached loopback");
+        }
+    }
+
+    /// FastCGI with `dynamic_upstreams` used to dial through a bare `TcpStream::connect`, skipping
+    /// the guard (SEC-MEDIUM-PROXY C3 review).
+    #[tokio::test]
+    async fn fastcgi_dynamic_hosts_go_through_the_dial_guard() {
+        for (request_derived, guard, expect_connections) in
+            [(true, true, 0), (true, false, 1), (false, true, 1)]
+        {
+            let (broken, counter) = spawn_broken_upstream().await;
+            let handler = build_handler(serde_json::json!({
+                "handler": "reverse_proxy",
+                "upstreams": [],
+                "transport": {"protocol": "fastcgi"}
+            }))
+            .with_dynamic_source(Arc::new(TestSource {
+                dial: broken,
+                request_derived,
+            }))
+            .with_dial_guard(guard);
+            let Outcome::Respond(response) = handler
+                .handle(get_request("/index.php", Some("203.0.113.7:5555")))
+                .await
+                .unwrap()
+            else {
+                panic!("expected a response");
+            };
+            assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                connections(&counter),
+                expect_connections,
+                "request_derived={request_derived} guard={guard}"
+            );
+        }
+    }
+
+    /// The refusal must not echo the attacker-chosen target (or the configured template) back.
+    #[tokio::test]
+    async fn refusals_do_not_reflect_the_expanded_dial_in_the_response() {
+        let handler = ssrf_handler(serde_json::json!({}), true);
+        let Outcome::Respond(response) = handler
+            .handle(backend_request("169.254.169.254:80"))
+            .await
+            .unwrap()
+        else {
+            panic!("expected a response");
+        };
+        assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body_text(&response), "502 Bad Gateway");
+    }
+
+    /// The `cookie` policy's secret default follows `stock_compat` (SEC-MEDIUM-PROXY C5).
+    #[test]
+    fn cookie_secret_default_follows_stock_compat() {
+        let value = serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "localhost:9000"}, {"dial": "localhost:9001"}],
+            "load_balancing": {"selection_policy": {
+                "policy": "cookie", "name": "lb", "fallback": {"policy": "first"}
+            }}
+        });
+        for (stock_compat, forgeable) in [(false, false), (true, true)] {
+            let handler = ReverseProxyHandler::from_json_with_stock_compat(
+                &value,
+                "handler",
+                None,
+                false,
+                stock_compat,
+            )
+            .unwrap();
+            let mut request = get_request("/", None);
+            request.headers.insert(
+                http::header::COOKIE,
+                format!(
+                    "lb={}",
+                    crate::digest::hmac_sha256_hex(b"", b"localhost:9001")
+                )
+                .parse()
+                .unwrap(),
+            );
+            let chosen = handler
+                .balancer
+                .select(&handler.upstreams, &request, &mut Response::ok())
+                .unwrap();
+            assert_eq!(
+                chosen.dial == "localhost:9001",
+                forgeable,
+                "stock_compat={stock_compat}"
+            );
+        }
+    }
+
+    /// The production factory wires the guard to the generation's `stock_compat`.
+    #[tokio::test]
+    async fn factory_enables_the_dial_guard_unless_stock_compat() {
+        let echo = spawn_echo_upstream().await;
+        let value = serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "{http.request.header.X-Backend}"}]
+        });
+        let factory = handler_factory();
+        for (stock_compat, expected) in [(false, StatusCode::BAD_GATEWAY), (true, StatusCode::OK)] {
+            let context = HandlerBuildContext {
+                stock_compat,
+                ..HandlerBuildContext::default()
+            };
+            let built = factory(&value, "handler", &context).unwrap().unwrap();
+            let Outcome::Respond(response) = built.handle(backend_request(&echo)).await.unwrap()
+            else {
+                panic!("expected a response");
+            };
+            assert_eq!(response.status, expected, "stock_compat={stock_compat}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_expansions_need_a_dial_allow_prefix() {
+        let request = |backend: &str| backend_request(backend);
+        let denied = ssrf_handler(serde_json::json!({}), true);
+        let upstream = Arc::clone(&denied.upstreams()[0]);
+        assert!(denied
+            .resolve_target(&upstream, &request("unix//var/run/docker.sock"))
+            .is_err());
+        let allowed = ssrf_handler(serde_json::json!({"dial_allow": ["unix//run/app"]}), true);
+        let upstream = Arc::clone(&allowed.upstreams()[0]);
+        assert!(allowed
+            .resolve_target(&upstream, &request("unix//run/app/web.sock"))
+            .is_ok());
+        for refused in [
+            "unix//run/app/../docker.sock",
+            "unix//var/run/docker.sock",
+            "unix//run/app2/web.sock",
+            "unix/run/app/web.sock",
+        ] {
+            assert!(
+                allowed
+                    .resolve_target(&upstream, &request(refused))
+                    .is_err(),
+                "{refused} must be refused"
+            );
+        }
+        // Guard off (stock_compat): stock behaviour, any unix target is accepted.
+        let stock = ssrf_handler(serde_json::json!({}), false);
+        let upstream = Arc::clone(&stock.upstreams()[0]);
+        assert!(stock
+            .resolve_target(&upstream, &request("unix//var/run/docker.sock"))
+            .is_ok());
+    }
+
+    #[test]
+    fn dial_allow_is_validated_at_load() {
+        for (value, fragment) in [
+            (serde_json::json!("10.0.0.0/8"), "must be an array"),
+            (serde_json::json!([5]), "dial_allow[0]"),
+            (serde_json::json!(["good.example.com"]), "dial_allow[0]"),
+            (
+                serde_json::json!(["10.0.0.0/8", "unix/relative"]),
+                "dial_allow[1]",
+            ),
+        ] {
+            let error = ReverseProxyHandler::from_json(
+                &serde_json::json!({
+                    "handler": "reverse_proxy",
+                    "upstreams": [{"dial": "{http.request.header.X-Backend}"}],
+                    "dial_allow": value
+                }),
+                "handler",
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{value} must be rejected"));
+            assert!(error.to_string().contains(fragment), "{error}");
+        }
+    }
+
+    #[test]
+    fn dynamic_client_cache_is_bounded_and_evicts_least_recently_used() {
+        let handler = ssrf_handler(serde_json::json!({}), true);
+        let upstream = Arc::clone(&handler.upstreams()[0]);
+        let backend = |index: usize| format!("198.51.100.{}:{}", index % 250, 1000 + index / 250);
+        let resolve = |index: usize| {
+            handler
+                .resolve_target(&upstream, &backend_request(&backend(index)))
+                .unwrap();
+        };
+        for index in 0..MAX_DYNAMIC_CLIENTS {
+            resolve(index);
+        }
+        let cached = |handler: &ReverseProxyHandler, index: usize| {
+            handler
+                .dynamic_clients
+                .lock()
+                .unwrap()
+                .contains_key(&backend(index))
+        };
+        assert_eq!(
+            handler.dynamic_clients.lock().unwrap().len(),
+            MAX_DYNAMIC_CLIENTS
+        );
+        // Touch entry 0 so entry 1 becomes the least recently used one.
+        resolve(0);
+        resolve(MAX_DYNAMIC_CLIENTS);
+        assert_eq!(
+            handler.dynamic_clients.lock().unwrap().len(),
+            MAX_DYNAMIC_CLIENTS,
+            "the cache must stay at its cap"
+        );
+        assert!(cached(&handler, 0), "recently used entry survives");
+        assert!(!cached(&handler, 1), "least recently used entry is evicted");
+        assert!(cached(&handler, MAX_DYNAMIC_CLIENTS), "new entry is cached");
+        // A flood of distinct expansions never grows the cache past the cap.
+        for index in MAX_DYNAMIC_CLIENTS + 1..MAX_DYNAMIC_CLIENTS * 2 {
+            resolve(index);
+        }
+        assert_eq!(
+            handler.dynamic_clients.lock().unwrap().len(),
+            MAX_DYNAMIC_CLIENTS
+        );
+    }
+
+    #[test]
+    fn dynamic_hosts_are_bounded_but_keep_the_current_pool() {
+        let handler = build_handler(serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "203.0.113.1:80"}]
+        }));
+        for index in 0..MAX_DYNAMIC_HOSTS * 3 {
+            let dial = format!("198.51.100.{}:{}", index % 250, 1000 + index / 250);
+            let provisioned = handler.provision_dynamic_hosts(std::slice::from_ref(&dial));
+            assert_eq!(
+                provisioned.len(),
+                1,
+                "the current pool is always provisioned"
+            );
+            assert_eq!(provisioned[0].dial, dial);
+            assert!(handler.dynamic_hosts.lock().unwrap().len() <= MAX_DYNAMIC_HOSTS);
+        }
     }
 
     #[test]

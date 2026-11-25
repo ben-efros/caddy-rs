@@ -32,6 +32,7 @@ fn authn() -> AuthnService<MemoryUserStore> {
             time_cost: 1,
             parallelism: 1,
         },
+        allow_weak_argon2_params: true,
         ..AuthnConfig::default()
     };
     AuthnService::new(MemoryUserStore::new(), authn_config).expect("create authn service")
@@ -55,6 +56,7 @@ fn server_with_totp_window() -> (TempDir, TestServer, AuthnService<MemoryUserSto
             parallelism: 1,
         },
         totp_window: caddy_rs_authn::TotpWindow::PlusMinusOne,
+        allow_weak_argon2_params: true,
         ..AuthnConfig::default()
     };
     let authn =
@@ -252,6 +254,47 @@ async fn setup_reports_configured_after_the_first_administrator() {
         body.setup,
         "health and setup agree that the server is configured"
     );
+}
+
+#[tokio::test]
+async fn setup_enforces_the_password_policy_server_side() {
+    let (_dir, server, _authn) = server_with_authn();
+    for (password, field) in [
+        ("", "password"),
+        ("short", "password"),
+        ("1234567", "password"),
+    ] {
+        let response = server
+            .post("/api/v1/auth/setup")
+            .json(&serde_json::json!({"username": "admin", "password": password}))
+            .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::BAD_REQUEST,
+            "{password:?}: {}",
+            response.text()
+        );
+        let body: ApiErrorResponse = response.json();
+        assert_eq!(body.error.code, ErrorCode::Validation);
+        assert_eq!(body.error.location.as_deref(), Some(field));
+        assert!(
+            body.error.message.contains("at least 8"),
+            "{}",
+            body.error.message
+        );
+    }
+    let too_long = server
+        .post("/api/v1/auth/setup")
+        .json(&serde_json::json!({"username": "admin", "password": "x".repeat(2000)}))
+        .await;
+    assert_eq!(too_long.status_code(), StatusCode::BAD_REQUEST);
+
+    // The rejections created nothing: setup is still open and an 8-character password works.
+    let ok = server
+        .post("/api/v1/auth/setup")
+        .json(&serde_json::json!({"username": "admin", "password": "12345678"}))
+        .await;
+    assert_eq!(ok.status_code(), StatusCode::CREATED, "{}", ok.text());
 }
 
 #[tokio::test]
@@ -729,6 +772,95 @@ async fn host_detail_exposes_a_stored_security_headers_override() {
     assert_eq!(
         detail.revision, 2,
         "storing headers bumps the host revision"
+    );
+}
+
+#[tokio::test]
+async fn an_editor_cannot_store_placeholder_text_in_host_security_headers() {
+    // E3: the editor role can update host headers without `settings:admin`. A CSP of
+    // `{env.CF_API_TOKEN}` would be expanded by the data plane into every response of the site.
+    let (_dir, server, authn) = server_with_authn();
+    let admin = first_admin(&server).await;
+    let created = server
+        .post("/api/v1/hosts")
+        .add_header("Authorization", bearer(&admin.access_token))
+        .json(&dead_body("leak.example.com"))
+        .await;
+    assert_eq!(created.status_code(), StatusCode::CREATED);
+    let host: HostResponse = created.json();
+    let (_, editor) = user_tokens(&authn, "eddie", caddy_rs_authn::Role::editor()).await;
+
+    for field in [
+        "content_security_policy",
+        "permissions_policy",
+        "x_frame_options",
+        "x_content_type_options",
+        "referrer_policy",
+    ] {
+        for payload in ["{env.CF_API_TOKEN}", "{file./etc/passwd}"] {
+            let response = server
+                .put(&format!("/api/v1/hosts/{}/security-headers", host.id))
+                .add_header("Authorization", bearer(&editor.access_token))
+                .json(&serde_json::json!({ field: payload }))
+                .await;
+            assert_eq!(
+                response.status_code(),
+                StatusCode::BAD_REQUEST,
+                "{field}={payload} must be refused: {}",
+                response.text()
+            );
+            let envelope = error_envelope(&response);
+            assert_eq!(envelope.error.code, ErrorCode::Validation);
+            assert!(
+                envelope.error.message.contains(field),
+                "the error names the field: {}",
+                envelope.error.message
+            );
+        }
+    }
+
+    // Nothing was stored, and a legitimate value from the same caller still works.
+    let detail: HostResponse = server
+        .get(&format!("/api/v1/hosts/{}", host.id))
+        .await
+        .json();
+    assert!(detail.security_headers.is_none(), "nothing was persisted");
+    let ok = server
+        .put(&format!("/api/v1/hosts/{}/security-headers", host.id))
+        .add_header("Authorization", bearer(&editor.access_token))
+        .json(&serde_json::json!({
+            "content_security_policy": "default-src 'self'",
+            "permissions_policy": "geolocation=()"
+        }))
+        .await;
+    assert_eq!(ok.status_code(), StatusCode::OK, "{}", ok.text());
+}
+
+#[tokio::test]
+async fn host_creation_rejects_a_placeholder_upstream() {
+    let (_dir, server, _runtime) = server_with_runtime();
+    let response = server
+        .post("/api/v1/hosts")
+        .json(&serde_json::json!({
+            "domains": ["ssrf.example.com"],
+            "spec": {"kind": "proxy", "spec": {
+                "upstream": {"scheme": "http", "host": "{http.request.header.X-Target}", "port": 80}
+            }}
+        }))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        StatusCode::BAD_REQUEST,
+        "a placeholder upstream must be refused: {}",
+        response.text()
+    );
+    assert!(
+        error_envelope(&response)
+            .error
+            .message
+            .contains("upstream host"),
+        "{}",
+        response.text()
     );
 }
 
@@ -2863,6 +2995,7 @@ async fn me_reports_an_expired_access_token_as_401() {
             time_cost: 1,
             parallelism: 1,
         },
+        allow_weak_argon2_params: true,
         ..AuthnConfig::default()
     };
     let authn =
@@ -3350,6 +3483,171 @@ async fn a_replayed_confirm_code_is_refused() {
         "a replayed code must be refused: {}",
         replay.text()
     );
+}
+
+#[tokio::test]
+async fn a_non_admin_can_enrol_and_confirm_their_own_totp_factor() {
+    // The /auth/totp/* handlers act only on the caller's own account, so they must not need
+    // `settings:admin` (the default-deny capability for an unlisted mutating path).
+    let (_dir, server, authn) = server_with_authn();
+    let _admin = first_admin(&server).await;
+    let (_viewer, tokens) = user_tokens(&authn, "vera", caddy_rs_authn::Role::viewer()).await;
+
+    let enrollment = begin_enrollment(&server, &tokens.access_token).await;
+    let confirmed = confirm_enrollment(
+        &server,
+        &tokens.access_token,
+        &totp_code_for(&enrollment.otpauth_uri),
+    )
+    .await;
+    assert_eq!(
+        confirmed.status_code(),
+        StatusCode::OK,
+        "a viewer manages their own factor: {}",
+        confirmed.text()
+    );
+    assert!(confirmed.json::<EnrollmentStatus>().totp_enabled);
+}
+
+#[tokio::test]
+async fn an_active_factor_cannot_be_replaced_without_the_current_code() {
+    let (_dir, server, authn) = server_with_totp_window();
+    let _admin = first_admin(&server).await;
+    let (_user, tokens) = user_tokens(&authn, "vera", caddy_rs_authn::Role::editor()).await;
+    let enrollment = begin_enrollment(&server, &tokens.access_token).await;
+    // Steps are consumed strictly in order inside the +-1 window: confirm with the previous step,
+    // log in with the current one, prove possession with the next one.
+    let confirmed = confirm_enrollment(
+        &server,
+        &tokens.access_token,
+        &totp_code_for_offset(&enrollment.otpauth_uri, -1),
+    )
+    .await;
+    assert_eq!(
+        confirmed.status_code(),
+        StatusCode::OK,
+        "{}",
+        confirmed.text()
+    );
+    let login = server
+        .post("/api/v1/auth/login")
+        .json(&serde_json::json!({
+            "username": "vera",
+            "password": SETUP_PASSWORD,
+            "totp_code": totp_code_for_offset(&enrollment.otpauth_uri, 0),
+        }))
+        .await;
+    assert_eq!(login.status_code(), StatusCode::OK, "{}", login.text());
+    let session: SessionTokens = login.json();
+
+    // The attack: a stolen access token calls setup to strip the factor.
+    let bare = server
+        .post("/api/v1/auth/totp/setup")
+        .add_header("Authorization", bearer(&session.access_token))
+        .await;
+    assert_eq!(bare.status_code(), StatusCode::CONFLICT, "{}", bare.text());
+    let wrong = server
+        .post("/api/v1/auth/totp/setup")
+        .add_header("Authorization", bearer(&session.access_token))
+        .json(&serde_json::json!({"totpCode": "abcdef"}))
+        .await;
+    assert_eq!(
+        wrong.status_code(),
+        StatusCode::UNAUTHORIZED,
+        "{}",
+        wrong.text()
+    );
+    let password_only = server
+        .post("/api/v1/auth/login")
+        .json(&serde_json::json!({"username": "vera", "password": SETUP_PASSWORD}))
+        .await;
+    assert_eq!(
+        password_only.status_code(),
+        StatusCode::UNAUTHORIZED,
+        "the factor must still gate login after the refused setups"
+    );
+
+    // With proof of the live factor a replacement secret is issued, beside the old one.
+    let replaced = server
+        .post("/api/v1/auth/totp/setup")
+        .add_header("Authorization", bearer(&session.access_token))
+        .json(&serde_json::json!({"totpCode": totp_code_for_offset(&enrollment.otpauth_uri, 1)}))
+        .await;
+    assert_eq!(
+        replaced.status_code(),
+        StatusCode::OK,
+        "{}",
+        replaced.text()
+    );
+    let replacement: SetupEnrollment = replaced.json();
+    assert_ne!(replacement.secret, enrollment.secret);
+    let still_gated = server
+        .post("/api/v1/auth/login")
+        .json(&serde_json::json!({"username": "vera", "password": SETUP_PASSWORD}))
+        .await;
+    assert_eq!(
+        still_gated.status_code(),
+        StatusCode::UNAUTHORIZED,
+        "an unconfirmed replacement must not weaken login"
+    );
+}
+
+#[tokio::test]
+async fn totp_confirm_guessing_is_throttled_with_429_and_retry_after() {
+    let (_dir, server, _authn) = server_with_authn();
+    let _admin = first_admin(&server).await;
+    let tokens = login(&server, "admin", SETUP_PASSWORD).await;
+    let enrollment = begin_enrollment(&server, &tokens.access_token).await;
+
+    // Five wrong guesses by a caller holding a (stolen) access token spend the budget ...
+    for _ in 0..5 {
+        let wrong = confirm_enrollment(&server, &tokens.access_token, "abcdef").await;
+        assert_eq!(wrong.status_code(), StatusCode::UNAUTHORIZED);
+    }
+    // ... after which even the correct code is refused without being evaluated.
+    let code = totp_code_for(&enrollment.otpauth_uri);
+    let blocked = confirm_enrollment(&server, &tokens.access_token, &code).await;
+    assert_eq!(blocked.status_code(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(error_envelope(&blocked).error.code, ErrorCode::RateLimited);
+    let retry_after = blocked
+        .header("retry-after")
+        .to_str()
+        .expect("a Retry-After header")
+        .parse::<u64>()
+        .expect("seconds");
+    assert!((1..=30).contains(&retry_after), "{retry_after}");
+}
+
+#[tokio::test]
+async fn totp_disable_guessing_is_throttled() {
+    let (_dir, server, _authn) = server_with_totp_window();
+    let _admin = first_admin(&server).await;
+    let tokens = login(&server, "admin", SETUP_PASSWORD).await;
+    let enrollment = begin_enrollment(&server, &tokens.access_token).await;
+    let code = totp_code_for(&enrollment.otpauth_uri);
+    assert_eq!(
+        confirm_enrollment(&server, &tokens.access_token, &code)
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+    let session = login_with_totp(&server, "admin", SETUP_PASSWORD, &enrollment.otpauth_uri).await;
+
+    for _ in 0..5 {
+        let bad = server
+            .post("/api/v1/auth/totp/disable")
+            .add_header("Authorization", bearer(&session.access_token))
+            .json(&serde_json::json!({"totpCode": "abcdef"}))
+            .await;
+        assert_eq!(bad.status_code(), StatusCode::UNAUTHORIZED);
+    }
+    let blocked = server
+        .post("/api/v1/auth/totp/disable")
+        .add_header("Authorization", bearer(&session.access_token))
+        .json(&serde_json::json!({"totpCode": "abcdef"}))
+        .await;
+    assert_eq!(blocked.status_code(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(blocked.maybe_header("retry-after").is_some());
 }
 
 #[tokio::test]

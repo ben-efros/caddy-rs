@@ -21,6 +21,13 @@ use crate::metrics::L4Metrics;
 /// The default per-route idle timeout, matching Caddy's 30 s.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The default cap on establishing the upstream TCP connection (SEC-MEDIUM-PROXY C6).
+///
+/// Without a bound an upstream that never answers the SYN pins the accepted client connection and
+/// its descriptor until the OS gives up (minutes), so a flood of connections to a black-holed
+/// upstream exhausts descriptors. `0` disables it, like every other duration here.
+pub const DEFAULT_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// How a route's proxy stage behaves.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProxyOptions {
@@ -28,6 +35,8 @@ pub struct ProxyOptions {
     upstream: String,
     /// Per-route idle timeout; `None` disables it.
     idle_timeout: Option<Duration>,
+    /// Cap on establishing the upstream connection; `None` disables it.
+    dial_timeout: Option<Duration>,
     /// PROXY header bytes to write before any payload byte (already rendered by the
     /// `proxy_protocol` stage).
     proxy_header: Option<Vec<u8>>,
@@ -39,6 +48,7 @@ impl ProxyOptions {
         Self {
             upstream: upstream.into(),
             idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
+            dial_timeout: Some(DEFAULT_DIAL_TIMEOUT),
             proxy_header: None,
         }
     }
@@ -51,6 +61,21 @@ impl ProxyOptions {
             Some(timeout)
         };
         self
+    }
+
+    /// Overrides the upstream dial timeout; `Duration::ZERO` disables it.
+    pub fn with_dial_timeout(mut self, timeout: Duration) -> Self {
+        self.dial_timeout = if timeout.is_zero() {
+            None
+        } else {
+            Some(timeout)
+        };
+        self
+    }
+
+    /// The configured dial timeout, `None` when disabled.
+    pub fn dial_timeout(&self) -> Option<Duration> {
+        self.dial_timeout
     }
 
     /// The configured idle timeout, `None` when disabled.
@@ -106,6 +131,24 @@ impl std::fmt::Display for ProxyError {
 
 impl std::error::Error for ProxyError {}
 
+/// Runs the dial `connect`, bounded by `limit` when one is set.
+async fn dial_with_timeout<F>(
+    connect: F,
+    limit: Option<Duration>,
+    upstream: &str,
+) -> Result<TcpStream, ProxyError>
+where
+    F: std::future::Future<Output = std::io::Result<TcpStream>>,
+{
+    let result = match limit {
+        Some(limit) => tokio::time::timeout(limit, connect).await.map_err(|_| {
+            ProxyError::Connect(format!("dialing {upstream} timed out after {limit:?}"))
+        })?,
+        None => connect.await,
+    };
+    result.map_err(|error| ProxyError::Connect(error.to_string()))
+}
+
 /// Dials `options.upstream` and proxies `client` to it.
 ///
 /// Returns the copied totals. The PROXY header, when configured, is written to the upstream
@@ -119,9 +162,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let mut client = client;
-    let mut upstream = TcpStream::connect(options.upstream())
-        .await
-        .map_err(|error| ProxyError::Connect(error.to_string()))?;
+    let mut upstream = dial_with_timeout(
+        TcpStream::connect(options.upstream()),
+        options.dial_timeout(),
+        options.upstream(),
+    )
+    .await?;
     if let Some(header) = options.proxy_header() {
         upstream
             .write_all(header)
@@ -286,6 +332,63 @@ mod tests {
         // Keep the peer alive until the assertion above so the duplex does not close early.
         let _ = client_peer.write_all(b"").await;
         accept.abort();
+    }
+
+    #[tokio::test]
+    async fn the_default_dial_timeout_is_ten_seconds_and_zero_disables_it() {
+        assert_eq!(
+            ProxyOptions::new("127.0.0.1:9000").dial_timeout(),
+            Some(DEFAULT_DIAL_TIMEOUT)
+        );
+        assert_eq!(DEFAULT_DIAL_TIMEOUT, Duration::from_secs(10));
+        let options = ProxyOptions::new("127.0.0.1:9000").with_dial_timeout(Duration::ZERO);
+        assert_eq!(options.dial_timeout(), None);
+        let options = ProxyOptions::new("127.0.0.1:9000").with_dial_timeout(Duration::from_secs(3));
+        assert_eq!(options.dial_timeout(), Some(Duration::from_secs(3)));
+    }
+
+    /// SEC-MEDIUM-PROXY C6: an upstream that never answers the SYN must not hold the connection (and
+    /// its file descriptor) open forever; the dial is bounded by `dial_timeout`.
+    #[tokio::test]
+    async fn a_stalled_dial_is_bounded_by_the_dial_timeout() {
+        let stalled = std::future::pending::<std::io::Result<TcpStream>>();
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3),
+            dial_with_timeout(stalled, Some(Duration::from_millis(50)), "203.0.113.1:9"),
+        )
+        .await
+        .expect("the dial must give up on its own");
+        let error = outcome.expect_err("a stalled dial times out");
+        assert!(
+            matches!(error, ProxyError::Connect(ref message) if message.contains("timed out after")),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn dial_errors_and_successes_pass_through_the_timeout() {
+        // A prompt failure is reported as such, not as a timeout.
+        let refused = std::future::ready(Err::<TcpStream, _>(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "refused",
+        )));
+        let error = dial_with_timeout(refused, Some(Duration::from_secs(5)), "x:1")
+            .await
+            .expect_err("refused");
+        assert!(
+            matches!(error, ProxyError::Connect(ref message) if message.contains("refused")),
+            "{error}"
+        );
+        // A real, prompt connection succeeds with and without a limit.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        for limit in [Some(Duration::from_secs(5)), None] {
+            dial_with_timeout(TcpStream::connect(address.clone()), limit, &address)
+                .await
+                .expect("dial succeeds");
+        }
     }
 
     #[tokio::test]

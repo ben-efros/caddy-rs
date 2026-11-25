@@ -155,12 +155,36 @@ makes a missing file non-fatal, so a plain install starts without credentials. I
 credentials deletes a stale file left by an earlier install. Supply the email and password together:
 `serve` creates no administrator unless both are set.
 
-`PM_BOOTSTRAP_ADMIN_TOTP` also works (fixed in T-AUTH-002). The bootstrap enrols a TOTP secret and
-then confirms the supplied code against it, so the code must come from the same enrolment. Because
-the secret is minted at bootstrap time, the enrolment URI is printed in the log line
-`bootstrap admin TOTP enrolled` on success and in the error if the code is rejected; scan it to keep
-receiving codes. A rejected code removes the administrator it created rather than leaving an account
-with an unconfirmed factor.
+The normal way to enrol a second factor is `POST /api/v1/auth/totp/setup` (then `/confirm`) after the
+first login: the server returns the secret and the `otpauth://` URI over the authenticated session.
+
+For unattended provisioning, set `PM_BOOTSTRAP_ADMIN_TOTP_SECRET` to a base32 secret you generated
+(at least 128 bits, 160 recommended, e.g. `head -c20 /dev/urandom | base32`) and already added to your
+authenticator. It is read from the environment only: there is deliberately no command-line flag
+(arguments are visible in the process listing), and `--help` does not print environment values.
+`serve` enrols that secret as an **active** factor for the bootstrap administrator on *every* start,
+with no code, because the user store is in memory and is rebuilt from the environment at each boot;
+the secret is the proof of possession you provisioned. Pass a current code once, at `install` time,
+in `PM_BOOTSTRAP_ADMIN_TOTP`: `install` checks it against the secret (so a mis-copied secret fails the
+install instead of locking you out at the next start) and **never stores the code**. `install` refuses
+a secret without a code, or a code without a secret, before changing anything. Neither value is
+logged or echoed in an error. `serve` ignores `PM_BOOTSTRAP_ADMIN_TOTP` (and warns if it is set), so an
+environment file written by an earlier version, which held a code, keeps working: reinstall to drop it.
+
+The environment file (`/etc/caddy-rs-pm.env`) now holds the bootstrap password **and the TOTP secret**
+together, so it is *not* a second factor against anyone who can read it. It must stay root-owned, mode
+0600; `install` writes it through a fresh 0600 temporary file renamed into place (an existing looser
+file is never truncated in place), keeps any other variables you added, and refuses values containing a
+line break.
+
+`PM_BOOTSTRAP_ADMIN_PASSWORD` must be at least 8 characters; a shorter one makes the service fail to
+start with an error naming the variable.
+
+Pass the bootstrap password and TOTP code through the environment (`PM_BOOTSTRAP_ADMIN_PASSWORD`,
+`PM_BOOTSTRAP_ADMIN_TOTP`, i.e. the 0600 environment file `install` writes), not as
+`--bootstrap-admin-password` / `--bootstrap-admin-totp`: a command-line argument is visible to every
+local user in the process listing and lands in shell history. The flags still work, for backwards
+compatibility, but the daemon logs a warning naming the flag whenever one is used.
 
 Two operational constraints follow from the code being time-based. The bootstrap only runs when no
 users exist, so this is a first-start-only path: if the code is rejected the administrator is gone

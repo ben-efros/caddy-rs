@@ -294,19 +294,20 @@ async fn windows_vectors() {
             ("/file.txt%3Astream", Expect::Forbidden),
             ("/secret.env.", Expect::Forbidden),
             ("/secret.env%20", Expect::Forbidden),
-            // Reserved device names, with and without extension, any case, superscript digits.
-            ("/CON", Expect::NotFound),
-            ("/con", Expect::NotFound),
-            ("/NUL", Expect::NotFound),
-            ("/aux.txt", Expect::NotFound),
-            ("/AUX.tar.gz", Expect::NotFound),
-            ("/dir/com1", Expect::NotFound),
-            ("/com%C2%B9", Expect::NotFound),
-            ("/lpt9", Expect::NotFound),
-            ("/CONIN$", Expect::NotFound),
-            ("/CONOUT$", Expect::NotFound),
-            ("/%63on", Expect::NotFound),
-            ("/NUL%20%20.txt", Expect::NotFound),
+            // Reserved device names (403, like stock Caddy: they are not local paths), with and
+            // without extension, any case, superscript digits.
+            ("/CON", Expect::Forbidden),
+            ("/con", Expect::Forbidden),
+            ("/NUL", Expect::Forbidden),
+            ("/aux.txt", Expect::Forbidden),
+            ("/AUX.tar.gz", Expect::Forbidden),
+            ("/dir/com1", Expect::Forbidden),
+            ("/com%C2%B9", Expect::Forbidden),
+            ("/lpt9", Expect::Forbidden),
+            ("/CONIN$", Expect::Forbidden),
+            ("/CONOUT$", Expect::Forbidden),
+            ("/%63on", Expect::Forbidden),
+            ("/NUL%20%20.txt", Expect::Forbidden),
             // Characters Windows cannot store: not found, never a 500.
             ("/a%2A", Expect::NotFound), // actix BadStart('*')
             ("/a%3F", Expect::NotFound),

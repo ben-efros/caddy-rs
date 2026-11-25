@@ -396,6 +396,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "totp-lite",
+ "tracing",
  "urlencoding",
  "uuid",
 ]
@@ -472,6 +473,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "maxminddb",
  "ring",
  "rustls",
@@ -494,6 +496,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "caddy-rs-admin",
+ "caddy-rs-core",
  "caddy-rs-tls",
  "rustls",
  "thiserror 2.0.21",
@@ -698,7 +701,9 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "bytes",
+ "caddy-rs-core",
  "caddy-rs-http",
+ "getrandom 0.2.17",
  "http",
  "http-body-util",
  "hyper",
@@ -733,6 +738,7 @@ dependencies = [
  "caddy-rs-test-support",
  "caddy-rs-tls",
  "ecdysis",
+ "getrandom 0.2.17",
  "h2",
  "h3",
  "h3-quinn",
@@ -798,6 +804,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]

@@ -287,7 +287,7 @@ impl fmt::Display for RadarConfigError {
 impl std::error::Error for RadarConfigError {}
 
 /// Radar configuration.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct RadarConfig {
     /// Operating mode.
     pub mode: RadarMode,
@@ -303,6 +303,32 @@ pub struct RadarConfig {
     pub filters: RadarFilters,
     /// Cache persistence backend.
     pub storage: StorageSpec,
+}
+
+/// Manual `Debug` that redacts the Radar API token (SEC-MEDIUM D4).
+impl std::fmt::Debug for RadarConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RadarConfig")
+            .field("mode", &self.mode)
+            .field("interval", &self.interval)
+            .field("cache_ttl", &self.cache_ttl)
+            .field(
+                "api_token",
+                &format_args!(
+                    "{}",
+                    if self.api_token.is_some() {
+                        "Some(<redacted>)"
+                    } else {
+                        "None"
+                    }
+                ),
+            )
+            .field("base_url", &self.base_url)
+            .field("filters", &self.filters)
+            .field("storage", &self.storage)
+            .finish()
+    }
 }
 
 impl Default for RadarConfig {
@@ -1512,5 +1538,23 @@ mod tests {
             br#"{"success": false, "errors": [{"message": "nope"}]}"#
         )
         .is_err());
+    }
+}
+
+/// SEC-MEDIUM D4 residual: the Radar API token must not appear in `{:?}`.
+#[cfg(test)]
+mod debug_redaction {
+    use super::*;
+
+    #[test]
+    fn radar_config_debug_hides_the_api_token() {
+        let config = RadarConfig {
+            api_token: Some("RADAR-SECRET-TOKEN".to_string()),
+            ..RadarConfig::default()
+        };
+        for text in [format!("{config:?}"), format!("{config:#?}")] {
+            assert!(!text.contains("RADAR-SECRET-TOKEN"), "{text}");
+            assert!(text.contains("base_url"), "{text}");
+        }
     }
 }

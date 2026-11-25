@@ -57,6 +57,9 @@ struct TemplatesConfig {
     canonical_root: Option<PathBuf>,
     mime_types: Vec<String>,
     delimiters: (String, String),
+    /// caddy-rs extension (SEC-MEDIUM-HTTP B5): when present, `env` and the `env.` placeholder may
+    /// only read these process environment variables. `None` is stock Caddy: any variable.
+    env_allow: Option<Vec<String>>,
 }
 
 /// `http.handlers.templates`.
@@ -80,6 +83,7 @@ impl TemplatesHandler {
                     | "mime_types"
                     | "delimiters"
                     | "between"
+                    | "env_allow"
                     | "extensions"
                     | "match"
             ) {
@@ -191,12 +195,38 @@ impl TemplatesHandler {
                 ))
             }
         };
+        let env_allow = match object.get("env_allow") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Array(items)) => {
+                let mut names = Vec::with_capacity(items.len());
+                for (index, item) in items.iter().enumerate() {
+                    let name = item
+                        .as_str()
+                        .filter(|name| !name.is_empty())
+                        .ok_or_else(|| {
+                            invalid(
+                                format!("{path}.env_allow[{index}]"),
+                                "environment variable name must be a non-empty string",
+                            )
+                        })?;
+                    names.push(name.to_string());
+                }
+                Some(names)
+            }
+            Some(_) => {
+                return Err(invalid(
+                    format!("{path}.env_allow"),
+                    "`env_allow` must be an array of environment variable names",
+                ))
+            }
+        };
         Ok(Self {
             config: std::sync::Arc::new(TemplatesConfig {
                 file_root,
                 canonical_root,
                 mime_types,
                 delimiters,
+                env_allow,
             }),
         })
     }
@@ -254,6 +284,7 @@ impl ResponseTransform for TemplatesTransform {
         };
         let root = self.resolve_root();
         let mut renderer = Renderer::new(&self.request, root);
+        renderer.env_allow = self.config.env_allow.clone();
         match renderer.render_source(&source, &self.config.delimiters) {
             Ok(body) => {
                 let body_allowed = status_allows_body(status)
@@ -1113,9 +1144,23 @@ struct Renderer<'a> {
     response_headers: HeaderMap,
     depth: usize,
     delimiters: (String, String),
+    /// See [`TemplatesConfig::env_allow`].
+    env_allow: Option<Vec<String>>,
 }
 
 impl<'a> Renderer<'a> {
+    /// Whether the template may read the process environment variable `name`.
+    fn env_permitted(&self, name: &str) -> std::result::Result<(), TemplateError> {
+        match &self.env_allow {
+            Some(allowed) if !allowed.iter().any(|entry| entry == name) => {
+                Err(TemplateError::Exec(format!(
+                    "environment variable `{name}` is not in the templates `env_allow` list"
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn new(request: &'a Request, root: Option<PathBuf>) -> Self {
         let root_value = request_value(request);
         Self {
@@ -1128,6 +1173,7 @@ impl<'a> Renderer<'a> {
             response_headers: HeaderMap::new(),
             depth: 0,
             delimiters: ("{{".to_string(), "}}".to_string()),
+            env_allow: None,
         }
     }
 
@@ -1518,6 +1564,11 @@ impl<'a> Renderer<'a> {
                         "the `file.*` placeholder is not available in templates".to_string(),
                     ));
                 }
+                // `{{placeholder "env.NAME"}}` reads the process environment too, so it is
+                // subject to the same `env_allow` list as `env`.
+                if let Some(variable) = name.strip_prefix("env.") {
+                    self.env_permitted(variable)?;
+                }
                 Ok(Value::Str(
                     self.request.get_placeholder(&name).unwrap_or_default(),
                 ))
@@ -1526,7 +1577,9 @@ impl<'a> Renderer<'a> {
                 let [name] = args.as_slice() else {
                     return Err(TemplateError::Exec("env requires one argument".to_string()));
                 };
-                Ok(Value::Str(std::env::var(name.render()).unwrap_or_default()))
+                let name = name.render();
+                self.env_permitted(&name)?;
+                Ok(Value::Str(std::env::var(name).unwrap_or_default()))
             }
             "include" => {
                 let Some(path) = args.first() else {
@@ -2304,6 +2357,107 @@ mod tests {
                 .contains("could not be read"),
             true
         );
+    }
+
+    // --- SEC-MEDIUM-HTTP B5: opt-in `env_allow` for the template `env` function ------------------
+
+    /// Run `source` through the full transform of a handler built from `config`.
+    async fn transformed(config: serde_json::Value, source: &str) -> (StatusCode, String) {
+        let handler = TemplatesHandler::from_json(&config, "handler").expect("config");
+        let transform = TemplatesTransform {
+            config: std::sync::Arc::clone(&handler.config),
+            request: request("/"),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html"));
+        let response = transform
+            .transform(StreamingResponse {
+                status: StatusCode::OK,
+                headers,
+                body: Body::Bytes(Bytes::from(source.to_string())),
+            })
+            .await;
+        let status = response.status;
+        let body = response.body.into_bytes().await.unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    fn templates_config(extra: serde_json::Value) -> serde_json::Value {
+        let mut config = serde_json::json!({"handler": "templates", "file_root": "."});
+        for (key, value) in extra.as_object().unwrap() {
+            config
+                .as_object_mut()
+                .unwrap()
+                .insert(key.clone(), value.clone());
+        }
+        config
+    }
+
+    /// Without `env_allow` the function is stock Caddy's: every process variable is readable.
+    #[tokio::test]
+    async fn env_is_unrestricted_without_env_allow_like_stock_caddy() {
+        let expected = std::env::var("PATH").expect("PATH is set");
+        let (status, body) =
+            transformed(templates_config(serde_json::json!({})), "{{env \"PATH\"}}").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, expected);
+        let (_, body) = transformed(
+            templates_config(serde_json::json!({})),
+            "{{placeholder \"env.PATH\"}}",
+        )
+        .await;
+        assert_eq!(body, expected);
+    }
+
+    /// With `env_allow`, only the listed variables are readable through `env` and through the
+    /// `env.` placeholder (which would otherwise be a bypass); everything else is a template
+    /// error (HTTP 500) rather than an empty string.
+    #[tokio::test]
+    async fn env_allow_restricts_env_and_the_env_placeholder() {
+        let expected = std::env::var("PATH").expect("PATH is set");
+        let config = templates_config(serde_json::json!({"env_allow": ["PATH"]}));
+        let (status, body) = transformed(config.clone(), "{{env \"PATH\"}}").await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, expected.as_str()));
+        let (status, body) = transformed(config.clone(), "{{ph \"env.PATH\"}}").await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, expected.as_str()));
+
+        for source in [
+            "{{env \"HOME\"}}",
+            "{{env \"path\"}}",
+            "{{placeholder \"env.HOME\"}}",
+            "{{ph \"env.HOME\"}}",
+            "{{if env \"HOME\"}}x{{end}}",
+        ] {
+            let (status, body) = transformed(config.clone(), source).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{source}");
+            assert!(body.is_empty(), "{source}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_env_allow_denies_every_variable() {
+        let config = templates_config(serde_json::json!({"env_allow": []}));
+        let (status, _) = transformed(config.clone(), "{{env \"PATH\"}}").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let (status, _) = transformed(config, "{{ph \"env.PATH\"}}").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn env_allow_config_is_validated_with_located_errors() {
+        for (value, path) in [
+            (serde_json::json!("PATH"), "handler.env_allow"),
+            (serde_json::json!({"PATH": true}), "handler.env_allow"),
+            (serde_json::json!(["PATH", 1]), "handler.env_allow[1]"),
+            (serde_json::json!(["PATH", ""]), "handler.env_allow[1]"),
+        ] {
+            let error = TemplatesHandler::from_json(
+                &templates_config(serde_json::json!({ "env_allow": value })),
+                "handler",
+            )
+            .expect_err("invalid env_allow");
+            assert!(error.to_string().contains(path), "{value}: {error}");
+        }
     }
 
     #[test]

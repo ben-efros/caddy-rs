@@ -160,7 +160,7 @@ impl EnrollmentStep {
 }
 
 /// The outcome of one successful enrollment request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum EnrollmentOutcome {
     /// The secret was minted. The URI is returned exactly once per activation.
     SecretIssued {
@@ -171,8 +171,23 @@ pub enum EnrollmentOutcome {
     Enrolled(EnrolledCredential),
 }
 
+/// Manual `Debug`: the `otpauth://` URI embeds the TOTP secret (SEC-MEDIUM D4 follow-up).
+impl std::fmt::Debug for EnrollmentOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SecretIssued { .. } => formatter
+                .debug_struct("SecretIssued")
+                .field("otpauth_uri", &format_args!("<redacted>"))
+                .finish(),
+            Self::Enrolled(credential) => {
+                formatter.debug_tuple("Enrolled").field(credential).finish()
+            }
+        }
+    }
+}
+
 /// Mutable enrollment state, behind a mutex because requests are served concurrently.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct State {
     /// The user id enrolled for, once `begin` has run.
     user: Option<UserId>,
@@ -186,6 +201,28 @@ struct State {
     /// session: the first step consumes it and this field remembers which token did. Only requests
     /// carrying that same token may continue the session.
     session_token: Option<String>,
+}
+
+/// Manual `Debug`: the issued URI and the session token are secrets.
+impl std::fmt::Debug for State {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |present: bool| {
+            format_args!("{}", if present { "Some(<redacted>)" } else { "None" }).to_string()
+        };
+        formatter
+            .debug_struct("State")
+            .field("user", &self.user)
+            .field(
+                "issued_uri",
+                &format_args!("{}", redact(self.issued_uri.is_some())),
+            )
+            .field("enrolled", &self.enrolled)
+            .field(
+                "session_token",
+                &format_args!("{}", redact(self.session_token.is_some())),
+            )
+            .finish()
+    }
 }
 
 /// The first-boot enrollment service for one activation window.
@@ -409,4 +446,33 @@ pub fn first_token_from_query(query: &str) -> Option<&str> {
         let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
         (name == TOKEN_PARAM).then_some(value)
     })
+}
+
+/// SEC-MEDIUM D4 follow-up: the TOTP secret URI must not appear in `{:?}`.
+#[cfg(test)]
+mod debug_redaction {
+    use super::*;
+
+    #[test]
+    fn enrollment_state_and_outcome_debug_hide_the_otpauth_uri() {
+        let uri = "otpauth://totp/x?secret=SUPERSECRETBASE32&issuer=y".to_string();
+        let outcome = EnrollmentOutcome::SecretIssued {
+            otpauth_uri: uri.clone(),
+        };
+        let state = State {
+            issued_uri: Some(uri),
+            session_token: Some("SESSIONTOKENVALUE".to_string()),
+            ..State::default()
+        };
+        for text in [
+            format!("{outcome:?}"),
+            format!("{outcome:#?}"),
+            format!("{state:?}"),
+            format!("{state:#?}"),
+        ] {
+            assert!(!text.contains("SUPERSECRETBASE32"), "{text}");
+            assert!(!text.contains("SESSIONTOKENVALUE"), "{text}");
+        }
+        assert!(format!("{outcome:?}").contains("SecretIssued"));
+    }
 }

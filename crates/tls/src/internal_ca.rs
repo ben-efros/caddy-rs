@@ -684,7 +684,10 @@ impl InternalIssuer {
                         not_before,
                         not_after,
                         is_ca: true,
-                        path_len: None,
+                        // pathlen:1 like Caddy's smallstep root template (`maxPathLen: 1`): the
+                        // intermediate (pathlen:0) may sign leaves only, and nothing deeper can
+                        // chain to this root (SEC-MEDIUM D5).
+                        path_len: Some(1),
                         key_usage_bits: &[5, 6], // keyCertSign, cRLSign
                         server_auth: false,
                         san: &[],
@@ -1974,6 +1977,45 @@ mod tests {
 
     fn utc_seconds(time: SystemTime) -> u64 {
         time.duration_since(UNIX_EPOCH).unwrap().as_secs()
+    }
+
+    /// The BasicConstraints `pathLenConstraint` of a certificate: `Some(n)` when the extension
+    /// carries `CA:TRUE, pathlen:n`, `None` when no pathlen is encoded.
+    fn path_len_of(der: &[u8]) -> Option<u8> {
+        // BasicConstraints extnValue content: SEQUENCE { BOOLEAN TRUE, INTEGER n }.
+        const PREFIX: &[u8] = &[0x30, 0x06, 0x01, 0x01, 0xFF, 0x02, 0x01];
+        der.windows(PREFIX.len() + 1)
+            .find(|window| window.starts_with(PREFIX))
+            .map(|window| window[PREFIX.len()])
+    }
+
+    /// SEC-MEDIUM D5: the internal root carries `pathlen:1` like Caddy's smallstep root template
+    /// (`x509util.DefaultRootTemplate`, `maxPathLen: 1`), the intermediate `pathlen:0`, and leaves
+    /// are not CAs. Without the root pathlen a compromised intermediate could mint sub-CAs that
+    /// chain to the root with no depth limit.
+    #[tokio::test]
+    async fn root_path_len_matches_caddys_smallstep_templates() {
+        let clock = Arc::new(ManualClock::new(at(Duration::ZERO)));
+        let (issuer, ca_storage, _certificate_storage) = memory_issuer(clock).await;
+        let certificate = issuer
+            .obtain(&issuance(&["pathlen.example"]))
+            .await
+            .unwrap();
+        let keys = ca_storage_keys(DEFAULT_CA_ID).unwrap();
+        let root_pem = String::from_utf8(load_blob(&ca_storage, &keys.root_certificate).await)
+            .expect("root PEM is UTF-8");
+        let root_der = pem_first_der(&root_pem, "CERTIFICATE").expect("root PEM decodes");
+        assert_eq!(path_len_of(&root_der), Some(1), "root: CA:TRUE, pathlen:1");
+        assert_eq!(
+            path_len_of(&certificate.cert_chain_der[1]),
+            Some(0),
+            "intermediate: CA:TRUE, pathlen:0"
+        );
+        assert_eq!(
+            path_len_of(&certificate.cert_chain_der[0]),
+            None,
+            "leaf: not a CA"
+        );
     }
 
     #[tokio::test]

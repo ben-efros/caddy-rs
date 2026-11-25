@@ -1,8 +1,11 @@
 //! Server-level `trusted_proxies` handling (Caddy `apps.http.servers.<name>.trusted_proxies`).
 //!
 //! Caddy's HTTP app resolves, for every request, whether the peer connection is a trusted proxy and
-//! what the effective client IP is (the left-most untrusted address in the client IP headers, or
-//! the strict right-to-left walk when `trusted_proxies_strict` is set). Handlers then read the
+//! what the effective client IP is (the left-most address in the client IP headers, or the
+//! strict right-to-left first-untrusted walk when `trusted_proxies_strict` is set). caddy-rs makes the
+//! strict walk the default when `trusted_proxies_strict` is absent (SEC-MEDIUM-PROXY C1; stock
+//! Caddy defaults to the spoofable left-most value): `stock_compat true` or an explicit
+//! `trusted_proxies_strict: false` restores it. Handlers then read the
 //! `trusted_proxy`/`client_ip` request variables:
 //!
 //! * `reverse_proxy` forwards prior `X-Forwarded-*` values only when the peer is trusted.
@@ -59,33 +62,31 @@ impl IpNet {
         if prefix > max_prefix {
             return Err(format!("CIDR prefix /{prefix} is too large for `{value}`"));
         }
+        // A network spelled as an IPv4-mapped IPv6 block (`::ffff:a.b.c.d/n`, n >= 96) is the same
+        // set of clients as the IPv4 network, which is how `contains` compares them.
+        if let (IpAddr::V6(v6), true) = (address, prefix >= 96) {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return Ok(Self {
+                    network: IpAddr::V4(v4),
+                    prefix: prefix - 96,
+                });
+            }
+        }
         Ok(Self {
             network: address,
             prefix,
         })
     }
 
-    /// Whether `address` falls inside this network (same address family only).
+    /// Whether `address` falls inside this network (same address family only, after IPv4-mapped
+    /// IPv6 canonicalisation).
+    ///
+    /// A dual-stack `[::]` listener reports IPv4 peers as `::ffff:a.b.c.d`; like Caddy's
+    /// `netip.Addr.Unmap()` and the handler-level check, the IPv4 form is compared too
+    /// (SEC-MEDIUM-PROXY C2). The raw spelling is compared first so a range that genuinely covers the
+    /// mapped block (`::/0`) keeps matching.
     pub fn contains(&self, address: IpAddr) -> bool {
-        match (self.network, address) {
-            (IpAddr::V4(network), IpAddr::V4(address)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u32::MAX << (32 - u32::from(self.prefix))
-                };
-                (u32::from(network) & mask) == (u32::from(address) & mask)
-            }
-            (IpAddr::V6(network), IpAddr::V6(address)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u128::MAX << (128 - u32::from(self.prefix))
-                };
-                (u128::from(network) & mask) == (u128::from(address) & mask)
-            }
-            _ => false,
-        }
+        caddy_rs_core::net::ip_in_net(self.network, self.prefix, address)
     }
 }
 
@@ -106,6 +107,19 @@ impl ServerTrustedProxies {
     /// and, for convenience, a bare array of range strings. Range entries may be CIDR ranges,
     /// single IPs, `private_ranges` (Caddy's built-in set), `none`, or `all`.
     pub fn from_server_json(server: &Value, path: &str) -> HttpResult<Self> {
+        Self::from_server_json_with_stock_compat(server, path, false)
+    }
+
+    /// Like [`Self::from_server_json`] with the generation's `stock_compat` flag.
+    ///
+    /// SEC-MEDIUM-PROXY C1: when `trusted_proxies_strict` is absent, the secure right-to-left walk
+    /// is the default; `stock_compat true` restores Caddy's left-most default. An explicit
+    /// `trusted_proxies_strict` value always wins.
+    pub fn from_server_json_with_stock_compat(
+        server: &Value,
+        path: &str,
+        stock_compat: bool,
+    ) -> HttpResult<Self> {
         let object = server
             .as_object()
             .ok_or_else(|| invalid(path, "server configuration must be an object"))?;
@@ -114,7 +128,7 @@ impl ServerTrustedProxies {
             Some(value) => parse_trusted_proxies_value(value, &format!("{path}.trusted_proxies"))?,
         };
         let strict = match object.get("trusted_proxies_strict") {
-            None | Some(Value::Null) => false,
+            None | Some(Value::Null) => !stock_compat,
             Some(Value::Bool(strict)) => *strict,
             Some(Value::Number(strict)) => strict.as_u64().is_some_and(|strict| strict > 0),
             Some(_) => {
@@ -178,7 +192,8 @@ impl ServerTrustedProxies {
         &self.permissive_ranges
     }
 
-    /// Whether `trusted_proxies_strict` is enabled.
+    /// Whether the strict right-to-left walk is in effect (explicit `trusted_proxies_strict`, else
+    /// on unless `stock_compat true`; SEC-MEDIUM-PROXY C1).
     pub fn strict(&self) -> bool {
         self.strict
     }
@@ -205,7 +220,7 @@ impl ServerTrustedProxies {
             }
             return (false, String::new());
         };
-        let peer_ip = peer.ip();
+        let peer_ip = peer.ip().to_canonical();
         let trusted = self.ranges.iter().any(|network| network.contains(peer_ip));
         if !trusted {
             return (false, peer_ip.to_string());
@@ -363,7 +378,7 @@ fn parse_client_ip(value: &str) -> Option<IpAddr> {
         return None;
     }
     if let Ok(address) = value.parse::<std::net::SocketAddr>() {
-        return Some(address.ip());
+        return Some(address.ip().to_canonical());
     }
     let value = value.strip_prefix('[').unwrap_or(value);
     let value = value.split(']').next().unwrap_or(value);
@@ -373,6 +388,7 @@ fn parse_client_ip(value: &str) -> Option<IpAddr> {
         .unwrap_or(value)
         .parse::<IpAddr>()
         .ok()
+        .map(|address| address.to_canonical())
 }
 
 fn invalid(path: &str, message: impl Into<String>) -> HttpError {
@@ -470,13 +486,179 @@ mod tests {
     #[test]
     fn trusted_peer_uses_leftmost_forwarded_for() {
         let server = serde_json::json!({
-            "trusted_proxies": {"source": "static", "ranges": ["10.0.0.0/8"]}
+            "trusted_proxies": {"source": "static", "ranges": ["10.0.0.0/8"]},
+            "trusted_proxies_strict": false
         });
         let trusted = ServerTrustedProxies::from_server_json(&server, "server").unwrap();
         let chained = request(Some("10.0.0.5:1234"), Some("203.0.113.9, 10.0.0.2"));
         let (is_trusted, client_ip) = trusted.determine(&chained);
         assert!(is_trusted);
         assert_eq!(client_ip, "203.0.113.9");
+    }
+
+    /// SEC-MEDIUM-PROXY C1: a trusted proxy APPENDS the address it saw to `X-Forwarded-For`, so the
+    /// client-controlled entries sit on the left. The default (secure) resolution must walk
+    /// right-to-left and never return the attacker-supplied left-most value.
+    #[test]
+    fn default_resolution_ignores_attacker_supplied_leftmost_forwarded_for() {
+        let server = serde_json::json!({
+            "trusted_proxies": {"source": "static", "ranges": ["10.0.0.0/8"]}
+        });
+        let trusted = ServerTrustedProxies::from_server_json(&server, "server").unwrap();
+        assert!(trusted.strict(), "strict is the secure default");
+        // Attacker sent `X-Forwarded-For: 10.0.0.5`; the proxy appended the real peer.
+        let spoofed = request(Some("10.0.0.2:1234"), Some("10.0.0.5, 203.0.113.9"));
+        assert_eq!(trusted.determine(&spoofed).1, "203.0.113.9");
+        // Attacker supplies a public address they want to be treated as (e.g. allow-listed).
+        let spoofed = request(Some("10.0.0.2:1234"), Some("192.0.2.1, 203.0.113.9"));
+        assert_eq!(trusted.determine(&spoofed).1, "203.0.113.9");
+        // Several header lines: the proxy's line is the last one.
+        let mut multi = request(Some("10.0.0.2:1234"), Some("192.0.2.1"));
+        multi
+            .headers
+            .append("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        assert_eq!(trusted.determine(&multi).1, "203.0.113.9");
+        // Chain of trusted hops after the real client; garbage entries are skipped.
+        let chain = request(
+            Some("10.0.0.2:1234"),
+            Some("192.0.2.1, 203.0.113.9, 10.1.1.1, not-an-ip, 10.0.0.9"),
+        );
+        assert_eq!(trusted.determine(&chain).1, "203.0.113.9");
+        // Every hop trusted: the direct peer is the effective client.
+        let all_trusted = request(Some("10.0.0.2:1234"), Some("10.0.0.5, 10.1.1.1"));
+        assert_eq!(trusted.determine(&all_trusted).1, "10.0.0.2");
+        // No header, empty header and garbage-only header fall back to the peer.
+        assert_eq!(
+            trusted.determine(&request(Some("10.0.0.2:1"), None)).1,
+            "10.0.0.2"
+        );
+        assert_eq!(
+            trusted.determine(&request(Some("10.0.0.2:1"), Some(""))).1,
+            "10.0.0.2"
+        );
+        assert_eq!(
+            trusted
+                .determine(&request(Some("10.0.0.2:1"), Some("garbage, ,,")))
+                .1,
+            "10.0.0.2"
+        );
+        // IPv6 right-most untrusted entry, with a bracketed/port form.
+        let v6 = request(Some("10.0.0.2:1"), Some("192.0.2.1, [2001:db8::7]:5000"));
+        assert_eq!(trusted.determine(&v6).1, "2001:db8::7");
+    }
+
+    /// `trusted_proxies_strict: false` (explicit) and `stock_compat: true` both keep stock Caddy's
+    /// left-most behaviour.
+    #[test]
+    fn stock_behaviour_is_left_most_with_explicit_opt_out_or_stock_compat() {
+        let spoofed = request(Some("10.0.0.2:1234"), Some("192.0.2.1, 203.0.113.9"));
+        let explicit_off = serde_json::json!({
+            "trusted_proxies": {"source": "static", "ranges": ["10.0.0.0/8"]},
+            "trusted_proxies_strict": false
+        });
+        for stock_compat in [false, true] {
+            let trusted = ServerTrustedProxies::from_server_json_with_stock_compat(
+                &explicit_off,
+                "server",
+                stock_compat,
+            )
+            .unwrap();
+            assert!(!trusted.strict());
+            assert_eq!(trusted.determine(&spoofed).1, "192.0.2.1");
+        }
+        let absent = serde_json::json!({
+            "trusted_proxies": {"source": "static", "ranges": ["10.0.0.0/8"]}
+        });
+        let stock =
+            ServerTrustedProxies::from_server_json_with_stock_compat(&absent, "server", true)
+                .unwrap();
+        assert!(!stock.strict());
+        assert_eq!(stock.determine(&spoofed).1, "192.0.2.1");
+        let secure =
+            ServerTrustedProxies::from_server_json_with_stock_compat(&absent, "server", false)
+                .unwrap();
+        assert!(secure.strict());
+        assert_eq!(secure.determine(&spoofed).1, "203.0.113.9");
+        // An explicit `true` wins over stock_compat.
+        let explicit_on = serde_json::json!({
+            "trusted_proxies": {"source": "static", "ranges": ["10.0.0.0/8"]},
+            "trusted_proxies_strict": true
+        });
+        let forced =
+            ServerTrustedProxies::from_server_json_with_stock_compat(&explicit_on, "server", true)
+                .unwrap();
+        assert!(forced.strict());
+        // Unix-socket peers follow the same default.
+        let unix = serde_json::json!({
+            "trusted_proxies": {"source": "static", "ranges": []},
+            "trusted_proxies_unix": true
+        });
+        let unix_request = request(None, Some("192.0.2.1, 203.0.113.9"));
+        let secure =
+            ServerTrustedProxies::from_server_json_with_stock_compat(&unix, "server", false)
+                .unwrap();
+        assert_eq!(secure.determine(&unix_request).1, "203.0.113.9");
+        let stock = ServerTrustedProxies::from_server_json_with_stock_compat(&unix, "server", true)
+            .unwrap();
+        assert_eq!(stock.determine(&unix_request).1, "192.0.2.1");
+    }
+
+    /// SEC-MEDIUM-PROXY C2: a dual-stack `[::]` listener reports IPv4 peers as `::ffff:a.b.c.d`.
+    /// They must be matched against the trusted IPv4 ranges (and forwarded entries likewise), and
+    /// the resolved client IP is the canonical dotted form, like the handler-level check.
+    #[test]
+    fn ipv4_mapped_ipv6_addresses_are_canonicalised() {
+        let net = IpNet::parse("10.0.0.0/8").unwrap();
+        assert!(net.contains("::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!net.contains("::ffff:11.1.2.3".parse().unwrap()));
+        assert!(net.contains("10.1.2.3".parse().unwrap()));
+        assert!(!net.contains("2001:db8::1".parse().unwrap()));
+        // A range spelled in mapped form equals the IPv4 range.
+        let mapped_net = IpNet::parse("::ffff:10.0.0.0/104").unwrap();
+        assert!(mapped_net.contains("10.1.2.3".parse().unwrap()));
+        assert!(mapped_net.contains("::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!mapped_net.contains("11.1.2.3".parse().unwrap()));
+        // A genuine IPv6 range covering the mapped block keeps matching.
+        assert!(IpNet::parse("::/0")
+            .unwrap()
+            .contains("::ffff:10.1.2.3".parse().unwrap()));
+
+        let server = serde_json::json!({
+            "trusted_proxies": {"source": "static", "ranges": ["10.0.0.0/8"]}
+        });
+        for strict in [true, false] {
+            let trusted = ServerTrustedProxies::from_server_json_with_stock_compat(
+                &{
+                    let mut server = server.clone();
+                    server["trusted_proxies_strict"] = serde_json::json!(strict);
+                    server
+                },
+                "server",
+                false,
+            )
+            .unwrap();
+            // Mapped trusted peer, mapped client in the header.
+            let mapped = request(Some("[::ffff:10.0.0.5]:1234"), Some("::ffff:203.0.113.9"));
+            assert_eq!(
+                trusted.determine(&mapped),
+                (true, "203.0.113.9".to_string()),
+                "strict={strict}"
+            );
+            // Strict walk must also skip a mapped trusted hop.
+            let hop = request(
+                Some("[::ffff:10.0.0.5]:1234"),
+                Some("203.0.113.9, ::ffff:10.0.0.2"),
+            );
+            if strict {
+                assert_eq!(trusted.determine(&hop).1, "203.0.113.9");
+            }
+            // Untrusted mapped peer: not trusted, client IP is the canonical peer.
+            let outside = request(Some("[::ffff:198.51.100.7]:1234"), Some("203.0.113.9"));
+            assert_eq!(
+                trusted.determine(&outside),
+                (false, "198.51.100.7".to_string())
+            );
+        }
     }
 
     #[test]
@@ -553,7 +735,8 @@ mod tests {
     #[test]
     fn ipv6_trusted_ranges_and_forwarded_headers() {
         let server = serde_json::json!({
-            "trusted_proxies": {"source": "static", "ranges": ["2001:db8:1::/48"]}
+            "trusted_proxies": {"source": "static", "ranges": ["2001:db8:1::/48"]},
+            "trusted_proxies_strict": false
         });
         let trusted = ServerTrustedProxies::from_server_json(&server, "server").unwrap();
         let first = request(

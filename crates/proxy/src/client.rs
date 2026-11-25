@@ -43,6 +43,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::client::TlsStream;
 use tower_service::Service;
 
+use crate::dial_guard::DialGuard;
 use crate::dns::{DnsResolver, IpVersion, ResolverAddress, SystemDnsResolver};
 use crate::tls::UpstreamTls;
 use crate::upstream::{Transport, Upstream};
@@ -281,6 +282,10 @@ pub struct TransportTuning {
     /// `MaxConnsPerHost` bucket. Sharing the map is what keeps the normal client and the
     /// HTTP/1.1-only upgrade client for one upstream under a single limit.
     pub(crate) conn_limiters: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    /// Egress policy applied to the *resolved* addresses of every dial made with this tuning
+    /// (SEC-MEDIUM-PROXY C3). `None` (the default and fixed upstreams) dials anything; clients for
+    /// request-derived dials carry a [`DialGuard`].
+    pub dial_guard: Option<Arc<DialGuard>>,
 }
 
 impl Default for TransportTuning {
@@ -293,9 +298,13 @@ impl Default for TransportTuning {
             local_address: None,
             resolver: None,
             conn_limiters: Arc::new(Mutex::new(HashMap::new())),
+            dial_guard: None,
         }
     }
 }
+
+/// Size at which [`TransportTuning::connection_limiter`] starts discarding idle per-dial limiters.
+const MAX_CONNECTION_LIMITERS: usize = 4096;
 
 impl TransportTuning {
     /// The `max_conns_per_host` limiter for `dial`, created once per dial and shared by every
@@ -308,6 +317,13 @@ impl TransportTuning {
             .conn_limiters
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Request-derived dials add one entry per distinct expansion; drop the limiters no live
+        // connection holds once the map is large so it cannot grow without bound
+        // (SEC-MEDIUM-PROXY C3). A dropped idle limiter is recreated on demand, which is
+        // equivalent because no connection is counted against it.
+        if limiters.len() >= MAX_CONNECTION_LIMITERS && !limiters.contains_key(dial) {
+            limiters.retain(|_, limiter| Arc::strong_count(limiter) > 1);
+        }
         Some(Arc::clone(
             limiters
                 .entry(dial.to_string())
@@ -912,6 +928,26 @@ async fn acquire_connection_permit(
 async fn dial_tcp(address: &str, tuning: &TransportTuning) -> io::Result<TcpStream> {
     let (host, port) = split_host_port(address)?;
     let mut addresses = resolve_upstream(host, port, tuning).await?;
+    if let Some(guard) = &tuning.dial_guard {
+        // Filter the resolved addresses (not the dial text): a host name that resolves to a
+        // restricted address is refused exactly like the literal.
+        let mut refusal = None;
+        addresses.retain(|address| match guard.check_ip(address.ip()) {
+            Ok(()) => true,
+            Err(message) => {
+                refusal.get_or_insert(message);
+                false
+            }
+        });
+        if addresses.is_empty() {
+            if let Some(message) = refusal {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("upstream `{address}`: {message}"),
+                ));
+            }
+        }
+    }
     if let Some(local) = tuning.local_address {
         addresses.retain(|address| address.is_ipv4() == local.is_ipv4());
         if addresses.is_empty() {
@@ -1367,6 +1403,44 @@ pub fn build_upstream_client_for_tuned(
 
 #[cfg(test)]
 mod tests {
+    /// SEC-MEDIUM-PROXY C3: a refusal by the guard is distinguishable from a failed connect (it is
+    /// `PermissionDenied`, produced before any socket is opened), so these cases cannot pass merely
+    /// because a metadata address is unreachable from the test host. Without the guard the same
+    /// literal would be dialed (not asserted: it may hang or even succeed on a cloud runner).
+    #[tokio::test]
+    async fn the_dial_guard_refuses_restricted_literals_before_connecting() {
+        let tuning = TransportTuning {
+            dial_guard: Some(Arc::new(DialGuard::default())),
+            ..TransportTuning::default()
+        };
+        let started = std::time::Instant::now();
+        for target in [
+            "169.254.169.254:80",
+            "[::1]:80",
+            "[fe80::1]:80",
+            "0.0.0.0:80",
+            "100.100.100.200:80",
+            "[fd00:ec2::254]:80",
+            "[::ffff:169.254.169.254]:80",
+            "[64:ff9b::a9fe:a9fe]:80",
+            "[2002:a9fe:a9fe::]:80",
+        ] {
+            // A timeout is a FAILURE: the guard must refuse before any socket is opened, and a
+            // broken guard must not hang the test or send traffic towards a real IMDS.
+            let error = tokio::time::timeout(Duration::from_millis(500), dial_tcp(target, &tuning))
+                .await
+                .unwrap_or_else(|_| panic!("{target}: the guard did not refuse promptly"))
+                .expect_err("restricted literal must be refused");
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied,
+                "{target}: {error}"
+            );
+            assert!(error.to_string().contains("dial_allow"), "{error}");
+        }
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
     /// Read an `IPPROTO_IP`/`IP_BIND_ADDRESS_NO_PORT` int option back off a live socket.
     ///
     /// Test-only: the crate's `deny(unsafe_code)` is relaxed for this one read the same way the

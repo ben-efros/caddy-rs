@@ -37,6 +37,13 @@ pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Default HTTP/1 header-read timeout, matching Caddy's `defaultReadHeaderTimeout` (1 minute).
 pub const DEFAULT_READ_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Caddy's `read_idle_timeout` default: how long a request-body read may stall before the request
+/// is aborted. A negative configured value disables it.
+pub const DEFAULT_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Caddy server field for the stalled-read timeout (preserved in the unknown-field map).
+pub const READ_IDLE_TIMEOUT_FIELD: &str = "read_idle_timeout";
+
 /// caddy-rs extension: maximum request body size in bytes (`0`/absent = unlimited).
 pub const MAX_REQUEST_BODY_SIZE_FIELD: &str = "max_request_body_size";
 
@@ -93,6 +100,11 @@ pub struct ServerLimits {
     /// Maximum time to read HTTP/1 request headers. Always set; Caddy's default is 1 minute.
     pub read_header_timeout: Duration,
 
+    /// How long a request-body read may stall before the request is aborted (Caddy's
+    /// `read_idle_timeout`, default 1 minute; `None` when configured negative). Enforced on
+    /// HTTP/3 request bodies; HTTP/1.1 and HTTP/2 rely on `read_timeout` (DIV-0029).
+    pub read_idle_timeout: Option<Duration>,
+
     /// Maximum size in bytes of the request head. `None` uses the hyper default.
     pub max_header_bytes: Option<usize>,
 
@@ -105,6 +117,21 @@ pub struct ServerLimits {
     /// Resolved server identity for the HTTP `Server` header and FastCGI `SERVER_SOFTWARE`
     /// (caddy-rs extension, T-CONF-060; ADR-0010 §3 matrix, `DIV-0132`).
     pub server_identity: caddy_rs_core::ResolvedIdentity,
+
+    /// When the per-read `read_timeout` timer runs (caddy-rs internal; not configurable).
+    pub read_timeout_scope: ReadTimeoutScope,
+}
+
+/// When the per-read `read_timeout` timer applies to a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadTimeoutScope {
+    /// On every stalled read, including the idle wait between requests (public servers; DIV-0029).
+    #[default]
+    Always,
+    /// Only while a request body is being read. Go's `ReadTimeout` is per request, and between
+    /// requests only `IdleTimeout` applies; a handler that is busy (no client bytes expected) must
+    /// not be torn down by it either. Used by the admin listeners.
+    BodyReads,
 }
 
 impl Default for ServerLimits {
@@ -114,10 +141,12 @@ impl Default for ServerLimits {
             write_timeout: None,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             read_header_timeout: DEFAULT_READ_HEADER_TIMEOUT,
+            read_idle_timeout: Some(DEFAULT_READ_IDLE_TIMEOUT),
             max_header_bytes: None,
             max_request_body_size: None,
             max_connections: None,
             server_identity: caddy_rs_core::ResolvedIdentity::default(),
+            read_timeout_scope: ReadTimeoutScope::Always,
         }
     }
 }
@@ -171,6 +200,40 @@ impl BufferedBodyReservation {
 }
 
 impl ServerLimits {
+    /// Limits of Caddy's admin `http.Server` (both the local and the remote listener in
+    /// `admin.go`): `ReadTimeout` 10 s, `ReadHeaderTimeout` 5 s, `IdleTimeout` 60 s,
+    /// `MaxHeaderBytes` 64 KiB, no `WriteTimeout`. Previously the admin listeners ran with the
+    /// public-server defaults (no read timeout, 1 minute header timeout, 5 minute idle timeout),
+    /// so idle and trickling connections lingered far longer than under stock Caddy.
+    pub fn admin() -> Self {
+        Self {
+            read_timeout: Some(Duration::from_secs(10)),
+            write_timeout: None,
+            idle_timeout: Duration::from_secs(60),
+            read_header_timeout: Duration::from_secs(5),
+            max_header_bytes: Some(64 * 1024),
+            read_timeout_scope: ReadTimeoutScope::BodyReads,
+            ..Self::default()
+        }
+    }
+
+    /// The longest a TLS handshake may take before the connection is dropped.
+    ///
+    /// Go's `net/http` (`Server.tlsHandshakeTimeout`) sets a read/write deadline before the
+    /// handshake equal to the smallest of the non-zero `ReadHeaderTimeout`, `ReadTimeout` and
+    /// `WriteTimeout`, so stock Caddy bounds a silent or trickling ClientHello by
+    /// `read_header_timeout` (default 1 minute) or by a tighter configured read/write timeout.
+    /// `TimedIo` and hyper's header timer only start after the handshake, so without this a client
+    /// holding a TCP connection open pinned a task and descriptor forever
+    /// (SEC-MEDIUM-ADMIN-SERVER A4).
+    pub fn tls_handshake_timeout(&self) -> Duration {
+        [self.read_timeout, self.write_timeout]
+            .into_iter()
+            .flatten()
+            .filter(|timeout| !timeout.is_zero())
+            .fold(self.read_header_timeout, Duration::min)
+    }
+
     /// Body-size limit applied while buffering a request body: the configured
     /// `max_request_body_size`, or [`DEFAULT_BUFFERED_BODY_LIMIT`] when none is set.
     #[must_use]
@@ -216,6 +279,23 @@ impl ServerLimits {
             READ_HEADER_TIMEOUT_FIELD,
         )?
         .unwrap_or(DEFAULT_READ_HEADER_TIMEOUT);
+        let read_idle_timeout = match server.extra.get(READ_IDLE_TIMEOUT_FIELD) {
+            None => Some(DEFAULT_READ_IDLE_TIMEOUT),
+            Some(value) if value.is_null() => Some(DEFAULT_READ_IDLE_TIMEOUT),
+            Some(value) => {
+                let nanos = parse_caddy_duration(value).map_err(|message| {
+                    CoreError::invalid(
+                        format!("{base}.{READ_IDLE_TIMEOUT_FIELD}"),
+                        format!("invalid duration: {message}"),
+                    )
+                })?;
+                match nanos {
+                    nanos if nanos < 0 => None,
+                    0 => Some(DEFAULT_READ_IDLE_TIMEOUT),
+                    nanos => Some(Duration::from_nanos(nanos as u64)),
+                }
+            }
+        };
 
         let max_header_bytes = extra_size(
             &server.extra,
@@ -252,10 +332,12 @@ impl ServerLimits {
             write_timeout,
             idle_timeout,
             read_header_timeout,
+            read_idle_timeout,
             max_header_bytes,
             max_request_body_size,
             max_connections,
             server_identity,
+            read_timeout_scope: ReadTimeoutScope::Always,
         })
     }
 }
@@ -470,6 +552,44 @@ mod tests {
     }
 
     #[test]
+    fn tls_handshake_timeout_is_the_smallest_of_read_header_read_and_write_timeout() {
+        // Go: Server.tlsHandshakeTimeout() = min of the non-zero ReadHeaderTimeout, ReadTimeout
+        // and WriteTimeout (net/http server.go).
+        let mut limits = ServerLimits::default();
+        assert_eq!(limits.tls_handshake_timeout(), DEFAULT_READ_HEADER_TIMEOUT);
+        limits.read_header_timeout = Duration::from_secs(5);
+        assert_eq!(limits.tls_handshake_timeout(), Duration::from_secs(5));
+        limits.read_timeout = Some(Duration::from_secs(2));
+        assert_eq!(limits.tls_handshake_timeout(), Duration::from_secs(2));
+        limits.read_timeout = Some(Duration::from_secs(9));
+        assert_eq!(limits.tls_handshake_timeout(), Duration::from_secs(5));
+        limits.read_timeout = Some(Duration::from_secs(5));
+        assert_eq!(limits.tls_handshake_timeout(), Duration::from_secs(5));
+        // WriteTimeout participates like the others: smaller than both wins, larger loses.
+        limits.write_timeout = Some(Duration::from_secs(1));
+        assert_eq!(limits.tls_handshake_timeout(), Duration::from_secs(1));
+        limits.write_timeout = Some(Duration::from_secs(30));
+        assert_eq!(limits.tls_handshake_timeout(), Duration::from_secs(5));
+        // With only a write timeout set it still bounds the handshake below the 1 minute default.
+        limits.read_timeout = None;
+        limits.read_header_timeout = DEFAULT_READ_HEADER_TIMEOUT;
+        limits.write_timeout = Some(Duration::from_secs(7));
+        assert_eq!(limits.tls_handshake_timeout(), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn admin_limits_match_stock_caddy_admin_server() {
+        let limits = ServerLimits::admin();
+        assert_eq!(limits.read_timeout, Some(Duration::from_secs(10)));
+        assert_eq!(limits.read_header_timeout, Duration::from_secs(5));
+        assert_eq!(limits.idle_timeout, Duration::from_secs(60));
+        assert_eq!(limits.write_timeout, None);
+        assert_eq!(limits.max_header_bytes, Some(64 * 1024));
+        // The remote admin handshake budget follows from them (Go: min of the three).
+        assert_eq!(limits.tls_handshake_timeout(), Duration::from_secs(5));
+    }
+
+    #[test]
     fn parses_duration_strings_like_caddy() {
         let cases = [
             ("5s", 5_000_000_000),
@@ -648,5 +768,51 @@ mod budget_tests {
         drop(hog);
         assert!(other.try_grow(1024), "the budget is returned on drop");
         assert!(other.try_grow(1024), "a reservation can keep growing");
+    }
+}
+
+#[cfg(test)]
+mod read_idle_timeout_tests {
+    use super::*;
+
+    fn limits(server_fields: serde_json::Value) -> Result<ServerLimits, CoreError> {
+        let mut server = serde_json::json!({"listen": [":8080"], "routes": []});
+        for (key, value) in server_fields.as_object().unwrap() {
+            server[key] = value.clone();
+        }
+        let server: HttpServer = serde_json::from_value(server).unwrap();
+        ServerLimits::from_http_server("srv0", &server, false, false)
+    }
+
+    /// Stock Caddy: `read_idle_timeout` defaults to one minute, a negative value disables it, and
+    /// zero means "use the default".
+    #[test]
+    fn read_idle_timeout_follows_caddys_semantics() {
+        assert_eq!(
+            limits(serde_json::json!({})).unwrap().read_idle_timeout,
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            limits(serde_json::json!({"read_idle_timeout": "5s"}))
+                .unwrap()
+                .read_idle_timeout,
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            limits(serde_json::json!({"read_idle_timeout": "-1s"}))
+                .unwrap()
+                .read_idle_timeout,
+            None,
+            "a negative value disables the timeout"
+        );
+        assert_eq!(
+            limits(serde_json::json!({"read_idle_timeout": 0}))
+                .unwrap()
+                .read_idle_timeout,
+            Some(Duration::from_secs(60)),
+            "zero keeps the default"
+        );
+        let error = limits(serde_json::json!({"read_idle_timeout": "soon"})).unwrap_err();
+        assert!(error.to_string().contains("read_idle_timeout"), "{error}");
     }
 }

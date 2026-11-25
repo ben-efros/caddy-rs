@@ -118,18 +118,32 @@ type BoxedBody = Pin<Box<dyn HttpBody<Data = Bytes, Error = BodyError> + Send + 
 /// Receiver-backed body used by [`StreamingBody::from_chunks`].
 struct ChunkReceiver {
     receiver: mpsc::Receiver<Result<Bytes, BodyError>>,
+    /// Bytes the producer promised to deliver, when known up front (`from_chunks_with_len`).
+    remaining: Option<u64>,
 }
 
 impl HttpBody for ChunkReceiver {
     type Data = Bytes;
     type Error = BodyError;
 
+    fn size_hint(&self) -> SizeHint {
+        match self.remaining {
+            Some(remaining) => SizeHint::with_exact(remaining),
+            None => SizeHint::default(),
+        }
+    }
+
     fn poll_frame(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
         match self.receiver.poll_recv(cx) {
-            Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(Ok(Frame::data(chunk)))),
+            Poll::Ready(Some(Ok(chunk))) => {
+                if let Some(remaining) = self.remaining.as_mut() {
+                    *remaining = remaining.saturating_sub(chunk.len() as u64);
+                }
+                Poll::Ready(Some(Ok(Frame::data(chunk))))
+            }
             Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
@@ -254,7 +268,28 @@ impl StreamingBody {
     /// [`BodyError`] after any already-delivered chunks.
     pub fn from_chunks(receiver: mpsc::Receiver<Result<Bytes, BodyError>>) -> Self {
         Self {
-            inner: Inner::Boxed(Box::pin(ChunkReceiver { receiver })),
+            inner: Inner::Boxed(Box::pin(ChunkReceiver {
+                receiver,
+                remaining: None,
+            })),
+            counter: None,
+            observation: None,
+        }
+    }
+
+    /// Like [`Self::from_chunks`] for a producer that knows the total length in advance (a static
+    /// file): `size_hint` is exact, so the server keeps a matching `Content-Length` instead of
+    /// falling back to chunked framing. If the producer delivers fewer bytes it must end the
+    /// stream with an error so the connection is aborted rather than left short.
+    pub fn from_chunks_with_len(
+        receiver: mpsc::Receiver<Result<Bytes, BodyError>>,
+        len: u64,
+    ) -> Self {
+        Self {
+            inner: Inner::Boxed(Box::pin(ChunkReceiver {
+                receiver,
+                remaining: Some(len),
+            })),
             counter: None,
             observation: None,
         }
