@@ -198,27 +198,39 @@ async fn unknown_usernames_are_throttled_exactly_like_known_ones() {
 }
 
 #[tokio::test]
-async fn the_failure_budget_is_per_username_and_ignores_ascii_case() {
+async fn the_failure_budget_is_per_exact_username() {
     let (service, _clock) = clocked_service(fast_config());
-    service
-        .create_user("alice", "correct horse", Role::viewer())
-        .await
-        .unwrap();
-    service
-        .create_user("bob", "correct horse", Role::viewer())
-        .await
-        .unwrap();
+    for name in ["alice", "bob", "Bob"] {
+        service
+            .create_user(name, "correct horse", Role::viewer())
+            .await
+            .unwrap();
+    }
     for _ in 0..5 {
         wrong_login(&service, "alice").await;
     }
     assert!(matches!(
-        service.login("ALICE", "correct horse", None).await,
+        service.login("alice", "correct horse", None).await,
         Err(AuthError::TooManyAttempts { .. })
     ));
     service
         .login("bob", "correct horse", None)
         .await
         .expect("another account is unaffected");
+
+    // The store is case-sensitive, so `Bob` and `bob` are two accounts: locking one out must not
+    // lock the other (a folded key would let anyone lock out `Bob` by failing as `bob`).
+    for _ in 0..5 {
+        wrong_login(&service, "bob").await;
+    }
+    assert!(matches!(
+        service.login("bob", "correct horse", None).await,
+        Err(AuthError::TooManyAttempts { .. })
+    ));
+    service
+        .login("Bob", "correct horse", None)
+        .await
+        .expect("a differently-cased account has its own budget");
 }
 
 /// An enrolled account whose factor is active, plus a service pinned to the step after the one the
@@ -432,14 +444,14 @@ fn an_idle_key_is_forgiven_and_long_usernames_are_keyed_by_digest() {
         key.len() < 200,
         "a huge username must not become a huge key"
     );
-    assert_eq!(key, username_throttle_key(&long.to_ascii_lowercase()));
     assert_ne!(
         username_throttle_key(&long),
         username_throttle_key(&format!("{long}x"))
     );
-    assert_eq!(
+    assert_ne!(
         username_throttle_key("Alice"),
-        username_throttle_key("alice")
+        username_throttle_key("alice"),
+        "keyed exactly like the case-sensitive store"
     );
 }
 
@@ -1035,4 +1047,421 @@ async fn the_first_administrator_needs_a_password_of_at_least_eight_characters()
         service.create_first_admin("second", "long enough pw").await,
         Err(AuthError::UsernameExists)
     ));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review round: reuse detection must not cascade, throttle hardening, policy, atomic updates
+// ---------------------------------------------------------------------------------------------
+
+async fn epoch_of(store: &MemoryUserStore, name: &str) -> u64 {
+    store
+        .get_user_by_username(name)
+        .await
+        .unwrap()
+        .unwrap()
+        .auth_epoch
+}
+
+#[tokio::test]
+async fn refresh_after_logout_is_a_plain_rejection_with_no_side_effects() {
+    let (service, store) = two_users().await;
+    let a = service.login("alice", "correct horse", None).await.unwrap();
+    let b = service.login("alice", "correct horse", None).await.unwrap();
+    service
+        .revoke_refresh_token(&a.refresh_token)
+        .await
+        .unwrap();
+
+    // A refresh timer that fires after the logout presents the logged-out token.
+    assert!(matches!(
+        service.refresh(&a.refresh_token).await,
+        Err(AuthError::RefreshTokenRevoked)
+    ));
+    assert_eq!(epoch_of(&store, "alice").await, 0);
+    assert!(service.verify_access_token(&b.access_token).await.is_ok());
+    service
+        .refresh(&b.refresh_token)
+        .await
+        .expect("other device");
+}
+
+#[tokio::test]
+async fn refresh_after_a_password_change_does_not_end_the_new_session() {
+    let (service, store) = two_users().await;
+    let alice = store.get_user_by_username("alice").await.unwrap().unwrap();
+    let device_a = service.login("alice", "correct horse", None).await.unwrap();
+    let device_b = service.login("alice", "correct horse", None).await.unwrap();
+    service
+        .update_password(alice.id, "correct horse", "new battery staple")
+        .await
+        .unwrap();
+    let new_session = service
+        .login("alice", "new battery staple", None)
+        .await
+        .unwrap();
+
+    // Both old devices' routine refreshes fail, and neither signs the new session out.
+    for stale in [&device_a, &device_b] {
+        assert!(matches!(
+            service.refresh(&stale.refresh_token).await,
+            Err(AuthError::RefreshTokenRevoked)
+        ));
+    }
+    assert_eq!(
+        epoch_of(&store, "alice").await,
+        1,
+        "only the password change bumped it"
+    );
+    assert!(service
+        .verify_access_token(&new_session.access_token)
+        .await
+        .is_ok());
+    service
+        .refresh(&new_session.refresh_token)
+        .await
+        .expect("the new session survives");
+}
+
+#[tokio::test]
+async fn a_multi_device_reset_does_not_cascade() {
+    let (service, store) = two_users().await;
+    let a = service.login("alice", "correct horse", None).await.unwrap();
+    let b = service.login("alice", "correct horse", None).await.unwrap();
+    let c = service.login("alice", "correct horse", None).await.unwrap();
+
+    // Device A rotates, then replays its stale token: a genuine reuse, the family is revoked once.
+    service.refresh(&a.refresh_token).await.unwrap();
+    assert!(service.refresh(&a.refresh_token).await.is_err());
+    assert_eq!(epoch_of(&store, "alice").await, 1);
+
+    // The user logs in again on A. Devices B and C then wake up with their (mass-revoked) tokens.
+    let a_again = service.login("alice", "correct horse", None).await.unwrap();
+    for woken in [&b, &c] {
+        assert!(matches!(
+            service.refresh(&woken.refresh_token).await,
+            Err(AuthError::RefreshTokenRevoked)
+        ));
+    }
+    assert_eq!(epoch_of(&store, "alice").await, 1, "no second reset");
+    assert!(service
+        .verify_access_token(&a_again.access_token)
+        .await
+        .is_ok());
+    service
+        .refresh(&a_again.refresh_token)
+        .await
+        .expect("A's new session survives the other devices waking up");
+
+    // Replaying the long-dead rotated token again is not a new theft signal either: the family it
+    // belonged to was already retired by the epoch bump.
+    assert!(service.refresh(&a.refresh_token).await.is_err());
+    assert_eq!(epoch_of(&store, "alice").await, 1);
+}
+
+#[tokio::test]
+async fn a_rotated_token_replayed_after_the_epoch_moved_is_not_theft() {
+    let (service, store) = two_users().await;
+    let alice = store.get_user_by_username("alice").await.unwrap().unwrap();
+    let old = service.login("alice", "correct horse", None).await.unwrap();
+    service.refresh(&old.refresh_token).await.unwrap();
+    service.revoke_all_for_user(alice.id).await.unwrap();
+    let fresh = service.login("alice", "correct horse", None).await.unwrap();
+
+    assert!(service.refresh(&old.refresh_token).await.is_err());
+    assert_eq!(epoch_of(&store, "alice").await, 1, "not bumped again");
+    service
+        .refresh(&fresh.refresh_token)
+        .await
+        .expect("fresh session lives");
+}
+
+#[tokio::test]
+async fn an_expired_rotated_token_is_just_expired() {
+    let (_service, store) = two_users().await;
+    let service = AuthnService::new(
+        store.clone(),
+        AuthnConfig {
+            refresh_ttl: Duration::from_secs(1),
+            ..fast_config()
+        },
+    )
+    .unwrap();
+    let tokens = service.login("alice", "correct horse", None).await.unwrap();
+    service.refresh(&tokens.refresh_token).await.unwrap();
+    std::thread::sleep(Duration::from_millis(2100));
+    assert!(matches!(
+        service.refresh(&tokens.refresh_token).await,
+        Err(AuthError::TokenExpired)
+    ));
+    assert_eq!(epoch_of(&store, "alice").await, 0, "expiry is not reuse");
+}
+
+#[tokio::test]
+async fn update_password_shares_the_login_failure_budget() {
+    let (service, clock) = clocked_service(fast_config());
+    let alice = service
+        .create_user("alice", "correct horse", Role::viewer())
+        .await
+        .unwrap();
+    // A stolen access token cannot guess the current password at line speed.
+    for _ in 0..5 {
+        assert!(matches!(
+            service
+                .update_password(alice.id, "wrong guess", "another password")
+                .await,
+            Err(AuthError::InvalidCredentials)
+        ));
+    }
+    assert!(matches!(
+        service
+            .update_password(alice.id, "correct horse", "another password")
+            .await,
+        Err(AuthError::TooManyAttempts { .. })
+    ));
+    // The same per-user key: login is locked out too, and recovers once the lockout ends.
+    assert!(matches!(
+        service.login("alice", "correct horse", None).await,
+        Err(AuthError::TooManyAttempts { .. })
+    ));
+    advance(&clock, 31);
+    service
+        .update_password(alice.id, "correct horse", "another password")
+        .await
+        .expect("allowed again after the lockout; success clears the budget");
+}
+
+#[tokio::test]
+async fn every_password_setting_path_applies_the_same_policy() {
+    let (service, _clock) = clocked_service(fast_config());
+    assert!(matches!(
+        service.create_user("eve", "short", Role::viewer()).await,
+        Err(AuthError::PasswordTooShort { min: 8 })
+    ));
+    assert!(matches!(
+        service
+            .create_user("eve", &"x".repeat(MAX_PASSWORD_BYTES + 1), Role::viewer())
+            .await,
+        Err(AuthError::PasswordTooLong { .. })
+    ));
+    let eve = service
+        .create_user("eve", "12345678", Role::viewer())
+        .await
+        .expect("exactly the minimum");
+    assert!(matches!(
+        service.set_password(eve.id, "1234567").await,
+        Err(AuthError::PasswordTooShort { .. })
+    ));
+    assert!(matches!(
+        service.update_password(eve.id, "12345678", "tiny").await,
+        Err(AuthError::PasswordTooShort { .. })
+    ));
+    // Rejections changed nothing.
+    service
+        .login("eve", "12345678", None)
+        .await
+        .expect("old password intact");
+    assert!(matches!(
+        check_password_policy("ééééééé"),
+        Err(AuthError::PasswordTooShort { .. })
+    ));
+    check_password_policy("éééééééé").expect("8 characters, 16 bytes");
+}
+
+#[test]
+fn an_idle_period_decays_the_backoff_level_gradually_instead_of_forgetting_it() {
+    let config = LoginThrottleConfig::default();
+    let mut now = Instant::now();
+    let mut tracker = AttemptTracker::default();
+    // Climb to level 4: every lockout is served, then one more failure re-locks immediately.
+    for _ in 0..5 {
+        let _ = tracker.reserve("k", now, &config);
+    }
+    for _ in 0..3 {
+        now += config.max_lockout; // past the current lockout
+        let _ = tracker.reserve("k", now, &config);
+    }
+    assert_eq!(tracker.entries["k"].level, 4);
+
+    now += config.max_lockout * 2; // one idle period
+    assert!(
+        tracker.reserve("k", now, &config).is_ok(),
+        "one guess is allowed"
+    );
+    assert!(
+        tracker.reserve("k", now, &config).is_err(),
+        "but not a fresh budget of max_failures guesses"
+    );
+    assert!(
+        tracker.entries["k"].level >= 3,
+        "level only decayed by one period"
+    );
+}
+
+#[test]
+fn an_entry_whose_lockout_expired_is_not_the_one_evicted_by_username_flooding() {
+    let config = LoginThrottleConfig {
+        max_tracked: 3,
+        ..LoginThrottleConfig::default()
+    };
+    let origin = Instant::now();
+    let mut tracker = AttemptTracker::default();
+    for _ in 0..5 {
+        let _ = tracker.reserve("victim", origin, &config);
+    }
+    let after_lock = origin + config.base_lockout + Duration::from_secs(1);
+    for index in 0..50u64 {
+        let _ = tracker.reserve(
+            &format!("noise-{index}"),
+            after_lock + Duration::from_millis(index),
+            &config,
+        );
+    }
+    let victim = tracker
+        .entries
+        .get("victim")
+        .expect("the penalised entry survives the flood");
+    assert_eq!(victim.level, 1);
+    let later = after_lock + Duration::from_secs(1);
+    assert!(
+        tracker.reserve("victim", later, &config).is_ok(),
+        "one guess"
+    );
+    assert!(
+        tracker.reserve("victim", later, &config).is_err(),
+        "its first failure re-locked, the count did not restart"
+    );
+}
+
+#[test]
+fn an_enormous_max_lockout_neither_panics_nor_validates() {
+    let huge = LoginThrottleConfig {
+        base_lockout: Duration::MAX,
+        max_lockout: Duration::MAX,
+        ..LoginThrottleConfig::default()
+    };
+    assert!(huge.validate().is_err(), "capped by validation");
+    assert!(LoginThrottleConfig {
+        max_lockout: Duration::from_secs(48 * 60 * 60),
+        ..LoginThrottleConfig::default()
+    }
+    .validate()
+    .is_err());
+    // Even if it somehow got through, the arithmetic saturates instead of overflowing `Instant`.
+    let mut tracker = AttemptTracker::default();
+    let now = Instant::now();
+    for _ in 0..5 {
+        let _ = tracker.reserve("k", now, &huge);
+    }
+    assert!(tracker.reserve("k", now, &huge).is_err());
+}
+
+/// A store whose `get_user` serves a frozen snapshot, standing in for a read that raced a
+/// concurrent write. Every other method, `modify_user` included, hits the real store.
+#[derive(Clone)]
+struct StaleReadStore {
+    inner: MemoryUserStore,
+    frozen: Arc<Mutex<Option<User>>>,
+}
+
+#[async_trait::async_trait]
+impl UserStore for StaleReadStore {
+    async fn get_user(&self, user_id: UserId) -> AuthResult<Option<User>> {
+        if let Some(user) = self.frozen.lock().unwrap().clone() {
+            return Ok(Some(user));
+        }
+        self.inner.get_user(user_id).await
+    }
+    async fn get_user_by_username(&self, username: &str) -> AuthResult<Option<User>> {
+        self.inner.get_user_by_username(username).await
+    }
+    async fn create_user(&self, user: User) -> AuthResult<User> {
+        self.inner.create_user(user).await
+    }
+    async fn update_user(&self, user: User) -> AuthResult<User> {
+        self.inner.update_user(user).await
+    }
+    async fn modify_user(&self, user_id: UserId, change: UserChange) -> AuthResult<User> {
+        self.inner.modify_user(user_id, change).await
+    }
+    async fn delete_user(&self, user_id: UserId) -> AuthResult<()> {
+        self.inner.delete_user(user_id).await
+    }
+    async fn list_users(&self) -> AuthResult<Vec<User>> {
+        self.inner.list_users().await
+    }
+    async fn get_refresh_token(&self, hash: &str) -> AuthResult<Option<RefreshTokenRecord>> {
+        self.inner.get_refresh_token(hash).await
+    }
+    async fn store_refresh_token(&self, record: RefreshTokenRecord) -> AuthResult<()> {
+        self.inner.store_refresh_token(record).await
+    }
+    async fn consume_refresh_token(
+        &self,
+        hash: &str,
+        now: i64,
+        reason: RevokeReason,
+    ) -> AuthResult<RefreshTokenRecord> {
+        self.inner.consume_refresh_token(hash, now, reason).await
+    }
+    async fn revoke_all_refresh_tokens_for_user(
+        &self,
+        user_id: UserId,
+        now: i64,
+    ) -> AuthResult<()> {
+        self.inner
+            .revoke_all_refresh_tokens_for_user(user_id, now)
+            .await
+    }
+    async fn accept_totp_step(&self, user_id: UserId, step: u64) -> AuthResult<bool> {
+        self.inner.accept_totp_step(user_id, step).await
+    }
+}
+
+#[tokio::test]
+async fn service_updates_do_not_revert_a_concurrently_consumed_totp_step() {
+    let inner = MemoryUserStore::new();
+    let store = StaleReadStore {
+        inner: inner.clone(),
+        frozen: Arc::new(Mutex::new(None)),
+    };
+    let service = AuthnService::new(store.clone(), fast_config()).unwrap();
+    let alice = service
+        .create_user("alice", "correct horse", Role::viewer())
+        .await
+        .unwrap();
+    // A pending (not yet gating) secret: password login still works, but a step can be accepted.
+    inner
+        .modify_user(
+            alice.id,
+            Box::new(|user| {
+                user.totp_secret = Some("JBSWY3DPEHPK3PXP".to_string());
+                user.totp_pending = true;
+                Ok(())
+            }),
+        )
+        .await
+        .unwrap();
+
+    for (index, scenario) in ["reuse", "revoke_all"].into_iter().enumerate() {
+        let rotated = service.login("alice", "correct horse", None).await.unwrap();
+        service.refresh(&rotated.refresh_token).await.unwrap();
+
+        // A read taken *before* the step was consumed...
+        *store.frozen.lock().unwrap() = inner.get_user(alice.id).await.unwrap();
+        // ...and then a TOTP code is consumed concurrently.
+        let step = 77 + index as u64;
+        assert!(inner.accept_totp_step(alice.id, step).await.unwrap());
+
+        match scenario {
+            "reuse" => assert!(service.refresh(&rotated.refresh_token).await.is_err()),
+            _ => service.revoke_all_for_user(alice.id).await.unwrap(),
+        }
+        let after = inner.get_user(alice.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.totp_last_step,
+            Some(step),
+            "{scenario}: the consumed step must stay consumed"
+        );
+        *store.frozen.lock().unwrap() = None;
+    }
 }

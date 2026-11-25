@@ -543,6 +543,12 @@ impl std::fmt::Debug for User {
 }
 
 /// Authentication errors.
+///
+/// `#[non_exhaustive]`: variants are added as the service grows (the throttle and password-policy
+/// errors were), so downstream `match`es need a wildcard arm. Adding fields to `User` and
+/// `AuthnConfig` is likewise a source-breaking change for struct literals; build them from
+/// `AuthnConfig::default()` with `..` and read users through the service.
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum AuthError {
     /// The requested user does not exist.
@@ -695,8 +701,34 @@ pub struct RefreshTokenRecord {
     expires_at: i64,
     /// Revoked at timestamp (if revoked).
     revoked_at: Option<i64>,
+    /// Why the token was revoked; `None` while it is live. Only a [`RevokeReason::Rotated`] token
+    /// can signal theft when presented again.
+    #[serde(default)]
+    revoke_reason: Option<RevokeReason>,
+    /// The owner's `auth_epoch` when the token was issued. Reuse of a rotated token only counts as
+    /// theft while the epoch has not moved since (a password change or session reset retires the
+    /// whole family anyway).
+    #[serde(default)]
+    epoch: u64,
     /// Token ID for revocation tracking.
     token_id: String,
+}
+
+/// Why a refresh token stopped being usable.
+///
+/// Recorded so that presenting a revoked token can be judged correctly: only a token that was
+/// *rotated* by a normal refresh is evidence of a stolen copy. Every other revocation is an
+/// ordinary event (the user logged out, changed their password, or a family revocation already
+/// happened), and a client that still holds such a token must simply be told it is revoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum RevokeReason {
+    /// Consumed by a successful `refresh`; a replay of this token indicates a copied token.
+    Rotated,
+    /// Consumed by a single-device logout.
+    LoggedOut,
+    /// Revoked in bulk (password change, factor change, reuse response, administrator action).
+    Revoked,
 }
 
 impl std::fmt::Debug for RefreshTokenRecord {
@@ -707,6 +739,7 @@ impl std::fmt::Debug for RefreshTokenRecord {
             .field("iat", &self.iat)
             .field("expires_at", &self.expires_at)
             .field("revoked_at", &self.revoked_at)
+            .field("revoke_reason", &self.revoke_reason)
             .field("token_id", &self.token_id)
             .finish()
     }
@@ -751,6 +784,24 @@ pub const MAX_PASSWORD_BYTES: usize = 1024;
 
 /// Shortest password (in characters) accepted when creating the first administrator.
 pub const MIN_PASSWORD_CHARS: usize = 8;
+
+/// The password policy every path that *sets* a password applies: at least
+/// [`MIN_PASSWORD_CHARS`] characters (counted as characters, not bytes) and at most
+/// [`MAX_PASSWORD_BYTES`] bytes. One helper so the account-creation, first-run, password-change and
+/// administrative-reset paths cannot drift apart.
+pub fn check_password_policy(password: &str) -> AuthResult<()> {
+    if password.chars().count() < MIN_PASSWORD_CHARS {
+        return Err(AuthError::PasswordTooShort {
+            min: MIN_PASSWORD_CHARS,
+        });
+    }
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(AuthError::PasswordTooLong {
+            max: MAX_PASSWORD_BYTES,
+        });
+    }
+    Ok(())
+}
 
 impl Argon2Config {
     /// Reject parameters weaker than the OWASP minimum, or unusable by Argon2 at all.
@@ -1282,6 +1333,12 @@ impl LoginThrottleConfig {
                 "login_throttle.max_lockout must not be shorter than base_lockout".to_string(),
             ));
         }
+        if self.max_lockout > MAX_LOCKOUT_CEILING {
+            return Err(AuthError::InvalidConfig(format!(
+                "login_throttle.max_lockout must not exceed {} seconds",
+                MAX_LOCKOUT_CEILING.as_secs()
+            )));
+        }
         if self.max_tracked == 0 {
             return Err(AuthError::InvalidConfig(
                 "login_throttle.max_tracked must be at least 1".to_string(),
@@ -1290,6 +1347,10 @@ impl LoginThrottleConfig {
         Ok(())
     }
 }
+
+/// Longest lockout the configuration may ask for (one day). Beyond this the arithmetic on
+/// `Instant` stops being meaningful and a lockout that long is an outage, not a throttle.
+const MAX_LOCKOUT_CEILING: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Failure state for one throttle key.
 #[derive(Debug)]
@@ -1323,8 +1384,10 @@ impl AttemptTracker {
         now: Instant,
         config: &LoginThrottleConfig,
     ) -> Result<(), Duration> {
-        // A key that has been quiet for twice the longest lockout starts over, so old failures do
-        // not accumulate forever and a served backoff level is eventually forgiven.
+        // A key that has been quiet for twice the longest lockout is forgiven *gradually*: the
+        // failure count restarts, but the backoff level only decays by one per idle period, and an
+        // entry that still has a level re-locks on its next failure. Forgetting the level outright
+        // would hand a patient guesser a fresh budget of `max_failures` guesses every idle period.
         let idle_reset = config.max_lockout.saturating_mul(2);
         if let Some(entry) = self.entries.get_mut(key) {
             match entry.locked_until {
@@ -1332,9 +1395,16 @@ impl AttemptTracker {
                 Some(_) => entry.locked_until = None,
                 None => {}
             }
-            if now.saturating_duration_since(entry.last_activity) >= idle_reset {
-                entry.failures = 0;
-                entry.level = 0;
+            let idle = now.saturating_duration_since(entry.last_activity);
+            if !idle_reset.is_zero() && idle >= idle_reset {
+                let periods = u32::try_from(idle.as_nanos() / idle_reset.as_nanos().max(1))
+                    .unwrap_or(u32::MAX);
+                entry.level = entry.level.saturating_sub(periods);
+                entry.failures = if entry.level > 0 {
+                    config.max_failures.saturating_sub(1)
+                } else {
+                    0
+                };
             }
         } else {
             if self.entries.len() >= config.max_tracked {
@@ -1361,7 +1431,12 @@ impl AttemptTracker {
                 .base_lockout
                 .saturating_mul(factor)
                 .min(config.max_lockout);
-            entry.locked_until = Some(now + lockout);
+            // `max_lockout` is validated, but the arithmetic must not panic whatever it holds.
+            entry.locked_until = Some(
+                now.checked_add(lockout)
+                    .or_else(|| now.checked_add(Duration::from_secs(100 * 365 * 24 * 60 * 60)))
+                    .unwrap_or(now),
+            );
             entry.level = entry.level.saturating_add(1);
         }
         Ok(())
@@ -1372,8 +1447,11 @@ impl AttemptTracker {
         self.entries.remove(key);
     }
 
-    /// Drop one entry to make room: an unlocked one first (oldest activity), a locked one only
-    /// when everything is locked.
+    /// Drop one entry to make room. Entries that carry no penalty go first (unlocked, backoff
+    /// level 0, fewest failures, oldest activity); an entry serving a lockout, or one whose
+    /// lockout expired but whose backoff level is still remembered, goes last. Otherwise flooding
+    /// the tracker with made-up usernames would evict a victim's penalised entry and restart its
+    /// count.
     fn evict_one(&mut self, now: Instant) {
         let victim = self
             .entries
@@ -1381,6 +1459,8 @@ impl AttemptTracker {
             .min_by_key(|(_, entry)| {
                 (
                     entry.locked_until.is_some_and(|until| until > now),
+                    entry.level,
+                    entry.failures,
                     entry.last_activity,
                 )
             })
@@ -1397,14 +1477,15 @@ const MAX_THROTTLE_KEY_BYTES: usize = 128;
 
 /// Throttle key for a submitted username.
 ///
-/// ASCII case is folded: the store matches names case-sensitively, but a limiter that treated
-/// `Admin` and `admin` as different keys could be dodged by changing the spelling.
+/// The key is the exact submitted name, because that is how the store matches: it is
+/// case-sensitive, so `Bob` and `bob` are different accounts and must not share (or lock out) each
+/// other's budget. A store that folds case would need the same folding here, so the two must agree;
+/// the key and the lookup are deliberately defined in one place's terms (exact match).
 fn username_throttle_key(username: &str) -> String {
-    let folded = username.to_ascii_lowercase();
-    if folded.len() > MAX_THROTTLE_KEY_BYTES {
-        format!("user-sha256:{}", hash_refresh_token(&folded))
+    if username.len() > MAX_THROTTLE_KEY_BYTES {
+        format!("user-sha256:{}", hash_refresh_token(username))
     } else {
-        format!("user:{folded}")
+        format!("user:{username}")
     }
 }
 
@@ -1438,6 +1519,9 @@ impl std::fmt::Debug for AuthnConfig {
     }
 }
 
+/// A closure that edits a user record in place; see [`UserStore::modify_user`].
+pub type UserChange = Box<dyn for<'a> FnOnce(&'a mut User) -> AuthResult<()> + Send>;
+
 /// Trait for user storage backends.
 ///
 /// Implementations must be safe for concurrent use. Refresh tokens are keyed by their SHA-256
@@ -1455,6 +1539,16 @@ pub trait UserStore: Send + Sync {
 
     /// Update an existing user.
     async fn update_user(&self, user: User) -> AuthResult<User>;
+
+    /// Atomically read-modify-write one user: apply `change` to the stored record while holding
+    /// whatever exclusion the backend needs, and persist the result.
+    ///
+    /// This is what service code uses to change a few fields. A `get_user` + `update_user` pair
+    /// writes back the *whole* record it read, so a concurrent change to another field (notably
+    /// `totp_last_step`, which makes a consumed TOTP code unusable) would be silently reverted.
+    /// A backend must make the closure and the write one atomic step. Returns the stored result,
+    /// or [`AuthError::UserNotFound`]; an error from `change` aborts without writing.
+    async fn modify_user(&self, user_id: UserId, change: UserChange) -> AuthResult<User>;
 
     /// Delete a user.
     async fn delete_user(&self, user_id: UserId) -> AuthResult<()>;
@@ -1480,18 +1574,21 @@ pub trait UserStore: Send + Sync {
     /// Store a new refresh token record.
     async fn store_refresh_token(&self, record: RefreshTokenRecord) -> AuthResult<()>;
 
-    /// Atomically consume a refresh token, marking it revoked.
+    /// Atomically consume a refresh token, marking it revoked for `reason`.
     ///
     /// Returns [`AuthError::RefreshTokenNotFound`] for an unknown digest,
-    /// [`AuthError::RefreshTokenRevoked`] for a token that was already consumed or revoked, and
-    /// [`AuthError::TokenExpired`] for an expired token.
+    /// [`AuthError::TokenExpired`] for an expired token (checked first, so an expired token never
+    /// looks like reuse), and [`AuthError::RefreshTokenRevoked`] for a token that was already
+    /// consumed or revoked.
     async fn consume_refresh_token(
         &self,
         token_hash: &str,
         now: i64,
+        reason: RevokeReason,
     ) -> AuthResult<RefreshTokenRecord>;
 
-    /// Mark every refresh token belonging to a user as revoked.
+    /// Mark every live refresh token belonging to a user as revoked ([`RevokeReason::Revoked`]).
+    /// Tokens that were already consumed keep their original reason.
     async fn revoke_all_refresh_tokens_for_user(&self, user_id: UserId, now: i64)
         -> AuthResult<()>;
 
@@ -1597,6 +1694,18 @@ impl UserStore for MemoryUserStore {
         Ok(user)
     }
 
+    async fn modify_user(&self, user_id: UserId, change: UserChange) -> AuthResult<User> {
+        let mut users = self.users.write().await;
+        let user = users.get_mut(&user_id).ok_or(AuthError::UserNotFound)?;
+        // Applied to a copy so a failing closure cannot leave a half-edited record behind. The
+        // username is the index key and is never changed through here.
+        let mut edited = user.clone();
+        change(&mut edited)?;
+        edited.username.clone_from(&user.username);
+        *user = edited.clone();
+        Ok(edited)
+    }
+
     async fn delete_user(&self, user_id: UserId) -> AuthResult<()> {
         let mut users = self.users.write().await;
         let mut users_by_username = self.users_by_username.write().await;
@@ -1629,20 +1738,24 @@ impl UserStore for MemoryUserStore {
         &self,
         token_hash: &str,
         now: i64,
+        reason: RevokeReason,
     ) -> AuthResult<RefreshTokenRecord> {
         let mut refresh_tokens = self.refresh_tokens.write().await;
         let record = refresh_tokens
             .get_mut(token_hash)
             .ok_or(AuthError::RefreshTokenNotFound)?;
 
-        if record.revoked_at.is_some() {
-            return Err(AuthError::RefreshTokenRevoked);
-        }
+        // Expiry first: a token past its lifetime is expired whether or not it was also revoked,
+        // so an old record can never be used to provoke the reuse response.
         if now >= record.expires_at {
             return Err(AuthError::TokenExpired);
         }
+        if record.revoked_at.is_some() {
+            return Err(AuthError::RefreshTokenRevoked);
+        }
 
         record.revoked_at = Some(now);
+        record.revoke_reason = Some(reason);
         Ok(record.clone())
     }
 
@@ -1655,6 +1768,7 @@ impl UserStore for MemoryUserStore {
         for record in refresh_tokens.values_mut() {
             if record.user_id == user_id && record.revoked_at.is_none() {
                 record.revoked_at = Some(now);
+                record.revoke_reason = Some(RevokeReason::Revoked);
             }
         }
         Ok(())
@@ -2038,6 +2152,7 @@ impl<S: UserStore> AuthnService<S> {
         role: Role,
     ) -> AuthResult<User> {
         let username = username.into();
+        check_password_policy(password)?;
         if self.store.get_user_by_username(&username).await?.is_some() {
             return Err(AuthError::UsernameExists);
         }
@@ -2075,11 +2190,7 @@ impl<S: UserStore> AuthnService<S> {
         // Enforced here, not only in the UI: the first administrator is created by an
         // unauthenticated call, and an empty or one-character password would make the whole
         // deployment trivially guessable. Rejected before any hashing work.
-        if password.chars().count() < MIN_PASSWORD_CHARS {
-            return Err(AuthError::PasswordTooShort {
-                min: MIN_PASSWORD_CHARS,
-            });
-        }
+        check_password_policy(password)?;
         let password_hash = hash_password(password, &self.config.argon2_params)?;
         let now = Timestamp::now();
         let user = User {
@@ -2111,20 +2222,34 @@ impl<S: UserStore> AuthnService<S> {
         old_password: &str,
         new_password: &str,
     ) -> AuthResult<()> {
-        let mut user = self
+        let user = self
             .store
             .get_user(user_id)
             .await?
             .ok_or(AuthError::UserNotFound)?;
 
+        check_password_policy(new_password)?;
+        // Verifying the current password is a password-guessing oracle for anyone holding a
+        // session token, so it spends the same per-user budget as `login`.
+        let key = username_throttle_key(&user.username);
+        self.reserve_attempt(&key)?;
         if !verify_password(old_password, &user.password_hash)? {
             return Err(AuthError::InvalidCredentials);
         }
+        self.clear_attempts(&key);
 
-        user.password_hash = hash_password(new_password, &self.config.argon2_params)?;
-        bump_epoch(&mut user)?;
-        user.updated_at = Timestamp::now();
-        self.store.update_user(user).await?;
+        let password_hash = hash_password(new_password, &self.config.argon2_params)?;
+        self.store
+            .modify_user(
+                user_id,
+                Box::new(move |user| {
+                    user.password_hash = password_hash;
+                    bump_epoch(user)?;
+                    user.updated_at = Timestamp::now();
+                    Ok(())
+                }),
+            )
+            .await?;
         self.store
             .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
             .await?;
@@ -2136,16 +2261,19 @@ impl<S: UserStore> AuthnService<S> {
     /// Like [`AuthnService::update_password`], this increments the authentication epoch and
     /// revokes every refresh token.
     pub async fn set_password(&self, user_id: UserId, new_password: &str) -> AuthResult<()> {
-        let mut user = self
-            .store
-            .get_user(user_id)
-            .await?
-            .ok_or(AuthError::UserNotFound)?;
-
-        user.password_hash = hash_password(new_password, &self.config.argon2_params)?;
-        bump_epoch(&mut user)?;
-        user.updated_at = Timestamp::now();
-        self.store.update_user(user).await?;
+        check_password_policy(new_password)?;
+        let password_hash = hash_password(new_password, &self.config.argon2_params)?;
+        self.store
+            .modify_user(
+                user_id,
+                Box::new(move |user| {
+                    user.password_hash = password_hash;
+                    bump_epoch(user)?;
+                    user.updated_at = Timestamp::now();
+                    Ok(())
+                }),
+            )
+            .await?;
         self.store
             .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
             .await?;
@@ -2157,17 +2285,17 @@ impl<S: UserStore> AuthnService<S> {
     /// The authentication epoch is incremented so tokens carrying the old role and capabilities
     /// are rejected.
     pub async fn update_role(&self, user_id: UserId, role: Role) -> AuthResult<User> {
-        let mut user = self
-            .store
-            .get_user(user_id)
-            .await?
-            .ok_or(AuthError::UserNotFound)?;
-
-        user.role = role;
-        bump_epoch(&mut user)?;
-        user.updated_at = Timestamp::now();
-        self.store.update_user(user.clone()).await?;
-        Ok(user)
+        self.store
+            .modify_user(
+                user_id,
+                Box::new(move |user| {
+                    user.role = role;
+                    bump_epoch(user)?;
+                    user.updated_at = Timestamp::now();
+                    Ok(())
+                }),
+            )
+            .await
     }
 
     /// Generate a fresh TOTP secret and its `otpauth://` URI for `username`.
@@ -2200,7 +2328,7 @@ impl<S: UserStore> AuthnService<S> {
     /// the attacker's own authenticator. Replacing an active factor is
     /// [`totp_reenroll`](Self::totp_reenroll), which demands a current code.
     pub async fn totp_setup(&self, user_id: UserId) -> AuthResult<(String, String)> {
-        let mut user = self
+        let user = self
             .store
             .get_user(user_id)
             .await?
@@ -2210,12 +2338,25 @@ impl<S: UserStore> AuthnService<S> {
         }
 
         let (secret, uri) = self.new_totp_secret(&user.username);
-        user.totp_secret = Some(secret.clone());
-        user.totp_pending = true;
-        user.totp_pending_secret = None;
-        user.totp_last_step = None;
-        user.updated_at = Timestamp::now();
-        self.store.update_user(user).await?;
+        let stored = secret.clone();
+        self.store
+            .modify_user(
+                user_id,
+                Box::new(move |user| {
+                    // Re-checked under the store's exclusion: a factor confirmed since the read
+                    // above must not be overwritten.
+                    if user.has_totp() {
+                        return Err(AuthError::TotpAlreadyEnabled);
+                    }
+                    user.totp_secret = Some(stored);
+                    user.totp_pending = true;
+                    user.totp_pending_secret = None;
+                    user.totp_last_step = None;
+                    user.updated_at = Timestamp::now();
+                    Ok(())
+                }),
+            )
+            .await?;
 
         Ok((secret, uri))
     }
@@ -2247,21 +2388,25 @@ impl<S: UserStore> AuthnService<S> {
             return Err(AuthError::InvalidTotpCode);
         }
 
-        // Re-read: verification advanced `totp_last_step`, and writing the stale copy back would
-        // un-consume the code that just proved possession.
-        let mut user = self
-            .store
-            .get_user(user_id)
-            .await?
-            .ok_or(AuthError::UserNotFound)?;
-        if !user.has_totp() {
-            // Disabled between the proof and the write; do not resurrect a half-state.
-            return Err(AuthError::TotpNotConfigured);
-        }
+        // Only the pending-secret field is written, atomically: verification advanced
+        // `totp_last_step`, and writing a stale whole record back would un-consume the code that
+        // just proved possession.
         let (secret, uri) = self.new_totp_secret(&user.username);
-        user.totp_pending_secret = Some(secret.clone());
-        user.updated_at = Timestamp::now();
-        self.store.update_user(user).await?;
+        let stored = secret.clone();
+        self.store
+            .modify_user(
+                user_id,
+                Box::new(move |user| {
+                    if !user.has_totp() {
+                        // Disabled between the proof and the write; do not resurrect a half-state.
+                        return Err(AuthError::TotpNotConfigured);
+                    }
+                    user.totp_pending_secret = Some(stored);
+                    user.updated_at = Timestamp::now();
+                    Ok(())
+                }),
+            )
+            .await?;
         Ok((secret, uri))
     }
 
@@ -2301,24 +2446,22 @@ impl<S: UserStore> AuthnService<S> {
             return Err(AuthError::InvalidTotpCode);
         }
 
-        let mut user = self
+        let user = self
             .store
-            .get_user(user_id)
-            .await?
-            .ok_or(AuthError::UserNotFound)?;
-        user.totp_pending = false;
-        bump_epoch(&mut user)?;
-        user.updated_at = Timestamp::now();
-        let user_id = user.id;
-        self.store.update_user(user).await?;
+            .modify_user(
+                user_id,
+                Box::new(|user| {
+                    user.totp_pending = false;
+                    bump_epoch(user)?;
+                    user.updated_at = Timestamp::now();
+                    Ok(())
+                }),
+            )
+            .await?;
         self.store
             .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
             .await?;
-
-        self.store
-            .get_user(user_id)
-            .await?
-            .ok_or(AuthError::UserNotFound)
+        Ok(user)
     }
 
     /// Swap the active secret for the pending replacement once a code from it is presented.
@@ -2340,33 +2483,31 @@ impl<S: UserStore> AuthnService<S> {
             return Err(AuthError::InvalidTotpCode);
         }
 
-        let mut user = self
+        let user = self
             .store
-            .get_user(user_id)
-            .await?
-            .ok_or(AuthError::UserNotFound)?;
-        if user.totp_pending_secret.as_deref() != Some(replacement.as_str()) {
-            // A concurrent re-enrolment replaced or cleared the secret this code was checked
-            // against; do not install a secret the caller did not just prove.
-            return Err(AuthError::InvalidTotpCode);
-        }
-        user.totp_secret = Some(replacement);
-        user.totp_pending = false;
-        user.totp_pending_secret = None;
-        // The confirming step stays recorded (`totp_last_step` was advanced by the verification),
-        // so the code that activated the new secret cannot be replayed against it.
-        bump_epoch(&mut user)?;
-        user.updated_at = Timestamp::now();
-        let user_id = user.id;
-        self.store.update_user(user).await?;
+            .modify_user(
+                user_id,
+                Box::new(move |user| {
+                    if user.totp_pending_secret.as_deref() != Some(replacement.as_str()) {
+                        // A concurrent re-enrolment replaced or cleared the secret this code was
+                        // checked against; do not install a secret the caller did not just prove.
+                        return Err(AuthError::InvalidTotpCode);
+                    }
+                    user.totp_secret = Some(replacement);
+                    user.totp_pending = false;
+                    user.totp_pending_secret = None;
+                    // The confirming step stays recorded (`totp_last_step` was advanced by the
+                    // verification), so the code that activated the new secret cannot be replayed.
+                    bump_epoch(user)?;
+                    user.updated_at = Timestamp::now();
+                    Ok(())
+                }),
+            )
+            .await?;
         self.store
             .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
             .await?;
-
-        self.store
-            .get_user(user_id)
-            .await?
-            .ok_or(AuthError::UserNotFound)
+        Ok(user)
     }
 
     /// Verify a TOTP code for a user.
@@ -2485,22 +2626,23 @@ impl<S: UserStore> AuthnService<S> {
 
     /// Disable TOTP for a user.
     pub async fn totp_disable(&self, user_id: UserId) -> AuthResult<()> {
-        let mut user = self
-            .store
-            .get_user(user_id)
-            .await?
-            .ok_or(AuthError::UserNotFound)?;
-
-        user.totp_secret = None;
-        user.totp_pending = false;
-        user.totp_pending_secret = None;
-        user.totp_last_step = None;
-        // Removing a factor weakens the account, so tokens minted while it was enabled are
-        // retired rather than allowed to outlive the downgrade.
-        bump_epoch(&mut user)?;
-        user.updated_at = Timestamp::now();
-        let user_id = user.id;
-        self.store.update_user(user).await?;
+        self.store
+            .modify_user(
+                user_id,
+                Box::new(|user| {
+                    user.totp_secret = None;
+                    user.totp_pending = false;
+                    user.totp_pending_secret = None;
+                    // The factor is gone, so there is no replay record left to protect.
+                    user.totp_last_step = None;
+                    // Removing a factor weakens the account, so tokens minted while it was enabled
+                    // are retired rather than allowed to outlive the downgrade.
+                    bump_epoch(user)?;
+                    user.updated_at = Timestamp::now();
+                    Ok(())
+                }),
+            )
+            .await?;
         self.store
             .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
             .await?;
@@ -2570,19 +2712,24 @@ impl<S: UserStore> AuthnService<S> {
     ///
     /// # Reuse detection
     ///
-    /// Presenting a token that was already consumed (or revoked) is treated as theft: either the
+    /// Presenting a token that a normal refresh already *rotated* is treated as theft: either the
     /// legitimate client or an attacker is holding a stale copy, and the service cannot tell which.
     /// Every refresh token of that user is revoked and the authentication epoch is bumped, so the
     /// whole token family, including the descendant the thief may already have minted, and every
     /// outstanding access token stop working; the user must log in again. The caller still
-    /// receives [`AuthError::RefreshTokenRevoked`]. A merely unknown or expired token revokes
-    /// nothing. [`revoke_refresh_token`](Self::revoke_refresh_token) (logout) is deliberately
-    /// idempotent and does not trigger this.
+    /// receives [`AuthError::RefreshTokenRevoked`].
+    ///
+    /// Only that one case reacts. A token revoked for any other reason (logout, a password or
+    /// factor change, an earlier reuse response) is answered with `RefreshTokenRevoked` and no side
+    /// effect, as are unknown and expired tokens; and a rotated token is only evidence of theft
+    /// while the user's `auth_epoch` is still the one it was issued under. Otherwise a second
+    /// device's routine refresh after a reset, or anyone holding an old token, could keep signing
+    /// the user out.
     pub async fn refresh(&self, refresh_token: &str) -> AuthResult<TokenPair> {
         let token_hash = hash_refresh_token(refresh_token);
         let record = match self
             .store
-            .consume_refresh_token(&token_hash, now_ts()?)
+            .consume_refresh_token(&token_hash, now_ts()?, RevokeReason::Rotated)
             .await
         {
             Ok(record) => record,
@@ -2608,17 +2755,38 @@ impl<S: UserStore> AuthnService<S> {
         let Some(record) = self.store.get_refresh_token(token_hash).await? else {
             return Ok(());
         };
-        let Some(mut user) = self.store.get_user(record.user_id).await? else {
+        if record.revoke_reason != Some(RevokeReason::Rotated) || now_ts()? >= record.expires_at {
             return Ok(());
-        };
+        }
+        let user_id = record.user_id;
+        let issued_epoch = record.epoch;
+        // One atomic step: the epoch is compared and bumped under the store's exclusion, and no
+        // other field of the record is rewritten (a stale whole-record write would revive a
+        // consumed TOTP code).
+        let bumped = self
+            .store
+            .modify_user(
+                user_id,
+                Box::new(move |user| {
+                    if user.auth_epoch != issued_epoch {
+                        return Err(AuthError::RefreshTokenRevoked);
+                    }
+                    bump_epoch(user)?;
+                    user.updated_at = Timestamp::now();
+                    Ok(())
+                }),
+            )
+            .await;
+        match bumped {
+            // The token predates a reset that already retired its family, or the user is gone.
+            Err(AuthError::RefreshTokenRevoked | AuthError::UserNotFound) => return Ok(()),
+            Err(other) => return Err(other),
+            Ok(_) => {}
+        }
         tracing::warn!(
-            user = %user.id.0,
+            user = %user_id.0,
             "refresh token reuse detected; revoking all of the user's sessions"
         );
-        bump_epoch(&mut user)?;
-        user.updated_at = Timestamp::now();
-        let user_id = user.id;
-        self.store.update_user(user).await?;
         self.store
             .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
             .await
@@ -2634,7 +2802,7 @@ impl<S: UserStore> AuthnService<S> {
     pub async fn revoke_refresh_token(&self, refresh_token: &str) -> AuthResult<()> {
         let token_hash = hash_refresh_token(refresh_token);
         self.store
-            .consume_refresh_token(&token_hash, now_ts()?)
+            .consume_refresh_token(&token_hash, now_ts()?, RevokeReason::LoggedOut)
             .await
             .map(|_record| ())
     }
@@ -2653,15 +2821,16 @@ impl<S: UserStore> AuthnService<S> {
 
     /// Revoke every refresh token for a user and invalidate existing access tokens.
     pub async fn revoke_all_for_user(&self, user_id: UserId) -> AuthResult<()> {
-        let mut user = self
-            .store
-            .get_user(user_id)
-            .await?
-            .ok_or(AuthError::UserNotFound)?;
-
-        bump_epoch(&mut user)?;
-        user.updated_at = Timestamp::now();
-        self.store.update_user(user).await?;
+        self.store
+            .modify_user(
+                user_id,
+                Box::new(|user| {
+                    bump_epoch(user)?;
+                    user.updated_at = Timestamp::now();
+                    Ok(())
+                }),
+            )
+            .await?;
         self.store
             .revoke_all_refresh_tokens_for_user(user_id, now_ts()?)
             .await
@@ -2761,6 +2930,8 @@ impl<S: UserStore> AuthnService<S> {
             iat: now,
             expires_at: refresh_expires_at,
             revoked_at: None,
+            revoke_reason: None,
+            epoch: user.auth_epoch,
             token_id: generate_token_id(),
         };
         self.store.store_refresh_token(record).await?;

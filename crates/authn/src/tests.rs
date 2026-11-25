@@ -256,6 +256,8 @@ async fn memory_store_refresh_token_lifecycle() {
         iat: now,
         expires_at: now + 60,
         revoked_at: None,
+        revoke_reason: None,
+        epoch: 0,
         token_id: "token1".to_string(),
     };
     store.store_refresh_token(record).await.unwrap();
@@ -268,9 +270,14 @@ async fn memory_store_refresh_token_lifecycle() {
             .user_id,
         user_id
     );
-    store.consume_refresh_token("hash1", now).await.unwrap();
+    store
+        .consume_refresh_token("hash1", now, RevokeReason::Rotated)
+        .await
+        .unwrap();
     assert!(matches!(
-        store.consume_refresh_token("hash1", now).await,
+        store
+            .consume_refresh_token("hash1", now, RevokeReason::Rotated)
+            .await,
         Err(AuthError::RefreshTokenRevoked)
     ));
 
@@ -280,6 +287,8 @@ async fn memory_store_refresh_token_lifecycle() {
         iat: now,
         expires_at: now + 60,
         revoked_at: None,
+        revoke_reason: None,
+        epoch: 0,
         token_id: "token2".to_string(),
     };
     store.store_refresh_token(record).await.unwrap();
@@ -301,11 +310,15 @@ async fn memory_store_refresh_token_lifecycle() {
         iat: now - 120,
         expires_at: now - 60,
         revoked_at: None,
+        revoke_reason: None,
+        epoch: 0,
         token_id: "token3".to_string(),
     };
     store.store_refresh_token(expired).await.unwrap();
     assert!(matches!(
-        store.consume_refresh_token("hash3", now).await,
+        store
+            .consume_refresh_token("hash3", now, RevokeReason::Rotated)
+            .await,
         Err(AuthError::TokenExpired)
     ));
 }
@@ -362,12 +375,12 @@ fn password_verification_is_constant_time() {
 async fn create_user_stores_hash_not_plaintext() {
     let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
-        .create_user("alice", "hunter2", Role::viewer())
+        .create_user("alice", "hunter22", Role::viewer())
         .await
         .unwrap();
-    assert_ne!(user.password_hash, "hunter2");
+    assert_ne!(user.password_hash, "hunter22");
     assert!(user.password_hash.starts_with("$argon2id$"));
-    assert!(!format!("{user:?}").contains("hunter2"));
+    assert!(!format!("{user:?}").contains("hunter22"));
 }
 
 #[tokio::test]
@@ -478,12 +491,12 @@ async fn expired_access_token_is_rejected() {
 async fn password_change_revokes_access_token_immediately() {
     let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
-        .create_user("charlie", "oldpass", Role::editor())
+        .create_user("charlie", "oldpass1", Role::editor())
         .await
         .unwrap();
     // The token is minted immediately before the change; the epoch check must reject it even
     // though both operations happen within the same second.
-    let tokens = service.login("charlie", "oldpass", None).await.unwrap();
+    let tokens = service.login("charlie", "oldpass1", None).await.unwrap();
     assert_eq!(
         service
             .verify_access_token(&tokens.access_token)
@@ -494,7 +507,7 @@ async fn password_change_revokes_access_token_immediately() {
     );
 
     service
-        .update_password(user.id, "oldpass", "newpass")
+        .update_password(user.id, "oldpass1", "newpass1")
         .await
         .unwrap();
     assert!(matches!(
@@ -505,18 +518,18 @@ async fn password_change_revokes_access_token_immediately() {
         service.refresh(&tokens.refresh_token).await,
         Err(AuthError::RefreshTokenRevoked)
     ));
-    assert!(service.login("charlie", "oldpass", None).await.is_err());
-    assert!(service.login("charlie", "newpass", None).await.is_ok());
+    assert!(service.login("charlie", "oldpass1", None).await.is_err());
+    assert!(service.login("charlie", "newpass1", None).await.is_ok());
 }
 
 #[tokio::test]
 async fn set_password_revokes_refresh_tokens() {
     let service = AuthnService::new(MemoryUserStore::new(), test_config()).expect("build service");
     let user = service
-        .create_user("dave", "oldpass", Role::viewer())
+        .create_user("dave", "oldpass1", Role::viewer())
         .await
         .unwrap();
-    let tokens = service.login("dave", "oldpass", None).await.unwrap();
+    let tokens = service.login("dave", "oldpass1", None).await.unwrap();
     service.set_password(user.id, "adminpass").await.unwrap();
     assert!(matches!(
         service.refresh(&tokens.refresh_token).await,
@@ -835,6 +848,8 @@ fn debug_redacts_secrets() {
         iat: now_ts().expect("system clock is after the Unix epoch"),
         expires_at: now_ts().expect("system clock is after the Unix epoch") + 60,
         revoked_at: None,
+        revoke_reason: None,
+        epoch: 0,
         token_id: "token-id".to_string(),
     };
     let record_debug = format!("{record:?}");
@@ -892,6 +907,8 @@ fn refresh_token_record_serde_roundtrip() {
         iat: now.timestamp(),
         expires_at: now.timestamp() + 3_600, // one hour
         revoked_at: Some(now.timestamp()),
+        revoke_reason: Some(RevokeReason::Revoked),
+        epoch: 0,
         token_id: token_id.clone(),
     };
 
