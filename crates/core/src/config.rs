@@ -1127,7 +1127,7 @@ pub struct LogSampling {
 /// Caddy's storage object is a module object with the module short name in `module` and the rest of
 /// the backend's fields alongside it (for example `{"module":"file_system","root":"/data"}`).
 /// Backend fields this build does not model are preserved in [`StorageConfig::extra`].
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StorageConfig {
     /// Storage module short name (`caddy.storage.*`), required by Caddy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1151,7 +1151,7 @@ impl StorageConfig {
 }
 
 /// A module object whose JSON inline key is `module` (issuers, TLS on-demand permission, log core).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModuleRef {
     /// Module short name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1163,7 +1163,7 @@ pub struct ModuleRef {
 }
 
 /// A module object whose JSON inline key is `name` (the TLS app's default DNS provider).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NamedModuleRef {
     /// Module short name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1175,7 +1175,7 @@ pub struct NamedModuleRef {
 }
 
 /// A module object whose JSON inline key is `provider` (session-ticket key source).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProviderModuleRef {
     /// Module short name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1186,7 +1186,83 @@ pub struct ProviderModuleRef {
     pub extra: BTreeMap<String, Value>,
 }
 
-/// TLS app configuration (`apps.tls`).
+/// Whether an `extra` key names secret material (token, secret, password, key, credential, api,
+/// auth); matched case-insensitively as a substring.
+fn is_sensitive_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    [
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "key",
+        "credential",
+        "api",
+        "auth",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle))
+}
+
+/// A copy of `value` with every value under a sensitive key replaced by `"<redacted>"` (nested
+/// objects and arrays included); keys stay visible.
+fn redact_value(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| {
+                    let value = if is_sensitive_key(key) {
+                        Value::String("<redacted>".to_string())
+                    } else {
+                        redact_value(value)
+                    };
+                    (key.clone(), value)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(redact_value).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Debug view of a module object's unknown fields with secrets redacted.
+fn redacted_extra(extra: &BTreeMap<String, Value>) -> BTreeMap<&String, Value> {
+    extra
+        .iter()
+        .map(|(key, value)| {
+            let value = if is_sensitive_key(key) {
+                Value::String("<redacted>".to_string())
+            } else {
+                redact_value(value)
+            };
+            (key, value)
+        })
+        .collect()
+}
+
+macro_rules! redacting_extra_debug {
+    ($type:ident, $name_field:ident) => {
+        /// Manual `Debug`: values under token/secret/password/key/credential/api/auth keys of
+        /// the preserved `extra` fields are redacted (SEC-MEDIUM D4 follow-up).
+        impl std::fmt::Debug for $type {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter
+                    .debug_struct(stringify!($type))
+                    .field(stringify!($name_field), &self.$name_field)
+                    .field("extra", &redacted_extra(&self.extra))
+                    .finish()
+            }
+        }
+    };
+}
+
+redacting_extra_debug!(StorageConfig, module);
+redacting_extra_debug!(ModuleRef, module);
+redacting_extra_debug!(NamedModuleRef, name);
+redacting_extra_debug!(ProviderModuleRef, provider);
+
+/// TLS app configuration (`apps.tls`). Its `Debug` is derived: the module objects it holds
+/// (`dns`, issuers) redact their own secrets.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TlsApp {
     /// Certificates to load into memory (`certificates`).
@@ -2533,5 +2609,69 @@ mod debug_redaction {
             assert!(!text.contains("SECRETBODY"), "{text}");
             assert!(text.contains("/etc/ca/root.crt"), "{text}");
         }
+    }
+}
+
+/// SEC-MEDIUM D4 follow-up: module objects keep unknown fields in `extra`, which can carry DNS
+/// provider tokens and storage credentials.
+#[cfg(test)]
+mod debug_redaction_extra {
+    use super::*;
+
+    fn secret_extra() -> BTreeMap<String, Value> {
+        let mut extra = BTreeMap::new();
+        extra.insert("api_token".to_string(), Value::String("TOKENVALUE".into()));
+        extra.insert("region".to_string(), Value::String("eu-west-1".into()));
+        extra.insert(
+            "challenges".to_string(),
+            serde_json::json!({"dns": {"provider": "cf", "api_token": "NESTEDTOKEN",
+                "list": [{"secret_access_key": "NESTEDSECRET"}]}}),
+        );
+        extra
+    }
+
+    #[test]
+    fn module_refs_and_storage_debug_redact_sensitive_extra_values() {
+        let extra = secret_extra();
+        let named = NamedModuleRef {
+            name: Some("cloudflare".to_string()),
+            extra: extra.clone(),
+        };
+        let module = ModuleRef {
+            module: Some("acme".to_string()),
+            extra: extra.clone(),
+        };
+        let provider = ProviderModuleRef {
+            provider: Some("p".to_string()),
+            extra: extra.clone(),
+        };
+        let storage = StorageConfig {
+            module: Some("s3".to_string()),
+            extra: extra.clone(),
+        };
+        let app = TlsApp {
+            dns: Some(named.clone()),
+            ..TlsApp::default()
+        };
+        let texts = [
+            format!("{named:?}"),
+            format!("{module:#?}"),
+            format!("{provider:?}"),
+            format!("{storage:#?}"),
+            format!("{app:?}"),
+            format!("{app:#?}"),
+        ];
+        for text in texts {
+            for secret in ["TOKENVALUE", "NESTEDTOKEN", "NESTEDSECRET"] {
+                assert!(!text.contains(secret), "{text}");
+            }
+        }
+        // Keys and non-sensitive values stay visible.
+        let text = format!("{named:?}");
+        assert!(
+            text.contains("api_token") && text.contains("eu-west-1"),
+            "{text}"
+        );
+        assert!(text.contains("cloudflare"), "{text}");
     }
 }
