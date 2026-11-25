@@ -337,6 +337,19 @@ impl TestResponse {
         }
     }
 
+    /// The header value if present, `None` if absent. The non-panicking counterpart to
+    /// [`Self::header`], for tests that assert on absence (`maybe_header(..).is_some()`), which
+    /// is the case where a panic-on-missing accessor cannot express the assertion at all.
+    pub(crate) fn maybe_header(&self, name: impl AsRef<str>) -> Option<HeaderValueRef<'_>> {
+        let name: &str = name.as_ref();
+        let header_name = HeaderName::from_bytes(name.as_bytes())
+            .unwrap_or_else(|error| panic!("invalid header name {name:?}: {error}"));
+        self.headers.get(&header_name).map(|value| HeaderValueRef {
+            name: name.to_owned(),
+            value,
+        })
+    }
+
     /// All response headers, for tests that assert on presence/absence rather than a value.
     pub(crate) fn headers(&self) -> &axum::http::HeaderMap {
         &self.headers

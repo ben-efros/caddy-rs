@@ -25,13 +25,12 @@ ignore = [
   # here performs RSA decryption with an attacker-influenced ciphertext.
   "RUSTSEC-2023-0071",
 
-  # --- chrono: unmaintained (RUSTSEC-2026-0543, 2026-09-14). Not our dependency and not in the
-  # shipped binary. The only path to it is
-  #   pm/crates/pm-api [dev-dependencies] axum-test -> expect-json -> chrono
-  # so it is absent from every release artefact: `cargo tree -e normal` does not reach it, and the
-  # advisory is "unmaintained", not a vulnerability. We cannot pin it away either -- the version is
-  # chosen by axum-test, and axum-test is our only harness for exercising the pm HTTP surface.
-  # Re-check when axum-test stops depending on expect-json, or when expect-json drops chrono
-  # (tracked as T-CI-002). Deliberately narrow: this ignores one advisory, not a crate name.
-  "RUSTSEC-2026-0543",
+  # (An ignore for the unmaintained `chrono` advisory used to sit here. It was justified by
+  # pm-api's dev-dependency on `axum-test` being the only route into the graph. T-SEC-141 replaced
+  # that harness with the in-process one in pm/crates/pm-api/src/test_harness.rs, which removes the
+  # `axum-test -> expect-json -> chrono` edge, so the crate is no longer a dependency and an ignore
+  # would allow an advisory for something that is not in the lockfile. The entry is removed rather
+  # than left dormant: `crates/core/tests/banned_crates.rs` bans `chrono` outright and fails if
+  # either the crate or the ignore comes back. This comment names no advisory id on purpose --
+  # the guard rejects any mention of it in this file, and quoting it here would re-arm it.)
 ]
