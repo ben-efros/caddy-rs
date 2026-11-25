@@ -38,29 +38,46 @@ stopped answering until they finished.
    If the request future is dropped (HTTP/2 `RST_STREAM`, timeout) the detached hash keeps its
    permit until it really finishes, so cancelled requests cannot multiply concurrent hashes past
    the limit (an earlier revision released the permit with the future and allowed that).
-3. **`hash_cache`.** Repeated (stored hash, password) pairs are answered from a bounded
-   (1000 entries, arbitrary-entry eviction) cache of results, success and failure, like Caddy's
-   `HashCache`, so legitimate clients (browsers resend credentials on every request) neither pay
-   the hash again nor queue behind an attacker. The key is
-   `HMAC-SHA256(per-handler random secret, len(hash) || hash || password)`, so the map cannot be
-   used as an offline password-guessing oracle. It is built-in and always on (Caddy's is an
-   opt-in field; this port does not accept a `hash_cache` JSON field) and is unconditional.
-   Results are cached from inside the blocking job, so a hash whose request was cancelled still
-   pays off. Not copied from Caddy: its in-flight de-duplication of identical concurrent
-   comparisons; identical concurrent uncached pairs each compute once.
+3. **Success cache (like Caddy's `hash_cache`, but successes only).** A repeated (username,
+   stored hash, password) triple that already verified is answered from a bounded cache
+   (1000 entries, second-chance eviction so entries in active use survive) without hashing again,
+   so real clients (browsers resend credentials on every request) neither pay the hash nor queue
+   behind an attacker. Deliberately narrower than Caddy's cache, which also remembers failures: a
+   failure gains no availability, and every junk password would otherwise insert an entry and
+   flush useful ones. Verdicts for unknown usernames (the fake hash) are never cached, and the
+   length-prefixed username is part of every key: otherwise a cached `(nonexistent, P)` verdict
+   would make a repeat probe of an unknown user cheaper than the same probe of a real account, a
+   user-existence oracle that defeats the fake-hash timing equalisation. The key is
+   `HMAC-SHA256(per-handler random secret, username, hash, password)`, so the map cannot be used
+   as an offline password-guessing oracle. The cache is built in and always on (Caddy's is
+   opt-in). The `hash_cache` JSON field is not interpreted; like every other unknown provider key
+   it is silently ignored at load (this handler does not reject unknown keys), so a stock config
+   that sets it still loads. Results are inserted from inside the blocking job, so a hash whose
+   request was cancelled still pays off. Not copied from Caddy: its de-duplication of identical
+   concurrent comparisons.
 4. **Bounded wait.** Without a limit on waiting, an attacker sending more than the pool's
    throughput grows an unbounded queue and every uncached login waits behind it. Under the secure
    default a request that waits more than 5 seconds for a hash permit gets
    `503 Service Unavailable` with `Retry-After: 5` (no challenge, no hash). `stock_compat: true`
    waits indefinitely, as stock Caddy effectively does. Cached credentials are never affected.
    The cap is a wait time, not a queue depth: queue length is bounded by request rate times 5 s.
+5. **Per-client fairness.** Under the secure default one client may have at most 4 uncached
+   verifications in flight (waiting or hashing); the next gets `429 Too Many Requests` with
+   `Retry-After: 5` immediately, so a single source cannot fill the wait queue and push everyone
+   else into the 503. A client is the resolved `client_ip` variable (the server derives it from
+   `trusted_proxies`, as the `client_ip` matcher does) or else the peer address; IPv6 is bucketed
+   by /64. The counter map holds an entry only while that client has a verification in flight, so
+   it is bounded by the number of concurrent requests. Caveat: many users behind one NAT or an
+   untrusted proxy share a bucket; only their first (uncached) login is affected.
 
 ### stock_compat
 
-Items 1 to 3 are behaviour-preserving (identical status codes and results) and apply in both
-settings. Item 4 is a divergence under the secure default: the 503 + `Retry-After` is
+Items 1 and 2 are behaviour-preserving. Item 3 changes timing only (repeat successful logins are
+faster than stock without `hash_cache`); results and status codes are identical, in both settings.
+Items 4 and 5 are divergences under the secure default: the 503 and 429 responses are
 `stock_compat`-gated (`BasicAuthHandler::from_json_with_stock_compat`, fed from
-`HandlerBuildContext::stock_compat`); `stock_compat: true` keeps unbounded waiting.
+`HandlerBuildContext::stock_compat`); `stock_compat: true` keeps unbounded waiting and has no
+per-client cap.
 
 ### Tests
 
@@ -70,24 +87,30 @@ settings. Item 4 is a divergence under the secure default: the 503 + `Retry-Afte
 - `cancelled_requests_keep_their_permit_until_the_hash_finishes` (fails before the permit fix:
   peak in-flight hashes 4 with a limit of 2 after two requests were cancelled; instrumented
   counter);
-- `hash_cache_answers_repeat_credentials_while_the_pool_is_exhausted` (cache hit/miss for success
-  and failure, proven by exhausting the pool), `queue_wait_is_capped_with_503_and_retry_after_by_default`,
-  `stock_compat_waits_for_a_permit_without_a_cap`,
+- `hash_cache_answers_repeat_credentials_while_the_pool_is_exhausted` (a cached success needs no
+  permit, an uncached pair gets 503), `failed_verdicts_are_not_cached`,
+  `unknown_user_probes_cost_the_same_hash_path_as_real_accounts` (failed before: the repeat
+  unknown-user probe was answered 401 from the cache while the pool was exhausted),
+  `hot_cache_entries_survive_a_flood_of_new_entries`,
+  `queue_wait_is_capped_with_503_and_retry_after_by_default`,
+  `stock_compat_waits_for_a_permit_without_a_cap`, `one_client_cannot_fill_the_hash_wait_queue`,
+  `client_buckets_group_ipv6_by_64_and_keep_ipv4_exact`,
   `hash_cache_keys_are_secret_keyed_and_the_cache_is_bounded`;
 - `hash_verification_limiter_caps_concurrency_without_rejecting`,
   `hash_verification_limit_is_a_small_multiple_of_parallelism`,
   `offloaded_verification_still_accepts_and_rejects_each_algorithm`, plus the pre-existing bcrypt /
   Argon2id vector and timing-equalisation tests, which run unchanged through the new path.
 
-Register: divergence for item 4 only. Proposed entry:
+Register: divergence for items 4 and 5 (item 3 is a timing-only difference). Proposed entry:
 
 ```
 - DIV id: (assign)
 - Area: HTTP
 - Caddy behaviour: `basic_auth` verification has no concurrency limit and no wait limit.
 - caddy-rs behaviour: hash computations run on a bounded pool (max(2, cores)); under the secure
-  default a request waiting more than 5 s for a slot gets 503 + `Retry-After: 5`;
-  `stock_compat: true` waits without limit.
+  default a request waiting more than 5 s for a slot gets 503 + `Retry-After: 5`, and a client
+  with 4 uncached verifications already in flight gets 429 + `Retry-After: 5`;
+  `stock_compat: true` waits without limit and has no per-client cap.
 - Rationale: stops a bad-credential flood from growing an unbounded queue that delays every login.
 - Status: intentional hardening (stock_compat restores stock behaviour)
 - Test: `crates/http/src/auth.rs` `queue_wait_is_capped_with_503_and_retry_after_by_default`,
@@ -131,10 +154,32 @@ Open-once also closes a stat-then-reopen race that predates B2: the symlink poli
 symlinks and served under the validators of the earlier path `stat`. On unix the open now uses
 `O_NOFOLLOW | O_NONBLOCK` (constants from the `libc` crate, no unsafe; a final symlink swapped in
 after the check fails with `ELOOP` and is answered 403; a FIFO swapped in cannot hang the open and
-is rejected as not-a-file). Residual: `O_NOFOLLOW` covers only the last component, so an
-intermediate directory swapped for a symlink inside that window is still followed; closing that
-needs `openat2(RESOLVE_NO_SYMLINKS)` or a per-component `openat` walk. Non-unix targets rely on
-the path check only.
+is rejected as not-a-file). The path's own `lstat` type is checked before any `open()`, so a
+device, FIFO, socket or symlink is never opened (including by HEAD); the handle's `fstat` is
+re-checked afterwards. `O_NOFOLLOW` reports `ELOOP` on Linux/macOS/OpenBSD, `EMLINK` on FreeBSD
+and `EFTYPE` on NetBSD; all are mapped to the 403 (the BSD arms are compiled only on those
+targets and were not built here). The `etag_file_extensions` sidecar is opened the same way (a
+symlinked or special sidecar is ignored, never followed) and read up to 1 KiB; a longer sidecar is
+ignored, so the computed ETag is used.
+
+Residual: `O_NOFOLLOW` covers only the last component, so an intermediate directory swapped for a
+symlink inside that window is still followed. Closing it needs
+`openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` or a per-component `openat` walk, for example via
+`rustix`; `rustix` is only a transitive entry in `Cargo.lock` (no workspace crate depends on it),
+so using it would add a direct dependency, which this change deliberately does not do. Only an
+attacker who can write inside the web root can race it. Non-unix targets rely on the path check
+only.
+
+HEAD: a HEAD response has an empty body but now keeps its declared `Content-Length` through
+`to_hyper_streaming_for(response, head)` (the length a GET would send, as Go reports it); a 304
+and a GET whose declared length disagrees with its body still lose the header. The server passes
+the request method at both call sites.
+
+Pre-existing, unchanged: a `root` that is itself a symlink (`/var/www -> /srv/site`) is refused
+403, because `path_contains_symlink` runs `symlink_metadata` on the root before comparing it to
+the root (identical code in the pre-B2 revision). Stock Caddy follows a symlinked root. Operators
+should configure the real path; canonicalising the root once at load is a possible follow-up and
+is not part of this change.
 
 Residual differences, none reachable with a stable file: if a file shrinks after the headers are
 sent the streamed body ends with an I/O error (connection aborted, like Go's short `io.CopyN`) and
@@ -158,6 +203,11 @@ must see a deliberate 300 MiB allocation, otherwise the other two would pass vac
 `crates/server/src/http.rs`: `streamed_static_files_keep_content_length_through_to_hyper_streaming`
 (200, single-range 206 and multipart 206 over 256 KiB through `to_hyper_streaming`; failed before
 with "Content-Length was dropped").
+
+`crates/server/src/http.rs`: `head_keeps_the_declared_content_length`.
+`crates/http/src/file_server.rs`: `etag_sidecar_symlink_is_not_followed`,
+`oversized_etag_sidecar_is_ignored`, `special_files_are_rejected_before_they_are_opened` (a FIFO
+must not reach `open()`; skipped without `mkfifo`); all three failed before.
 
 `crates/http/src/file_server.rs` (a test seam runs between the path checks and the open so the
 swap is deterministic): `symlink_swapped_in_after_the_path_check_is_refused` (served the first
