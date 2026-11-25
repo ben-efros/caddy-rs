@@ -693,11 +693,15 @@ pub struct BasicAuthHandler {
     waiters: std::sync::Arc<ClientWaiters>,
     /// Most uncached verifications one client may have in flight (`None` under `stock_compat`).
     per_client_cap: Option<usize>,
+    /// Hash computations actually run (not served from the cache or a shared flight).
+    hash_runs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Verifications in flight per cache key (single flight).
+    flights: std::sync::Arc<Flights>,
 }
 
 /// In-flight uncached verifications one client (IPv4 address, or IPv6 /64) may have at once under
 /// the secure default; more get 429 immediately instead of queueing behind the hash pool.
-const CLIENT_WAITER_CAP: usize = 4;
+const CLIENT_WAITER_CAP: usize = 8;
 
 type ClientBucket = [u8; 16];
 
@@ -741,9 +745,105 @@ struct WaiterGuard {
     bucket: ClientBucket,
 }
 
+/// Process-wide client table, shared by every `basic_auth` handler like the hash pool it
+/// protects: K handlers must not give one client K times the cap.
+fn global_client_waiters() -> &'static std::sync::Arc<ClientWaiters> {
+    static WAITERS: std::sync::OnceLock<std::sync::Arc<ClientWaiters>> = std::sync::OnceLock::new();
+    WAITERS.get_or_init(std::sync::Arc::default)
+}
+
+/// Verifications in flight per cache key. The first request for a key (the leader) computes;
+/// concurrent identical requests (followers) wait for its result instead of each hashing and
+/// each taking a per-client slot.
+#[derive(Default, Debug)]
+struct Flights {
+    map: std::sync::Mutex<
+        std::collections::HashMap<
+            [u8; 32],
+            std::sync::Arc<tokio::sync::watch::Sender<FlightState>>,
+        >,
+    >,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FlightState {
+    Pending,
+    Done(bool),
+    /// The leader went away without a result (cancelled, refused, overloaded): followers retry.
+    Abandoned,
+}
+
+enum Joined {
+    Leader(FlightLeader),
+    Follower(tokio::sync::watch::Receiver<FlightState>),
+}
+
+/// Completion handle of a flight; moved into the blocking job. Dropping it unfinished (the
+/// request was cancelled before the hash started, or was refused) abandons the flight.
+struct FlightLeader {
+    flights: std::sync::Arc<Flights>,
+    key: [u8; 32],
+    sender: std::sync::Arc<tokio::sync::watch::Sender<FlightState>>,
+    finished: bool,
+}
+
+impl Flights {
+    fn join(self: &std::sync::Arc<Self>, key: [u8; 32]) -> Joined {
+        let mut map = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(sender) = map.get(&key) {
+            return Joined::Follower(sender.subscribe());
+        }
+        let (sender, _receiver) = tokio::sync::watch::channel(FlightState::Pending);
+        let sender = std::sync::Arc::new(sender);
+        map.insert(key, std::sync::Arc::clone(&sender));
+        Joined::Leader(FlightLeader {
+            flights: std::sync::Arc::clone(self),
+            key,
+            sender,
+            finished: false,
+        })
+    }
+}
+
+impl FlightLeader {
+    fn settle(&mut self, state: FlightState) {
+        self.finished = true;
+        self.sender.send_replace(state);
+        let mut map = self
+            .flights
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map
+            .get(&self.key)
+            .is_some_and(|current| std::sync::Arc::ptr_eq(current, &self.sender))
+        {
+            map.remove(&self.key);
+        }
+    }
+
+    fn finish(mut self, matched: bool) {
+        self.settle(FlightState::Done(matched));
+    }
+}
+
+impl Drop for FlightLeader {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.settle(FlightState::Abandoned);
+        }
+    }
+}
+
 impl ClientWaiters {
     fn enter(self: &std::sync::Arc<Self>, bucket: ClientBucket, cap: usize) -> Option<WaiterGuard> {
-        let mut counts = self.counts.lock().ok()?;
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let count = counts.entry(bucket).or_insert(0);
         if *count >= cap {
             return None;
@@ -758,12 +858,15 @@ impl ClientWaiters {
 
 impl Drop for WaiterGuard {
     fn drop(&mut self) {
-        if let Ok(mut counts) = self.owner.counts.lock() {
-            if let Some(count) = counts.get_mut(&self.bucket) {
-                *count -= 1;
-                if *count == 0 {
-                    counts.remove(&self.bucket);
-                }
+        let mut counts = self
+            .owner
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = counts.get_mut(&self.bucket) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.bucket);
             }
         }
     }
@@ -982,8 +1085,10 @@ impl BasicAuthHandler {
                     cache: std::sync::Arc::new(HashCache::new()),
                     limiter: std::sync::Arc::clone(hash_verification_limiter()),
                     max_wait: Some(HASH_QUEUE_MAX_WAIT),
-                    waiters: std::sync::Arc::default(),
+                    waiters: std::sync::Arc::clone(global_client_waiters()),
                     per_client_cap: Some(CLIENT_WAITER_CAP),
+                    hash_runs: std::sync::Arc::default(),
+                    flights: std::sync::Arc::default(),
                 });
             }
             Some(provider) => provider.as_object().ok_or_else(|| {
@@ -1099,8 +1204,10 @@ impl BasicAuthHandler {
             cache: std::sync::Arc::new(HashCache::new()),
             limiter: std::sync::Arc::clone(hash_verification_limiter()),
             max_wait: Some(HASH_QUEUE_MAX_WAIT),
-            waiters: std::sync::Arc::default(),
+            waiters: std::sync::Arc::clone(global_client_waiters()),
             per_client_cap: Some(CLIENT_WAITER_CAP),
+            hash_runs: std::sync::Arc::default(),
+            flights: std::sync::Arc::default(),
         })
     }
 }
@@ -1475,22 +1582,51 @@ impl BasicAuthHandler {
             identity.extend_from_slice(&hash.cache_identity());
             self.cache.key(&identity, &password)
         });
-        if key.as_ref().is_some_and(|key| self.cache.hit(key)) {
-            return Ok(true);
+        // Single flight: identical concurrent (user, password) checks wait for one verification.
+        let mut leader = None;
+        loop {
+            let Some(key) = key.as_ref() else { break };
+            if self.cache.hit(key) {
+                return Ok(true);
+            }
+            match self.flights.join(*key) {
+                Joined::Leader(own) => {
+                    leader = Some(own);
+                    break;
+                }
+                Joined::Follower(mut flight) => {
+                    let state = flight
+                        .wait_for(|state| *state != FlightState::Pending)
+                        .await
+                        .map(|state| *state);
+                    if let Ok(FlightState::Done(matched)) = state {
+                        return Ok(matched);
+                    }
+                    // Abandoned: try again (cache hit, or become the leader).
+                }
+            }
         }
-        // Per-client fairness (secure default only): released when this future ends.
-        let _slot = match (self.per_client_cap, bucket) {
+        // Per-client fairness (secure default only). The slot moves into the blocking job below,
+        // next to the pool permit, so a cancelled request whose hash is still running keeps
+        // counting against its client until that hash really finishes.
+        let slot = match (self.per_client_cap, bucket) {
             (Some(cap), Some(bucket)) => {
                 Some(self.waiters.enter(bucket, cap).ok_or(Refusal::ClientBusy)?)
             }
             _ => None,
         };
         let cache = std::sync::Arc::clone(&self.cache);
+        let runs = std::sync::Arc::clone(&self.hash_runs);
         run_limited_within(&self.limiter, self.max_wait, move || {
+            let _slot = slot;
+            runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let matched = verify_password(&hash, &password);
             // Cached from inside the job so a hash whose request was cancelled still pays off.
             if let Some(key) = key.filter(|_| matched) {
                 cache.insert(key);
+            }
+            if let Some(leader) = leader {
+                leader.finish(matched);
             }
             matched
         })
@@ -2742,7 +2878,7 @@ mod tests {
         );
         let held = Arc::clone(&limiter).acquire_owned().await.unwrap();
         let mut waiting = Vec::new();
-        for index in 0..4 {
+        for index in 0..CLIENT_WAITER_CAP {
             let handler = Arc::clone(&handler);
             // Same /64, different interface identifiers.
             let remote = format!("[2001:db8:1:2::{}]:5555", index + 1);
@@ -2784,7 +2920,7 @@ mod tests {
         let stock = Arc::new(cached_handler(true, &limiter));
         let _held = Arc::clone(&limiter).acquire_owned().await.unwrap();
         let mut pending = Vec::new();
-        for index in 0..6 {
+        for index in 0..(CLIENT_WAITER_CAP + 2) {
             let stock = Arc::clone(&stock);
             pending.push(tokio::spawn(async move {
                 attempt_from(&stock, "203.0.113.7:1", &format!("pw{index}")).await
@@ -2795,6 +2931,140 @@ mod tests {
         for task in pending {
             task.abort();
         }
+    }
+
+    /// B1 round 3: a request future dropped mid-hash (HTTP/2 `RST_STREAM`) must not free its
+    /// per-client slot while the detached hash still holds a global permit, otherwise one client
+    /// could keep unbounded detached hashes running by resetting and resending.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn per_client_slots_stay_taken_until_a_cancelled_hash_finishes() {
+        let value = serde_json::json!({
+            "handler": "basic_auth",
+            "hash": {"algorithm": "bcrypt"},
+            // Cost 12 keeps every hash running for far longer than the test's timings.
+            "accounts": [{"username": "alice", "password": bcrypt::hash("pw", 12).unwrap()}]
+        });
+        let limiter = Arc::new(tokio::sync::Semaphore::new(CLIENT_WAITER_CAP));
+        let handler = Arc::new(
+            BasicAuthHandler::from_json_with_stock_compat(&value, "handler", false)
+                .unwrap()
+                .with_hash_limits(Arc::clone(&limiter), Duration::from_secs(30)),
+        );
+        let mut tasks = Vec::new();
+        for index in 0..CLIENT_WAITER_CAP {
+            let handler = Arc::clone(&handler);
+            tasks.push(tokio::spawn(async move {
+                attempt_from(&handler, "[2001:db8:a::1]:1", &format!("wrong{index}")).await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+        // The cancelled hashes are still running: the client is still at its cap.
+        let Outcome::Respond(response) = tokio::time::timeout(
+            Duration::from_secs(2),
+            attempt_from(&handler, "[2001:db8:a::2]:1", "one-too-many"),
+        )
+        .await
+        .expect("refused immediately, not queued behind the running hashes") else {
+            panic!("expected a response");
+        };
+        assert_eq!(
+            response.status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "cancelled-but-running hashes must keep counting against the client"
+        );
+        // Once they finish the slots come back.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let outcome = attempt_from(&handler, "[2001:db8:a::3]:1", "later").await;
+            if status_of(&outcome) != Some(StatusCode::TOO_MANY_REQUESTS) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "slots never came back"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// B1 round 3: identical concurrent credentials are verified once (single flight) and share
+    /// the result, so a burst of parallel requests with the same new credentials (after a reload,
+    /// behind a proxy) takes one slot, not one each. A shared failure is not cached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn identical_concurrent_credentials_are_verified_once() {
+        use std::sync::atomic::Ordering;
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let handler = Arc::new(
+            cached_handler(false, &limiter)
+                .with_hash_limits(Arc::clone(&limiter), Duration::from_secs(5)),
+        );
+        for (password, expected_ok) in [("pw", true), ("wrong", false)] {
+            let before = handler.hash_runs.load(Ordering::SeqCst);
+            // Hold the pool so every request is registered before the single hash can start.
+            let held = Arc::clone(&limiter).acquire_owned().await.unwrap();
+            let mut tasks = Vec::new();
+            for _ in 0..(CLIENT_WAITER_CAP * 3) {
+                let handler = Arc::clone(&handler);
+                tasks.push(tokio::spawn(async move {
+                    attempt_from(&handler, "[2001:db8:b::1]:1", password).await
+                }));
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(held);
+            for task in tasks {
+                let outcome = task.await.unwrap();
+                assert_eq!(
+                    matches!(outcome, Outcome::Continue(_)),
+                    expected_ok,
+                    "{password}: {:?}",
+                    status_of(&outcome)
+                );
+            }
+            assert_eq!(
+                handler.hash_runs.load(Ordering::SeqCst) - before,
+                1,
+                "{password}: identical concurrent checks must share one hash"
+            );
+        }
+        // The shared failure was not cached: the same wrong pair is computed again.
+        let before = handler.hash_runs.load(Ordering::SeqCst);
+        attempt_from(&handler, "[2001:db8:b::1]:1", "wrong").await;
+        assert_eq!(handler.hash_runs.load(Ordering::SeqCst) - before, 1);
+    }
+
+    /// B1 round 3: the per-client table is process-wide like the hash pool, so many `basic_auth`
+    /// handlers cannot each give a client its own cap.
+    #[test]
+    fn client_waiters_are_shared_by_every_handler() {
+        let value = serde_json::json!({"handler": "basic_auth"});
+        let first = BasicAuthHandler::from_json(&value, "a").unwrap();
+        let second = BasicAuthHandler::from_json(&value, "b").unwrap();
+        assert!(Arc::ptr_eq(&first.waiters, &second.waiters));
+    }
+
+    /// A panic while the table lock is held must not make every later client look over the cap.
+    #[test]
+    fn a_poisoned_client_table_still_admits_clients() {
+        let waiters = Arc::new(ClientWaiters::default());
+        let poisoner = Arc::clone(&waiters);
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.counts.lock().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+        let guard = waiters.enter([7u8; 16], 1);
+        assert!(
+            guard.is_some(),
+            "a poisoned lock must not refuse every client"
+        );
+        drop(guard);
+        assert!(waiters.enter([7u8; 16], 1).is_some());
     }
 
     #[test]
