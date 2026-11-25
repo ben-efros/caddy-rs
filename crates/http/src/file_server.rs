@@ -1886,6 +1886,9 @@ fn stash_streamed_file(streamed: StreamedFile) {
 fn stream_file(streamed: StreamedFile) -> crate::body::Body {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let (sender, receiver) = tokio::sync::mpsc::channel(2);
+    // Exact length of everything the producer below will send, so `Content-Length` survives the
+    // server's framing policy (Go's `ServeContent` always sets it).
+    let total = segments_len(&streamed.segments);
     tokio::spawn(async move {
         let StreamedFile { mut file, segments } = streamed;
         for segment in segments {
@@ -1920,7 +1923,9 @@ fn stream_file(streamed: StreamedFile) -> crate::body::Body {
             }
         }
     });
-    crate::body::Body::from_stream(crate::body::StreamingBody::from_chunks(receiver))
+    crate::body::Body::from_stream(crate::body::StreamingBody::from_chunks_with_len(
+        receiver, total,
+    ))
 }
 
 async fn browse_html(
