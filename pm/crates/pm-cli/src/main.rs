@@ -248,39 +248,81 @@ fn install_pm_unit(unit_path: &Path, content: &str, force: bool) -> anyhow::Resu
     Ok(())
 }
 
+/// Environment variables this installer owns in the bootstrap environment file. Any other line the
+/// operator put there is preserved. (`PM_BOOTSTRAP_ADMIN_TOTP` is listed so a stale code written by
+/// an earlier version is dropped: a code is never stored.)
+const MANAGED_ENV_KEYS: [&str; 3] = [
+    "PM_BOOTSTRAP_ADMIN_PASSWORD",
+    "PM_BOOTSTRAP_ADMIN_TOTP",
+    "PM_BOOTSTRAP_ADMIN_TOTP_SECRET",
+];
+
+const ENV_FILE_HEADER: [&str; 2] = [
+    "# Bootstrap credentials for caddy-rs-pm, read by systemd before it drops privileges.",
+    "# Mode 0600: these values must never appear in the unit file or in the process arguments.",
+];
+
 /// Write (or remove) the environment file that carries the bootstrap credentials.
 ///
-/// The file is the only place a bootstrap password may live: it is written with mode 0600 and is
-/// read by systemd as root, so it never reaches the unit file or the process arguments. Passing no
-/// credentials removes a file left behind by an earlier install, because a stale password must not
-/// keep working after the operator installed without one.
+/// The file holds the bootstrap **password and the TOTP secret** together, so it is not a second
+/// factor against anyone who can read it: it must stay root-owned and mode 0600. It is the only
+/// place they may live: it never reaches the unit file or the process arguments. Lines this
+/// installer does not manage are preserved. Passing no credentials removes the managed lines (and
+/// the file when nothing else is left), because a stale password must not keep working after the
+/// operator installed without one. Values containing a line break are refused, since they would
+/// inject further variables.
 fn write_bootstrap_env_file(
     path: &Path,
     password: Option<&str>,
-    totp: Option<&str>,
     totp_secret: Option<&str>,
 ) -> anyhow::Result<()> {
-    if password.is_none() && totp.is_none() && totp_secret.is_none() {
-        if path.exists() {
+    for (name, value) in [("password", password), ("TOTP secret", totp_secret)] {
+        if value.is_some_and(|v| v.contains(['\n', '\r'])) {
+            bail!("the bootstrap {name} must not contain a line break");
+        }
+    }
+
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let is_managed = |line: &str| {
+        let key = line.trim_start().split('=').next().unwrap_or("").trim();
+        MANAGED_ENV_KEYS.contains(&key)
+    };
+    let kept: Vec<&str> = existing
+        .lines()
+        .filter(|line| {
+            !line.trim().is_empty() && !is_managed(line) && !ENV_FILE_HEADER.contains(line)
+        })
+        .collect();
+
+    if password.is_none() && totp_secret.is_none() {
+        if !path.exists() {
+            return Ok(());
+        }
+        if kept.is_empty() {
             std::fs::remove_file(path)
                 .with_context(|| format!("failed to remove {}", path.display()))?;
             println!(
                 "Removed stale bootstrap environment file: {}",
                 path.display()
             );
+        } else if existing.lines().any(is_managed) {
+            let content = kept.join("\n") + "\n";
+            write_private_file(path, &content)?;
+            println!(
+                "Removed stale bootstrap credentials from {}",
+                path.display()
+            );
         }
         return Ok(());
     }
 
-    let mut content = String::from(
-        "# Bootstrap credentials for caddy-rs-pm, read by systemd before it drops privileges.\n\
-         # Mode 0600: these values must never appear in the unit file or in the process arguments.\n",
-    );
+    let mut content = ENV_FILE_HEADER.join("\n") + "\n";
+    for line in &kept {
+        content.push_str(line);
+        content.push('\n');
+    }
     if let Some(password) = password {
         content.push_str(&format!("PM_BOOTSTRAP_ADMIN_PASSWORD={password}\n"));
-    }
-    if let Some(totp) = totp {
-        content.push_str(&format!("PM_BOOTSTRAP_ADMIN_TOTP={totp}\n"));
     }
     if let Some(secret) = totp_secret {
         content.push_str(&format!("PM_BOOTSTRAP_ADMIN_TOTP_SECRET={secret}\n"));
@@ -294,29 +336,42 @@ fn write_bootstrap_env_file(
     Ok(())
 }
 
-/// Write `content` to `path`, creating the file with mode 0600 and no world-readable window.
+/// Write `content` to `path` with mode 0600 from the first byte, replacing any existing file
+/// atomically: the content goes to a fresh `create_new` temporary file in the same directory (so an
+/// existing 0644 file is never truncated and re-chmodded, and a symlink at the target is replaced,
+/// not followed), then is renamed over the target.
 #[cfg(unix)]
 fn write_private_file(path: &Path, content: &str) -> anyhow::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
-    // `mode` only applies when the file is created, so an existing file is tightened explicitly
-    // below; writing through the same handle keeps the secret out of any second window.
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temporary = path.with_file_name(format!(".{name}.tmp-{}", std::process::id()));
+    // A leftover from a crashed run of this same pid is removed so `create_new` can succeed.
+    let _ = std::fs::remove_file(&temporary);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
-        .open(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    file.write_all(content.as_bytes())
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+        .open(&temporary)
+        .with_context(|| format!("failed to create {}", temporary.display()))?;
+    let written = file
+        .write_all(content.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error).with_context(|| format!("failed to write {}", temporary.display()));
+    }
+    std::fs::rename(&temporary, path)
+        .with_context(|| format!("failed to replace {}", path.display()))?;
     Ok(())
 }
 
@@ -412,22 +467,31 @@ struct GlobalArgs {
     /// Bootstrap admin password for unattended first-run setup.
     ///
     /// Required if PM_BOOTSTRAP_ADMIN_EMAIL is set.
-    #[arg(long, env = "PM_BOOTSTRAP_ADMIN_PASSWORD")]
+    ///
+    /// Passing it as a flag is visible in the process listing; prefer the environment variable.
+    #[arg(long, env = "PM_BOOTSTRAP_ADMIN_PASSWORD", hide_env_values = true)]
     bootstrap_admin_password: Option<String>,
 
-    /// Optional TOTP code for bootstrap admin (if 2FA desired immediately).
+    /// A current TOTP code for the secret in `PM_BOOTSTRAP_ADMIN_TOTP_SECRET`.
     ///
-    /// A *current code* for the secret in `PM_BOOTSTRAP_ADMIN_TOTP_SECRET`; must be set together
-    /// with it.
-    #[arg(long, env = "PM_BOOTSTRAP_ADMIN_TOTP")]
+    /// Used **only by `install`**, once, to check that the secret was copied correctly. It is never
+    /// written to the environment file and `serve` ignores it. The secret itself is read from the
+    /// `PM_BOOTSTRAP_ADMIN_TOTP_SECRET` environment variable only (there is deliberately no flag).
+    #[arg(long, env = "PM_BOOTSTRAP_ADMIN_TOTP", hide_env_values = true)]
     bootstrap_admin_totp: Option<String>,
+}
 
-    /// Base32 TOTP secret for the bootstrap admin, already added to the operator's authenticator.
-    ///
-    /// Requires `PM_BOOTSTRAP_ADMIN_TOTP`. Without a pre-shared secret, enrol through
-    /// `POST /api/v1/auth/totp/setup` after the first login instead.
-    #[arg(long, env = "PM_BOOTSTRAP_ADMIN_TOTP_SECRET")]
-    bootstrap_admin_totp_secret: Option<String>,
+/// Name of the environment variable that carries the bootstrap admin's base32 TOTP secret.
+///
+/// Environment (or the 0600 environment file) only, never a flag: an argument is visible to every
+/// local user in the process listing, and clap would print an environment-backed value in `--help`.
+const BOOTSTRAP_TOTP_SECRET_ENV: &str = "PM_BOOTSTRAP_ADMIN_TOTP_SECRET";
+
+/// The bootstrap TOTP secret from the environment, if one is set and non-empty.
+fn bootstrap_totp_secret_from_env() -> Option<String> {
+    std::env::var(BOOTSTRAP_TOTP_SECRET_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 /// Subcommands.
@@ -756,9 +820,17 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 std::env::current_exe().unwrap_or_else(|_| PathBuf::from("caddy-rs-pm"))
             });
             let env_file = Path::new(CADDY_RS_PM_ENV_PATH);
-            let has_credentials = cli.global.bootstrap_admin_password.is_some()
-                || cli.global.bootstrap_admin_totp.is_some()
-                || cli.global.bootstrap_admin_totp_secret.is_some();
+            // Checked before anything is created. The code is only validated, never stored.
+            let totp_secret = check_install_totp(
+                bootstrap_totp_secret_from_env().as_deref(),
+                cli.global.bootstrap_admin_totp.as_deref(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_secs())
+                    .unwrap_or(0),
+            )?;
+            let has_credentials =
+                cli.global.bootstrap_admin_password.is_some() || totp_secret.is_some();
             // Before the unit is written: a unit that names an account or a writable directory
             // which does not exist fails to start with a generic 217/USER or 226/NAMESPACE that
             // does not mention the missing prerequisite. Creating them here is what makes
@@ -790,8 +862,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             write_bootstrap_env_file(
                 env_file,
                 cli.global.bootstrap_admin_password.as_deref(),
-                cli.global.bootstrap_admin_totp.as_deref(),
-                cli.global.bootstrap_admin_totp_secret.as_deref(),
+                totp_secret.as_deref(),
             )?;
             Ok(())
         }
@@ -806,7 +877,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             });
             uninstall_pm_unit(Path::new(CADDY_RS_PM_UNIT_PATH), &content, force)?;
             // The unit is gone, so its credentials must not outlive it.
-            write_bootstrap_env_file(Path::new(CADDY_RS_PM_ENV_PATH), None, None, None)?;
+            write_bootstrap_env_file(Path::new(CADDY_RS_PM_ENV_PATH), None, None)?;
             Ok(())
         }
     }
@@ -967,52 +1038,51 @@ fn ensure_service_prerequisites(
     Ok(())
 }
 
-/// Shown when `PM_BOOTSTRAP_ADMIN_TOTP` and `PM_BOOTSTRAP_ADMIN_TOTP_SECRET` are not set together.
+/// One-shot check, at `install` time, of the bootstrap TOTP settings; returns the canonical secret to
+/// store (the code is checked here and **never stored**).
 ///
-/// A TOTP code can only be proven against a secret the operator already holds. The daemon used to
-/// mint a fresh random secret on every start and ask for a code for it in advance, which nobody can
-/// supply (about one chance in a million), so that mode could never succeed.
-const BOOTSTRAP_TOTP_PAIR_HELP: &str =
-    "PM_BOOTSTRAP_ADMIN_TOTP (a current code) and PM_BOOTSTRAP_ADMIN_TOTP_SECRET (the base32 secret \
-     it was generated from, already added to your authenticator) must be set together; a code \
-     cannot be proven against a secret the daemon generates at start. To enrol a second factor \
-     without a pre-shared secret, leave both unset and call POST /api/v1/auth/totp/setup after \
-     the first login";
-
-/// Enrol the operator's TOTP secret for the bootstrap admin and prove possession of it.
-///
-/// `totp_setup_with_secret` leaves the secret *pending*, so until `totp_confirm` succeeds the factor
-/// does not gate login: an abandoned bootstrap cannot lock the operator out. On any failure the admin
-/// created by the caller is rolled back rather than left behind with an unconfirmed factor. The
-/// secret never appears in an error or a log line.
-async fn enrol_and_confirm_bootstrap_totp(
-    authn: &AuthnService<MemoryUserStore>,
-    user_id: caddy_rs_authn::UserId,
-    totp_secret: &str,
-    totp_code: &str,
-) -> Result<(), CliError> {
-    let outcome = match authn.totp_setup_with_secret(user_id, totp_secret).await {
-        Ok(()) => authn.totp_confirm(user_id, totp_code).await.map(|_user| ()),
-        Err(error) => Err(error),
-    };
-    if let Err(error) = outcome {
-        // Report which outcome actually happened rather than assuming the rollback worked:
-        // leaving an administrator with an unconfirmed secret is a security problem.
-        let rollback = match authn.delete_user(user_id).await {
-            Ok(()) => "the bootstrap admin was removed".to_string(),
-            Err(delete_error) => format!(
-                "the bootstrap admin could not be removed ({delete_error}) and now exists with an \
-                 UNCONFIRMED TOTP secret; remove it before starting the service"
-            ),
-        };
-        return Err(CliError::InvalidArg(format!(
-            "bootstrap TOTP enrolment failed: {error}; {rollback}. Check that \
-             PM_BOOTSTRAP_ADMIN_TOTP_SECRET is the secret in your authenticator and that \
-             PM_BOOTSTRAP_ADMIN_TOTP is a code it currently shows"
-        )));
+/// The daemon's user store is in memory and is rebuilt from the environment on every start, so a
+/// stored code (valid for 30 seconds) would be stale at the next boot. The operator-provisioned
+/// secret is what `serve` enrols, as an active factor, with no code. Requiring a current code here
+/// is the proof that the secret in the environment is the one in the operator's authenticator, so a
+/// typo is caught now rather than locking the administrator out at the next start.
+fn check_install_totp(
+    secret: Option<&str>,
+    code: Option<&str>,
+    now_secs: u64,
+) -> anyhow::Result<Option<String>> {
+    match (secret, code) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => bail!(
+            "PM_BOOTSTRAP_ADMIN_TOTP is a code and needs PM_BOOTSTRAP_ADMIN_TOTP_SECRET (the base32 \
+             secret it comes from). To enrol a second factor without a pre-shared secret, leave \
+             both unset and call POST /api/v1/auth/totp/setup after the first login"
+        ),
+        (Some(_), None) => bail!(
+            "PM_BOOTSTRAP_ADMIN_TOTP_SECRET needs one current code in PM_BOOTSTRAP_ADMIN_TOTP at \
+             install time, to prove the secret was copied into your authenticator correctly (the \
+             code is not stored)"
+        ),
+        (Some(secret), Some(code)) => {
+            let normalized = caddy_rs_authn::normalize_totp_secret(secret).map_err(|error| {
+                anyhow::anyhow!("PM_BOOTSTRAP_ADMIN_TOTP_SECRET is not acceptable: {error}")
+            })?;
+            let step = caddy_rs_authn::totp_step_at(now_secs);
+            let matches = [step.saturating_sub(1), step, step.saturating_add(1)]
+                .into_iter()
+                .any(|candidate| {
+                    caddy_rs_authn::totp_code_for_step(&normalized, candidate)
+                        .is_some_and(|expected| expected == code.trim())
+                });
+            if !matches {
+                bail!(
+                    "PM_BOOTSTRAP_ADMIN_TOTP is not a current code for PM_BOOTSTRAP_ADMIN_TOTP_SECRET; \
+                     check that the secret in your authenticator is this one and that the clock is right"
+                );
+            }
+            Ok(Some(normalized))
+        }
     }
-    info!("bootstrap admin TOTP enrolled and confirmed");
-    Ok(())
 }
 
 /// The bootstrap-credential flags present in `args` (flag names only, never values).
@@ -1022,11 +1092,7 @@ async fn enrol_and_confirm_bootstrap_totp(
 /// owner-only environment file that `install` writes. The flags still work (removing them would
 /// break existing invocations); `main` warns when one is used.
 fn secret_flags_on_command_line(args: impl IntoIterator<Item = String>) -> Vec<&'static str> {
-    const SECRET_FLAGS: [&str; 3] = [
-        "--bootstrap-admin-password",
-        "--bootstrap-admin-totp",
-        "--bootstrap-admin-totp-secret",
-    ];
+    const SECRET_FLAGS: [&str; 2] = ["--bootstrap-admin-password", "--bootstrap-admin-totp"];
     let mut found = Vec::new();
     for arg in args {
         for flag in SECRET_FLAGS {
@@ -1048,16 +1114,9 @@ async fn bootstrap_admin(
     email: Option<&str>,
     password: Option<&str>,
     totp_secret: Option<&str>,
-    totp_code: Option<&str>,
 ) -> Result<(), CliError> {
     let (Some(email), Some(password)) = (email, password) else {
         return Ok(());
-    };
-    // Settings that cannot work are refused before anything is created.
-    let totp = match (totp_secret, totp_code) {
-        (None, None) => None,
-        (Some(secret), Some(code)) => Some((secret, code)),
-        _ => return Err(CliError::InvalidArg(BOOTSTRAP_TOTP_PAIR_HELP.to_owned())),
     };
     info!(email = %email, "checking for bootstrap admin setup");
     if !store.list_users().await?.is_empty() {
@@ -1079,8 +1138,22 @@ async fn bootstrap_admin(
             other => CliError::InvalidArg(format!("failed to create bootstrap admin: {other}")),
         })?;
 
-    if let Some((secret, code)) = totp {
-        enrol_and_confirm_bootstrap_totp(authn, user.id, secret, code).await?;
+    if let Some(secret) = totp_secret {
+        // Active immediately, no code: this runs on every start (the user store is rebuilt from the
+        // environment), and the secret itself is the possession proof `install` already checked.
+        if let Err(error) = authn.totp_activate_with_secret(user.id, secret).await {
+            let rollback = match authn.delete_user(user.id).await {
+                Ok(()) => "the bootstrap admin was removed".to_string(),
+                Err(delete_error) => format!(
+                    "the bootstrap admin could not be removed ({delete_error}); remove it before \
+                     starting the service"
+                ),
+            };
+            return Err(CliError::InvalidArg(format!(
+                "PM_BOOTSTRAP_ADMIN_TOTP_SECRET is not acceptable: {error}; {rollback}"
+            )));
+        }
+        info!("bootstrap admin second factor enrolled from PM_BOOTSTRAP_ADMIN_TOTP_SECRET");
     }
 
     // The session endpoints read this store, so the admin can log in immediately; the store is
@@ -1153,10 +1226,15 @@ async fn serve(global: GlobalArgs, args: ServeArgs) -> Result<(), CliError> {
         &authn_store,
         global.bootstrap_admin_email.as_deref(),
         global.bootstrap_admin_password.as_deref(),
-        global.bootstrap_admin_totp_secret.as_deref(),
-        global.bootstrap_admin_totp.as_deref(),
+        bootstrap_totp_secret_from_env().as_deref(),
     )
     .await?;
+    if global.bootstrap_admin_totp.is_some() {
+        warn!(
+            "PM_BOOTSTRAP_ADMIN_TOTP is ignored when serving: the code is only checked by \
+             `install`, and the secret in PM_BOOTSTRAP_ADMIN_TOTP_SECRET is what gets enrolled"
+        );
+    }
 
     info!(
         env_override,
@@ -2165,13 +2243,8 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create the test directory");
         let path = dir.join("caddy-rs-pm.env");
 
-        write_bootstrap_env_file(
-            &path,
-            Some("hunter2"),
-            Some("123456"),
-            Some("JBSWY3DPEHPK3PXP"),
-        )
-        .expect("write the environment file");
+        write_bootstrap_env_file(&path, Some("hunter2"), Some(OPERATOR_SECRET))
+            .expect("write the environment file");
         let mode = std::fs::metadata(&path)
             .expect("the environment file exists")
             .permissions()
@@ -2180,17 +2253,130 @@ mod tests {
         assert_eq!(mode, 0o600, "a file carrying a password must be owner-only");
         let content = std::fs::read_to_string(&path).expect("read the environment file");
         assert!(content.contains("PM_BOOTSTRAP_ADMIN_PASSWORD=hunter2"));
-        assert!(content.contains("PM_BOOTSTRAP_ADMIN_TOTP=123456"));
-        assert!(content.contains("PM_BOOTSTRAP_ADMIN_TOTP_SECRET=JBSWY3DPEHPK3PXP"));
+        assert!(content.contains(&format!("PM_BOOTSTRAP_ADMIN_TOTP_SECRET={OPERATOR_SECRET}")));
+        assert!(
+            !content.contains("PM_BOOTSTRAP_ADMIN_TOTP="),
+            "a TOTP code is never stored"
+        );
 
         // Installing without credentials must not leave a stale password behind.
-        write_bootstrap_env_file(&path, None, None, None).expect("remove the environment file");
+        write_bootstrap_env_file(&path, None, None).expect("remove the environment file");
         assert!(!path.exists(), "a stale credentials file must be removed");
 
         std::fs::remove_dir_all(&dir).expect("remove the test directory");
     }
 
     /// Boot the authentication service the way `serve` does, against `data_dir`.
+    #[cfg(unix)]
+    #[test]
+    fn the_environment_file_is_replaced_atomically_and_keeps_unrelated_lines() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("create the test directory");
+        let path = dir.path().join("caddy-rs-pm.env");
+        // A leftover world-readable file with an operator's own variable and a stale code.
+        std::fs::write(
+            &path,
+            "RUST_LOG=debug\nPM_BOOTSTRAP_ADMIN_PASSWORD=old\nPM_BOOTSTRAP_ADMIN_TOTP=123456\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let inode_before = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&path).unwrap());
+
+        write_bootstrap_env_file(&path, Some("new password"), Some(OPERATOR_SECRET)).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("RUST_LOG=debug"),
+            "unrelated line kept: {content}"
+        );
+        assert!(content.contains("PM_BOOTSTRAP_ADMIN_PASSWORD=new password"));
+        assert!(
+            !content.contains("old") && !content.contains("123456"),
+            "{content}"
+        );
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_ne!(
+            std::os::unix::fs::MetadataExt::ino(&metadata),
+            inode_before,
+            "replaced via a new file, not truncated in place"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            leftovers,
+            vec!["caddy-rs-pm.env".to_string()],
+            "no temp file left"
+        );
+
+        // Installing without credentials strips ours but keeps the operator's line (and the file).
+        write_bootstrap_env_file(&path, None, None).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content.trim(), "RUST_LOG=debug");
+    }
+
+    #[test]
+    fn credentials_with_line_breaks_are_refused_not_written() {
+        let dir = tempfile::tempdir().expect("create the test directory");
+        let path = dir.path().join("caddy-rs-pm.env");
+        for bad in ["x\nPM_BOOTSTRAP_ADMIN_EMAIL=evil", "x\ry"] {
+            assert!(write_bootstrap_env_file(&path, Some(bad), None).is_err());
+            assert!(write_bootstrap_env_file(&path, None, Some(bad)).is_err());
+        }
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn install_checks_the_code_once_and_never_needs_it_again() {
+        let now = 1_900_000_000u64;
+        let step = caddy_rs_authn::totp_step_at(now);
+        let code = caddy_rs_authn::totp_code_for_step(OPERATOR_SECRET, step).unwrap();
+
+        let stored = check_install_totp(
+            Some("jbsw y3dp ehpk 3pxp jbsw y3dp ehpk 3pxp"),
+            Some(&code),
+            now,
+        )
+        .unwrap()
+        .expect("a secret to store");
+        assert_eq!(
+            stored, OPERATOR_SECRET,
+            "the canonical form is what gets stored"
+        );
+        assert!(check_install_totp(None, None, now).unwrap().is_none());
+
+        // Neighbouring steps are tolerated (clock skew), a stale code and a wrong one are not.
+        let previous = caddy_rs_authn::totp_code_for_step(OPERATOR_SECRET, step - 1).unwrap();
+        assert!(check_install_totp(Some(OPERATOR_SECRET), Some(&previous), now).is_ok());
+        let old = caddy_rs_authn::totp_code_for_step(OPERATOR_SECRET, step - 5).unwrap();
+        assert!(check_install_totp(Some(OPERATOR_SECRET), Some(&old), now).is_err());
+        assert!(check_install_totp(Some(OPERATOR_SECRET), Some("000000"), now).is_err());
+
+        // Unpairable or unusable settings are refused, naming the variable and never the secret.
+        let no_secret = check_install_totp(None, Some(&code), now)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            no_secret.contains("PM_BOOTSTRAP_ADMIN_TOTP_SECRET")
+                && no_secret.contains("/auth/totp/setup")
+        );
+        let no_code = check_install_totp(Some(OPERATOR_SECRET), None, now)
+            .unwrap_err()
+            .to_string();
+        assert!(no_code.contains("one current code"));
+        let weak = check_install_totp(Some("JBSWY3DPEHPK3PXP"), Some("123456"), now)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            weak.contains("128 bits") && !weak.contains("JBSWY3DPEHPK3PXP"),
+            "{weak}"
+        );
+    }
+
+    const OPERATOR_SECRET: &str = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+
     async fn boot_authn(data_dir: &Path, store: MemoryUserStore) -> AuthnService<MemoryUserStore> {
         let source = resolve_jwt_secret_source(data_dir, None).expect("resolve the signing key");
         AuthnService::new(
@@ -2347,7 +2533,6 @@ mod tests {
             Some("admin@example.com"),
             Some("correct horse battery staple"),
             None,
-            None,
         )
         .await
         .expect("create the bootstrap admin");
@@ -2371,14 +2556,13 @@ mod tests {
             Some("other@example.com"),
             Some("another strong password"),
             None,
-            None,
         )
         .await
         .expect("skip the second bootstrap");
         assert_eq!(authn.list_users().await.expect("list users").len(), 1);
 
         // No credentials configured is a no-op.
-        bootstrap_admin(&authn, &store, None, None, None, None)
+        bootstrap_admin(&authn, &store, None, None, None)
             .await
             .expect("no bootstrap credentials");
         assert_eq!(authn.list_users().await.expect("list users").len(), 1);
@@ -2440,68 +2624,83 @@ mod tests {
         );
     }
 
-    const OPERATOR_SECRET: &str = "JBSWY3DPEHPK3PXP";
-
-    async fn totp_bootstrap(
+    async fn boot_with(
+        store: &MemoryUserStore,
+        dir: &tempfile::TempDir,
         secret: Option<&str>,
-        code: Option<&str>,
-    ) -> (Result<(), CliError>, MemoryUserStore, tempfile::TempDir) {
-        let dir = tempfile::tempdir().expect("create the test directory");
-        let store = MemoryUserStore::new();
+    ) -> (Result<(), CliError>, AuthnService<MemoryUserStore>) {
         let authn = boot_authn(&dir.path().join("data"), store.clone()).await;
         let result = bootstrap_admin(
             &authn,
-            &store,
+            store,
             Some("admin@example.com"),
             Some("correct horse battery staple"),
             secret,
-            code,
         )
         .await;
-        (result, store, dir)
+        (result, authn)
     }
 
     #[tokio::test]
-    async fn a_secret_and_a_matching_code_enrol_the_bootstrap_factor() {
-        let code = caddy_rs_authn::totp_code_for_step(OPERATOR_SECRET, current_totp_step())
-            .expect("a real code");
-        let (result, store, _dir) = totp_bootstrap(Some(OPERATOR_SECRET), Some(&code)).await;
-        result.expect("the operator's secret and a current code succeed");
-        let users = store.list_users().await.expect("list users");
-        assert_eq!(users.len(), 1);
-        assert!(users[0].has_totp(), "the proven factor gates login");
-    }
+    async fn the_bootstrap_factor_is_active_and_survives_every_restart() {
+        let dir = tempfile::tempdir().expect("create the test directory");
+        // The daemon's user store is in memory, so every start begins with an empty store and
+        // re-runs the bootstrap from the same environment. A code stored at install time would be
+        // stale by then; the secret is not.
+        for boot in 1..=3 {
+            let store = MemoryUserStore::new();
+            let (result, authn) = boot_with(&store, &dir, Some(OPERATOR_SECRET)).await;
+            result.unwrap_or_else(|error| panic!("start #{boot} must succeed: {error}"));
+            let users = store.list_users().await.expect("list users");
+            assert!(
+                users[0].has_totp() && !users[0].totp_pending,
+                "factor active"
+            );
 
-    #[tokio::test]
-    async fn a_code_without_a_secret_or_the_reverse_is_refused_before_creating_anything() {
-        for (secret, code) in [(None, Some("123456")), (Some(OPERATOR_SECRET), None)] {
-            let (result, store, _dir) = totp_bootstrap(secret, code).await;
-            let message = result.expect_err("an unpairable setting").to_string();
             assert!(
-                message.contains("PM_BOOTSTRAP_ADMIN_TOTP_SECRET"),
-                "{message}"
+                authn
+                    .login("admin@example.com", "correct horse battery staple", None)
+                    .await
+                    .is_err(),
+                "the factor gates login"
             );
+            // Hashing takes a while in a debug build, so a code can cross into the next 30 s step
+            // before it is checked; a fresh code on the second try covers that boundary.
+            let mut logged_in = false;
+            for _ in 0..2 {
+                let code = caddy_rs_authn::totp_code_for_step(OPERATOR_SECRET, current_totp_step())
+                    .expect("a code derived from the secret");
+                if authn
+                    .login(
+                        "admin@example.com",
+                        "correct horse battery staple",
+                        Some(&code),
+                    )
+                    .await
+                    .is_ok()
+                {
+                    logged_in = true;
+                    break;
+                }
+            }
             assert!(
-                message.contains("/auth/totp/setup"),
-                "points at the normal path: {message}"
-            );
-            assert!(
-                store.list_users().await.unwrap().is_empty(),
-                "nothing is created for a configuration that cannot work"
+                logged_in,
+                "login with a code from the secret on start #{boot}"
             );
         }
     }
 
     #[tokio::test]
-    async fn a_wrong_code_or_a_malformed_secret_rolls_the_admin_back_without_echoing_the_secret() {
-        for (secret, code) in [
-            (OPERATOR_SECRET, "000000"),
-            ("not a base32 secret!!", "000000"),
-        ] {
-            let (result, store, _dir) = totp_bootstrap(Some(secret), Some(code)).await;
-            let message = result.expect_err("enrolment must fail").to_string();
+    async fn a_malformed_or_short_secret_removes_the_admin_without_echoing_it() {
+        for secret in ["not a base32 secret!!", "JBSWY3DPEHPK3PXP"] {
+            let dir = tempfile::tempdir().expect("create the test directory");
+            let store = MemoryUserStore::new();
+            let (result, _authn) = boot_with(&store, &dir, Some(secret)).await;
+            let message = result
+                .expect_err("an unusable secret fails startup")
+                .to_string();
             assert!(
-                message.contains("bootstrap TOTP enrolment failed"),
+                message.contains("PM_BOOTSTRAP_ADMIN_TOTP_SECRET"),
                 "{message}"
             );
             assert!(
@@ -2509,8 +2708,8 @@ mod tests {
                 "the secret must not be echoed: {message}"
             );
             assert!(
-                store.list_users().await.expect("list users").is_empty(),
-                "a failed bootstrap removes the admin it created"
+                store.list_users().await.unwrap().is_empty(),
+                "no half-enrolled admin"
             );
         }
     }
@@ -2561,16 +2760,9 @@ mod tests {
         let store = MemoryUserStore::new();
         let authn = boot_authn(&dir.path().join("data"), store.clone()).await;
 
-        let error = bootstrap_admin(
-            &authn,
-            &store,
-            Some("admin@example.com"),
-            Some("a"),
-            None,
-            None,
-        )
-        .await
-        .expect_err("a one-character password must be refused");
+        let error = bootstrap_admin(&authn, &store, Some("admin@example.com"), Some("a"), None)
+            .await
+            .expect_err("a one-character password must be refused");
         let message = error.to_string();
         assert!(message.contains("PM_BOOTSTRAP_ADMIN_PASSWORD"), "{message}");
         assert!(message.contains("at least 8"), "{message}");
@@ -2607,9 +2799,10 @@ mod tests {
             vec!["--bootstrap-admin-password", "--bootstrap-admin-totp"],
             "each flag is reported once"
         );
-        assert_eq!(
-            secret_flags_on_command_line(args(&["--bootstrap-admin-totp-secret", "JBSWY3DP"])),
-            vec!["--bootstrap-admin-totp-secret"]
+        // The secret has no flag at all (environment only); an unknown flag is not reported as ours.
+        assert!(
+            secret_flags_on_command_line(args(&["--bootstrap-admin-totp-secret", "JBSWY3DP"]))
+                .is_empty()
         );
         // The email is not a secret, and a longer flag that merely shares a prefix is not a match.
         assert!(secret_flags_on_command_line(args(&[
