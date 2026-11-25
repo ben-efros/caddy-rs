@@ -226,8 +226,10 @@ async fn strict_mode_walks_client_ip_headers_right_to_left() {
     runtime.shutdown().await;
 }
 
+/// SEC-MEDIUM-PROXY C1: without `trusted_proxies_strict` the secure right-to-left walk applies, so
+/// the attacker-supplied left-most `X-Forwarded-For` entry is never the client IP.
 #[tokio::test]
-async fn default_non_strict_mode_uses_the_leftmost_value() {
+async fn default_mode_ignores_the_attacker_supplied_leftmost_value() {
     let upstream = spawn_echo_upstream().await;
     let (runtime, address) = start(config(
         &upstream,
@@ -241,10 +243,41 @@ async fn default_non_strict_mode_uses_the_leftmost_value() {
     let body = request(address, &[("X-Forwarded-For", "10.0.0.5, 203.0.113.9")]).await;
     assert_eq!(
         value(&body, "client_ip"),
-        "10.0.0.5",
-        "default (non-strict) mode takes the first valid value left-to-right: {body}"
+        "203.0.113.9",
+        "default mode takes the right-most untrusted value, not the spoofable left-most: {body}"
     );
     runtime.shutdown().await;
+}
+
+/// Stock Caddy's left-most behaviour is kept by an explicit `trusted_proxies_strict: false` and by
+/// `stock_compat true`.
+#[tokio::test]
+async fn explicit_non_strict_and_stock_compat_use_the_leftmost_value() {
+    let upstream = spawn_echo_upstream().await;
+    let ranges = serde_json::json!({"source": "static", "ranges": ["127.0.0.1/32", "10.0.0.0/8"]});
+    for (server_fields, stock_compat) in [
+        (
+            serde_json::json!({"trusted_proxies": ranges, "trusted_proxies_strict": false}),
+            false,
+        ),
+        (serde_json::json!({"trusted_proxies": ranges}), true),
+    ] {
+        let mut config = config(
+            &upstream,
+            "127.0.0.1:0",
+            server_fields,
+            serde_json::Value::Null,
+        );
+        config.stock_compat = Some(stock_compat);
+        let (runtime, address) = start(config).await;
+        let body = request(address, &[("X-Forwarded-For", "10.0.0.5, 203.0.113.9")]).await;
+        assert_eq!(
+            value(&body, "client_ip"),
+            "10.0.0.5",
+            "stock left-most behaviour (stock_compat={stock_compat}): {body}"
+        );
+        runtime.shutdown().await;
+    }
 }
 
 #[tokio::test]

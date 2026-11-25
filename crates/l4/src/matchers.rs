@@ -654,30 +654,27 @@ impl IpRange {
                 "prefix length {prefix} exceeds {max} for {spec:?}"
             )));
         }
+        // A range spelled as an IPv4-mapped IPv6 block (`::ffff:a.b.c.d/n`, n >= 96) is the same set
+        // of clients as the IPv4 range, which is how `contains` compares them (SEC-MEDIUM-PROXY C2).
+        if let (IpAddr::V6(v6), true) = (network, prefix >= 96) {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return Ok(Self {
+                    network: IpAddr::V4(v4),
+                    prefix: prefix - 96,
+                });
+            }
+        }
         Ok(Self { network, prefix })
     }
 
     /// Whether `addr` falls inside this range (families must match).
+    ///
+    /// An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, what a dual-stack `[::]` listener reports for
+    /// an IPv4 client) is also compared as the IPv4 address it stands for, like Caddy's
+    /// `netip.Addr.Unmap()` (SEC-MEDIUM-PROXY C2). The raw spelling is still compared first, so a
+    /// range that genuinely covers the mapped block (`::/0`) keeps matching.
     pub fn contains(&self, addr: IpAddr) -> bool {
-        match (self.network, addr) {
-            (IpAddr::V4(network), IpAddr::V4(addr)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u32::MAX << (32 - u32::from(self.prefix))
-                };
-                (u32::from(network) & mask) == (u32::from(addr) & mask)
-            }
-            (IpAddr::V6(network), IpAddr::V6(addr)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u128::MAX << (128 - u32::from(self.prefix))
-                };
-                (u128::from(network) & mask) == (u128::from(addr) & mask)
-            }
-            _ => false,
-        }
+        caddy_rs_core::net::ip_in_net(self.network, self.prefix, addr)
     }
 }
 
@@ -983,6 +980,54 @@ mod tests {
         ));
         assert!(IpRange::parse("10.0.0.0/33").is_err());
         assert!(IpRange::parse("not-an-ip").is_err());
+    }
+
+    /// SEC-MEDIUM-PROXY C2: on a dual-stack `[::]` listener an IPv4 client appears as
+    /// `::ffff:a.b.c.d`. It must be matched as the IPv4 address, otherwise a negated/deny-style
+    /// `ip` matcher never sees the client in its range.
+    #[test]
+    fn ipv4_mapped_ipv6_peers_match_ipv4_ranges() {
+        let mapped: IpAddr = "::ffff:203.0.113.7".parse().unwrap();
+        let v4_range = IpRange::parse("203.0.113.0/24").unwrap();
+        assert!(
+            v4_range.contains(mapped),
+            "mapped peer is inside the v4 range"
+        );
+        assert!(!v4_range.contains("::ffff:203.0.114.7".parse().unwrap()));
+        assert!(IpRange::parse("0.0.0.0/0").unwrap().contains(mapped));
+        assert!(IpRange::parse("203.0.113.7").unwrap().contains(mapped));
+        // Plain v4 and native v6 behaviour is unchanged; families still do not cross.
+        assert!(v4_range.contains("203.0.113.7".parse().unwrap()));
+        let v6_range = IpRange::parse("2001:db8::/32").unwrap();
+        assert!(v6_range.contains("2001:db8::1".parse().unwrap()));
+        assert!(!v6_range.contains(mapped));
+        assert!(!v4_range.contains("2001:db8::1".parse().unwrap()));
+        // A range spelled in the mapped form is the same set of clients as its v4 spelling.
+        let mapped_range = IpRange::parse("::ffff:203.0.113.0/120").unwrap();
+        assert!(mapped_range.contains("203.0.113.9".parse().unwrap()));
+        assert!(mapped_range.contains(mapped));
+        assert!(!mapped_range.contains("203.0.114.9".parse().unwrap()));
+        // A genuine IPv6 range that covers the mapped block keeps matching mapped peers (the raw
+        // spelling is still compared), so allow-lists written as `::/0` do not shrink.
+        let wide = IpRange::parse("::/0").unwrap();
+        assert!(wide.contains("2001:db8::1".parse().unwrap()));
+        assert!(wide.contains(mapped));
+
+        // The matcher itself, on the mapped peer an `[::]` listener reports.
+        let matcher = IpMatcher::new().with_range(v4_range);
+        assert!(sample(
+            &matcher,
+            b"",
+            &ConnectionMeta {
+                peer: Some(mapped),
+                asn: None
+            }
+        ));
+        let other = ConnectionMeta {
+            peer: Some("::ffff:192.0.2.1".parse().unwrap()),
+            asn: None,
+        };
+        assert!(!sample(&matcher, b"", &other));
     }
 
     #[test]

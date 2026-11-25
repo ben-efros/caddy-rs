@@ -157,27 +157,10 @@ impl IpMatcher {
 
     /// Whether `ip` falls inside the network.
     ///
-    /// An address family mismatch never matches: an IPv4 address cannot be inside an IPv6 network.
+    /// An IPv4-mapped IPv6 peer is also compared as the IPv4 address it stands for; otherwise an
+    /// address family mismatch never matches.
     fn contains(&self, ip: IpAddr) -> bool {
-        match (self.network, ip) {
-            (IpAddr::V4(network), IpAddr::V4(ip)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u32::MAX << (32 - self.prefix)
-                };
-                (u32::from(network) & mask) == (u32::from(ip) & mask)
-            }
-            (IpAddr::V6(network), IpAddr::V6(ip)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u128::MAX << (128 - self.prefix)
-                };
-                (u128::from(network) & mask) == (u128::from(ip) & mask)
-            }
-            _ => false,
-        }
+        caddy_rs_core::net::ip_in_net(self.network, self.prefix, ip)
     }
 }
 
@@ -398,3 +381,27 @@ impl fmt::Display for UdpRouteError {
 }
 
 impl std::error::Error for UdpRouteError {}
+
+#[cfg(test)]
+mod mapped_peer_tests {
+    use super::*;
+
+    fn meta(peer: &str) -> ConnectionMeta {
+        ConnectionMeta {
+            peer: Some(peer.parse().unwrap()),
+            asn: None,
+        }
+    }
+
+    /// Datagram sockets are dual-stack too: an IPv4 peer can arrive as `::ffff:a.b.c.d`
+    /// (SEC-MEDIUM-PROXY C2 review).
+    #[test]
+    fn udp_ip_matcher_matches_ipv4_mapped_peers() {
+        let matcher = IpMatcher::parse("203.0.113.0/24").unwrap();
+        assert!(matcher.matches(&meta("203.0.113.5")));
+        assert!(matcher.matches(&meta("::ffff:203.0.113.5")));
+        assert!(!matcher.matches(&meta("::ffff:198.51.100.5")));
+        let mapped = IpMatcher::parse("::ffff:203.0.113.0/120").unwrap();
+        assert!(mapped.matches(&meta("203.0.113.5")));
+    }
+}
