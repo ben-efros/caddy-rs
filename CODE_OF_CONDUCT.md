@@ -1,30 +1,37 @@
-# Code of conduct
+# Code of Conduct
 
-## Our commitment
+## The short version
 
-This project is a place to do careful engineering in public. Everyone participating — issues,
-pull requests, reviews, discussions — is expected to keep it that way.
+We're here to build software, not win a popularity contest.
 
-## Expected behaviour
+Bring working code, good questions, reproducible bugs, technical arguments, and an unhealthy willingness to read documentation. Leave the nonsense at the door.
 
-- Assume good faith and argue about the code, the tests and the evidence, not the person.
-- Be precise. "This is broken" is less useful than the input, the expected result, the actual result.
-- Accept that "unsupported is a valid answer": maintainers may decline a feature that cannot be
-  implemented faithfully, and that decision is not personal.
-- Respect that security-sensitive reports are handled privately until a fix ships.
+Nobody is required to be your friend. Nobody is required to agree with you. Nobody is required to merge your pull request.
 
-## Unacceptable behaviour
+## The rules (yes, there are a few)
 
-Harassment, discrimination, personal attacks, deliberate disruption, publishing others' private
-information, or pressuring maintainers to merge unreviewed changes.
+- **Argue with the code.** If you think something is stupid, explain why. Ideally with benchmarks, test cases, or something more substantial than a strongly worded emoji.
+- **Bring receipts.** Bugs need reproduction steps. Feature requests need a reason. Claims need evidence. "It doesn't work on my machine" is a starting point, not a diagnosis.
+- **No sacred cows.** Challenge design decisions, question assumptions, and point out bad engineering. That's how software gets better.
+- **No entitlement.** Maintainers owe you neither their time nor a merge button. A declined feature is not a personal attack. Sometimes the answer is no. Sometimes the answer is "absolutely not."
+- **Don't be a security liability.** Vulnerabilities and sensitive information belong in private reports, not public issues where the internet can turn them into a weekend project.
+
+## Things that will get you shown the door
+
+While other projects virtue signal and think open source is about only their "virtues", this one is not. I assure you that nobody here is interested in policing personalities, opinions, humor, or the occasional heated technical disagreement.
+
+Spam, threats, harassment, doxxing, deliberate sabotage, and other behavior that makes maintaining software more trouble than it's worth may result in repercussions you don't like. When you are out in public and aren't hiding in Mommy's basement, follow the law.
 
 ## Enforcement
 
-Report concerns to the maintainer listed in `CODEOWNERS`. Reports are handled privately. The
-maintainer may warn, edit or remove contributions, or block participation, and will explain the
-decision to the person concerned.
+The maintainer(s) reserve the right to remove contributions, close discussions, restrict access, or ban participants who make the project worse.
+
+There is no appeals court, no jury of your peers, and no constitutional convention. This is a software repository.
+
+If you have a legitimate concern, contact the maintainer listed in `CODEOWNERS`.
 
 ## Scope
 
-This applies in all project spaces (repository, issues, pull requests, discussions) and when
-representing the project elsewhere.
+This applies wherever project business happens: repositories, issues, pull requests, discussions, and official project spaces.
+
+**The goal is simple: build good software, have interesting technical discussions, and don't make the maintainers regret opening their laptops.**
