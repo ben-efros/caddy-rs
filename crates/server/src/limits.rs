@@ -123,6 +123,21 @@ impl Default for ServerLimits {
 }
 
 impl ServerLimits {
+    /// The longest a TLS handshake may take before the connection is dropped.
+    ///
+    /// Go's `net/http` (`Server.tlsHandshakeTimeout`) sets a read/write deadline before the
+    /// handshake equal to the smaller of the non-zero `ReadTimeout` and `ReadHeaderTimeout`, so
+    /// stock Caddy bounds a silent or trickling ClientHello by `read_header_timeout` (default
+    /// 1 minute). `TimedIo` and hyper's header timer only start after the handshake, so without
+    /// this a client holding a TCP connection open pinned a task and descriptor forever
+    /// (SEC-MEDIUM-ADMIN-SERVER A4).
+    pub fn tls_handshake_timeout(&self) -> Duration {
+        match self.read_timeout {
+            Some(read_timeout) => read_timeout.min(self.read_header_timeout),
+            None => self.read_header_timeout,
+        }
+    }
+
     /// Parse the limits and timeouts of one Caddy HTTP server object.
     ///
     /// Errors are located at the offending JSON path, for example
@@ -403,6 +418,21 @@ mod tests {
 
     fn nanos(value: Value) -> Result<i64, String> {
         parse_caddy_duration(&value)
+    }
+
+    #[test]
+    fn tls_handshake_timeout_is_the_smaller_of_read_and_read_header_timeout() {
+        // Go: Server.tlsHandshakeTimeout() = min of the non-zero ReadTimeout/ReadHeaderTimeout.
+        let mut limits = ServerLimits::default();
+        assert_eq!(limits.tls_handshake_timeout(), DEFAULT_READ_HEADER_TIMEOUT);
+        limits.read_header_timeout = Duration::from_secs(5);
+        assert_eq!(limits.tls_handshake_timeout(), Duration::from_secs(5));
+        limits.read_timeout = Some(Duration::from_secs(2));
+        assert_eq!(limits.tls_handshake_timeout(), Duration::from_secs(2));
+        limits.read_timeout = Some(Duration::from_secs(9));
+        assert_eq!(limits.tls_handshake_timeout(), Duration::from_secs(5));
+        limits.read_timeout = Some(Duration::from_secs(5));
+        assert_eq!(limits.tls_handshake_timeout(), Duration::from_secs(5));
     }
 
     #[test]

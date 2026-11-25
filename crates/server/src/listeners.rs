@@ -1868,30 +1868,42 @@ async fn serve_accepted<I>(
     let access_log_policy = context.access_log_policy;
     if let Some(tls) = context.tls {
         let acceptor = TlsAcceptor::from(tls);
+        // Go bounds the handshake by min(read_timeout, read_header_timeout); the connection is
+        // dropped when the client does not finish it in time (SEC-MEDIUM-ADMIN-SERVER A4).
+        let handshake_timeout = limits.tls_handshake_timeout();
         let tls_stream = match external_key {
             // A token-held key signs inside the PKCS#11 token: hold a token handshake permit and
             // bound the whole handshake by the token budget (T-TLS-097).
             Some(pool) => {
-                match caddy_rs_tls::tls_server::accept_external_key_handshake(
-                    acceptor, stream, pool,
+                match tokio::time::timeout(
+                    handshake_timeout,
+                    caddy_rs_tls::tls_server::accept_external_key_handshake(acceptor, stream, pool),
                 )
                 .await
                 {
-                    Ok(stream) => stream,
-                    Err(error) => {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
                         // Budget exhaustion and token failures are per-connection errors: log at
                         // debug and drop the connection, like the handshake failure below.
                         tracing::debug!(%error, "TLS handshake failed");
                         return;
                     }
+                    Err(_elapsed) => {
+                        tracing::debug!(?handshake_timeout, "TLS handshake timed out");
+                        return;
+                    }
                 }
             }
-            None => match acceptor.accept(stream).await {
-                Ok(stream) => stream,
-                Err(error) => {
+            None => match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(error)) => {
                     // TLS handshake failures are client-side errors (wrong SNI, protocol
                     // mismatch); log at debug and drop the connection like Caddy does.
                     tracing::debug!(%error, "TLS handshake failed");
+                    return;
+                }
+                Err(_elapsed) => {
+                    tracing::debug!(?handshake_timeout, "TLS handshake timed out");
                     return;
                 }
             },
@@ -3284,10 +3296,19 @@ pub(crate) async fn bind_admin_remote(
                         let _tracked = tracked;
                         // Mandatory mutual TLS: a missing or untrusted client certificate fails
                         // here and the connection is dropped before any admin request is parsed.
-                        let tls = match acceptor.accept(stream).await {
-                            Ok(tls) => tls,
-                            Err(error) => {
+                        let tls = match tokio::time::timeout(
+                            crate::limits::DEFAULT_READ_HEADER_TIMEOUT,
+                            acceptor.accept(stream),
+                        )
+                        .await
+                        {
+                            Ok(Ok(tls)) => tls,
+                            Ok(Err(error)) => {
                                 tracing::debug!(%error, "remote admin TLS handshake failed");
+                                return;
+                            }
+                            Err(_elapsed) => {
+                                tracing::debug!("remote admin TLS handshake timed out");
                                 return;
                             }
                         };
