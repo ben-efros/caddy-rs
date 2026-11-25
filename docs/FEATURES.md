@@ -151,7 +151,7 @@ and the adapter emits the same JSON matcher objects.
 | `rewrite` | `rewrite`, `uri`, `method`, `try_files` | `method`, `uri`, `strip_path_prefix`, `strip_path_suffix`, `uri_substring`, `path_regexp`, `query` | Rewrites the request in Caddy's order: method, URI, prefix strip, suffix strip, substring replacements, regexp replacements, then query operations (`rename`, `set`, `add`, `replace`, `delete`). |
 | `vars` | `vars` | any string, number or boolean field | Sets request variables consumed by later handlers and by `{http.vars.NAME}` placeholders. |
 | `map` | `map` | `source`, `destinations`, `mappings` (`input`/`input_regexp`, `outputs`), `defaults` | Maps a source value to destination placeholders. Mappings are evaluated per destination in order; a matching non-null output wins, otherwise the positional default applies. |
-| `templates` | `templates` | `file_root`, `mime_types`, `delimiters` | Executes buffered response bodies whose content type matches `mime_types` (default `text/html`, `text/plain`, `text/markdown`) as templates. Supports `if`/`else`, `range`, `with`, `define`/`template`, variables, pipelines, field access, and functions including `placeholder`/`ph`, `env`, `include`, `import`, `readFile`, `fileExists`, `html`, `upper`, `lower`, `replace`, `split`, `join`, `truncate` and `stripHTML`. File access is confined to `file_root`. |
+| `templates` | `templates` | `file_root`, `mime_types`, `delimiters`, `env_allow` (caddy-rs extension) | Executes buffered response bodies whose content type matches `mime_types` (default `text/html`, `text/plain`, `text/markdown`) as templates. Supports `if`/`else`, `range`, `with`, `define`/`template`, variables, pipelines, field access, and functions including `placeholder`/`ph`, `env`, `include`, `import`, `readFile`, `fileExists`, `html`, `upper`, `lower`, `replace`, `split`, `join`, `truncate` and `stripHTML`. File access is confined to `file_root`. |
 | `request_body` | `request_body` | `max_size`, `set` | `max_size` bounds how many bytes later handlers may read (exceeding it is `413`); `set` replaces the body with a string and updates `Content-Length`. |
 | `encode` | `encode` | `encodings`, `prefer`, `minimum_length`, `match` | Compresses responses with gzip and zstd. See below. |
 | `authentication` / `basic_auth` | `basic_auth`, `basicauth` | `providers.http_basic` (`accounts`, `hash`, `realm`) | HTTP Basic authentication. See below. |
@@ -210,6 +210,13 @@ The `templates` handler renders with the delimiters `{{` and `}}` by default, co
 `.Cookie`, `.Host`, `.Args`), set response headers through `.RespHeader.Set/Add/Del`, and call the
 functions listed in the handler table. `include`, `import`, `readFile` and `fileExists` resolve
 paths under `file_root` and clamp `..` at that root.
+
+Like stock Caddy, `env` (and `{{placeholder "env.NAME"}}`) can read any process environment
+variable, so a template author can read secrets such as database passwords. When templates are
+untrusted or share a process with secrets, set the caddy-rs extension `env_allow` to an array of
+exact variable names; only those can then be read, and any other name is a template error (HTTP
+500). `env_allow: []` denies all. Absent means stock behaviour. The default `file_root` is the
+request's `{http.vars.root}` (the working directory when empty), as in stock Caddy.
 
 ### Rate limiting
 
