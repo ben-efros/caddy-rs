@@ -712,8 +712,41 @@ impl std::fmt::Display for CliExit {
 
 impl std::error::Error for CliExit {}
 
-#[tokio::main]
-async fn main() -> ExitCode {
+/// Stack size of the thread that runs the program. Windows gives a process's main thread only 1 MiB
+/// (Linux: 8 MiB) and the large async state machines of a debug build overflow it before any work
+/// starts, so the real entry point runs on a thread with an explicit, platform-independent stack.
+const MAIN_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+/// Stack size of the Tokio worker threads, for the same reason (Tokio's default is 2 MiB).
+const WORKER_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+fn main() -> ExitCode {
+    let spawned = std::thread::Builder::new()
+        .name("caddy-rs-main".to_string())
+        .stack_size(MAIN_THREAD_STACK_BYTES)
+        .spawn(|| match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_stack_size(WORKER_THREAD_STACK_BYTES)
+            .build()
+        {
+            Ok(runtime) => runtime.block_on(async_main()),
+            Err(error) => {
+                eprintln!("caddy-rs: error: cannot start the async runtime: {error}");
+                ExitCode::from(1)
+            }
+        });
+    match spawned.map(std::thread::JoinHandle::join) {
+        Ok(Ok(code)) => code,
+        // The panic message was already printed by the panic hook.
+        Ok(Err(_)) => ExitCode::from(101),
+        Err(error) => {
+            eprintln!("caddy-rs: error: cannot start the main thread: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+async fn async_main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli.command).await {
         Ok(()) => ExitCode::SUCCESS,

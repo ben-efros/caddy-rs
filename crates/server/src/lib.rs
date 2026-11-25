@@ -17,6 +17,10 @@ pub(crate) mod auto_https;
 // `CAP_NET_BIND_SERVICE` primitives (ADR-0046, T-CORE-121).
 pub mod bindcap;
 pub mod error;
+#[cfg(unix)]
+pub mod fdstore;
+#[cfg(not(unix))]
+#[path = "fdstore_unsupported.rs"]
 pub mod fdstore;
 #[cfg(feature = "graceful-restart")]
 pub mod graceful_restart;

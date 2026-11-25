@@ -29,8 +29,11 @@ thiserror.workspace = true
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "fs", "signal"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
-sd-notify.workspace = true
 url.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# systemd readiness notification exists only where systemd does. The crate does not compile on
+# Windows (it needs Unix datagram sockets), and the daemon has nothing to notify there.
+[target.'cfg(unix)'.dependencies]
+sd-notify.workspace = true

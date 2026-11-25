@@ -374,6 +374,7 @@ pub struct BindReport {
     pub replaced: usize,
 }
 
+#[cfg(unix)]
 impl BindReport {
     /// The number of descriptors the store holds for this plan once the run has finished.
     ///

@@ -23,6 +23,7 @@ use caddy_rs_pm_runtime::{
 };
 use clap::{Parser, Subcommand};
 use reqwest::Client;
+#[cfg(unix)]
 use sd_notify::NotifyState;
 use serde::Deserialize;
 use thiserror::Error;
@@ -630,8 +631,40 @@ enum CliError {
     Anyhow(#[from] anyhow::Error),
 }
 
-#[tokio::main]
-async fn main() {
+/// Stack size of the thread that runs the program. Windows gives a process's main thread only 1 MiB
+/// (Linux: 8 MiB) and the large async state machines of a debug build overflow it before any work
+/// starts, so the real entry point runs on a thread with an explicit, platform-independent stack.
+const MAIN_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+/// Stack size of the Tokio worker threads, for the same reason (Tokio's default is 2 MiB).
+const WORKER_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+fn main() {
+    let spawned = std::thread::Builder::new()
+        .name("caddy-rs-pm-main".to_string())
+        .stack_size(MAIN_THREAD_STACK_BYTES)
+        .spawn(|| match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_stack_size(WORKER_THREAD_STACK_BYTES)
+            .build()
+        {
+            Ok(runtime) => runtime.block_on(async_main()),
+            Err(error) => {
+                eprintln!("caddy-rs-pm: cannot start the async runtime: {error}");
+                std::process::exit(1);
+            }
+        });
+    match spawned.map(std::thread::JoinHandle::join) {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => std::process::exit(101),
+        Err(error) => {
+            eprintln!("caddy-rs-pm: cannot start the main thread: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn async_main() {
     let cli = Cli::parse();
 
     // Initialize logging.
@@ -1154,12 +1187,15 @@ async fn serve(global: GlobalArgs, args: ServeArgs) -> Result<(), CliError> {
     let local_addr = listener.local_addr()?;
     info!(management_addr = %local_addr, "management API listening");
 
-    // Systemd readiness notification.
-    let sd_notify_enabled = !args.no_sd_notify && sd_notify::booted().unwrap_or(false);
-    if sd_notify_enabled {
-        sd_notify::notify(true, &[NotifyState::Ready])
-            .map_err(|e| CliError::SdNotify(e.to_string()))?;
-        info!("systemd readiness notification sent");
+    // Systemd readiness notification (Unix only: Windows has no `NOTIFY_SOCKET`).
+    #[cfg(unix)]
+    {
+        let sd_notify_enabled = !args.no_sd_notify && sd_notify::booted().unwrap_or(false);
+        if sd_notify_enabled {
+            sd_notify::notify(true, &[NotifyState::Ready])
+                .map_err(|e| CliError::SdNotify(e.to_string()))?;
+            info!("systemd readiness notification sent");
+        }
     }
 
     // Graceful shutdown. axum stops accepting when this future resolves and then drains in-flight

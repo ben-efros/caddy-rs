@@ -39,7 +39,9 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[cfg(feature = "http3")]
 use tokio::net::UdpSocket;
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
@@ -50,7 +52,9 @@ use caddy_rs_core::{Generation, GenerationStore, ListenAddr, Network};
 use caddy_rs_http::{Body, Router};
 use caddy_rs_proxy::trusted_proxies::ServerTrustedProxies;
 
-use crate::activation::{adopt_tcp, adopt_unix, InheritedSocket, LocalSocket};
+#[cfg(unix)]
+use crate::activation::adopt_unix;
+use crate::activation::{adopt_tcp, InheritedSocket, LocalSocket};
 use crate::auto_https::AutomaticHttpsServing;
 use crate::error::Error;
 use crate::http::{serve_request_with_automatic_upgradable, ServedResponse};
@@ -366,6 +370,14 @@ pub(crate) async fn bind(
                 socket_addr: Some(socket_addr),
             })
         }
+        // Windows has AF_UNIX at the OS level but tokio exposes Unix-domain listeners only on
+        // Unix, so a `unix//path` listener is refused loudly there instead of being ignored.
+        #[cfg(not(unix))]
+        Network::Unix => Err(Error::Listen {
+            listen: configured.to_string(),
+            reason: "Unix-domain socket listeners are not supported on Windows; listen on a TCP address such as `127.0.0.1:8080` instead".to_string(),
+        }),
+        #[cfg(unix)]
         Network::Unix => {
             let path = address.address.clone();
             let listener = match inherited {
@@ -740,6 +752,13 @@ fn tcp_socket_options(socket: &impl TcpSocketOptions) -> io::Result<()> {
 }
 
 /// A dual-stack (`IPv6` wildcard with `IPV6_V6ONLY=0`) listening socket for a hostless address.
+/// Backlog for wildcard listeners: the system maximum. Windows' `SOMAXCONN` is a sentinel (`0x7fffffff`)
+/// that asks the stack to pick a reasonable maximum.
+#[cfg(unix)]
+const LISTEN_BACKLOG: i32 = libc::SOMAXCONN;
+#[cfg(not(unix))]
+const LISTEN_BACKLOG: i32 = 0x7fff_ffff;
+
 fn wildcard_dual_stack_listener(port: u16) -> io::Result<TcpListener> {
     let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
     // Caddy (Go) forces IPV6_V6ONLY=0 for `:port`; do not depend on the host's bindv6only default.
@@ -747,7 +766,7 @@ fn wildcard_dual_stack_listener(port: u16) -> io::Result<TcpListener> {
     socket.set_reuse_address(true)?;
     socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
     // Caddy (Go) uses the system `somaxconn` backlog for `:port` wildcard listeners.
-    socket.listen(libc::SOMAXCONN)?;
+    socket.listen(LISTEN_BACKLOG)?;
     socket.set_nonblocking(true)?;
     TcpListener::from_std(socket.into())
 }
@@ -1752,6 +1771,7 @@ fn spawn_tcp_accept_loop(
     })
 }
 
+#[cfg(unix)]
 fn spawn_unix_accept_loop(
     listener: UnixListener,
     listen_key: String,
@@ -2873,12 +2893,14 @@ impl Drop for AdminSocketPath {
 /// Clients only need write permission to `connect(2)`, but an owner-only socket keeps the admin
 /// API unreachable for other users of the host, which is the reason to use a Unix socket instead
 /// of a loopback TCP port.
+#[cfg(unix)]
 fn set_admin_socket_permissions(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
 /// Bind the admin API to a Unix domain socket.
+#[cfg(unix)]
 async fn bind_admin_unix(
     configured: &str,
     path: &str,
@@ -2964,7 +2986,15 @@ pub(crate) async fn bind_admin(
         reason,
     })?;
     if address.network == Network::Unix {
+        #[cfg(unix)]
         return bind_admin_unix(configured, &address.address, api).await;
+        // Windows: no tokio Unix-domain listener, and no owner-only socket file to protect the
+        // admin API with. Refuse rather than fall back to something weaker.
+        #[cfg(not(unix))]
+        return Err(Error::Listen {
+            listen: configured.to_string(),
+            reason: "Unix-domain admin sockets are not supported on Windows; use a loopback TCP admin address (the default `localhost:2019`)".to_string(),
+        });
     }
     if address.network != Network::Tcp {
         return Err(Error::NotImplemented {
@@ -3856,7 +3886,7 @@ mod client_certificate_tests {
 }
 
 /// Tests for the Unix-domain-socket admin listener (`admin.listen: "unix/<path>"`).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod admin_unix_tests {
     use super::bind_admin;
     use caddy_rs_admin::AdminApi;

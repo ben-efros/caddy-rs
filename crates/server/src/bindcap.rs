@@ -602,6 +602,23 @@ where
     }
 }
 
+/// Platforms without Linux capabilities (Windows) never escalate: a failed bind returns its original
+/// error unchanged. Binding a port below 1024 needs no privilege on Windows, so there is nothing to
+/// raise, mirroring the oracle's `bindcap_other.go` stub.
+#[cfg(not(target_os = "linux"))]
+pub fn with_bind_capability<T, F>(
+    _address: &ListenAddr,
+    first_error: std::io::Error,
+    _attempt: F,
+) -> std::result::Result<T, std::io::Error>
+where
+    T: Send + 'static,
+    F: FnOnce() -> std::result::Result<T, std::io::Error> + Send + 'static,
+{
+    note_seam_entry();
+    Err(first_error)
+}
+
 #[cfg(test)]
 #[allow(unsafe_code)] // one test calls prctl directly to construct the ambient-true case.
 mod tests {

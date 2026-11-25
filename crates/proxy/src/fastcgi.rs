@@ -649,10 +649,6 @@ impl FastCgiTransport {
                     ))),
                 }
             }
-            #[cfg(not(unix))]
-            Transport::Unix { .. } => Err(FastCgiError::Connect(
-                "unix sockets are not supported on this platform".to_string(),
-            )),
         }
     }
 
