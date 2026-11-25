@@ -1137,22 +1137,33 @@ fn hash_verification_limit() -> usize {
 
 /// Process-wide limiter shared by every `basic_auth` handler instance, so the bound holds for
 /// the whole server rather than per route.
-fn hash_verification_limiter() -> &'static tokio::sync::Semaphore {
-    static LIMITER: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    LIMITER.get_or_init(|| tokio::sync::Semaphore::new(hash_verification_limit()))
+fn hash_verification_limiter() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static LIMITER: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    LIMITER
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(hash_verification_limit())))
 }
 
 /// Run blocking `work` on the blocking pool once a permit is free. Callers beyond the limit wait
 /// asynchronously (they never occupy a worker thread and are never rejected, so response codes
 /// stay exactly Caddy's). A cancelled/panicked job counts as a failed verification.
-async fn run_limited<F>(limiter: &tokio::sync::Semaphore, work: F) -> bool
+///
+/// The permit moves INTO the blocking closure: if the request future is dropped (HTTP/2
+/// `RST_STREAM`, timeout) the detached hash keeps its permit until it really finishes, so
+/// cancelled requests cannot multiply concurrent hashes beyond the limit.
+async fn run_limited<F>(limiter: &std::sync::Arc<tokio::sync::Semaphore>, work: F) -> bool
 where
     F: FnOnce() -> bool + Send + 'static,
 {
-    let Ok(_permit) = limiter.acquire().await else {
+    let Ok(permit) = std::sync::Arc::clone(limiter).acquire_owned().await else {
         return false;
     };
-    tokio::task::spawn_blocking(work).await.unwrap_or(false)
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Verify `password` against `hash` without blocking an async worker. bcrypt (cost 14 for the
@@ -2164,8 +2175,8 @@ mod tests {
     /// B1 (SEC-MEDIUM-HTTP): password hashing is CPU-heavy (the unknown-user fake bcrypt hash is
     /// cost 14, about a second). It must run off the async workers, otherwise a few concurrent
     /// bad-credential requests starve every tokio worker and the whole server stops answering.
-    /// With two workers and eight in-flight bad-credential requests, an unrelated timer task must
-    /// still be serviced promptly.
+    /// With a single worker thread and eight in-flight bad-credential requests, an unrelated timer
+    /// task must still be serviced promptly.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn bad_credentials_do_not_starve_the_async_workers() {
         let handler = std::sync::Arc::new(basic_auth_handler(serde_json::json!({
@@ -2242,6 +2253,57 @@ mod tests {
         }
         assert!(peak.load(Ordering::SeqCst) <= 2, "limit exceeded");
         assert!(peak.load(Ordering::SeqCst) >= 1);
+    }
+
+    /// SEC-MEDIUM-HTTP B1 review: a dropped request future (h2 RST_STREAM, timeout) detaches the
+    /// blocking job but must NOT free its permit, otherwise cancelled requests let unbounded
+    /// concurrent hashes run. Permits are released only when the hash really finishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_requests_keep_their_permit_until_the_hash_finishes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let running = std::sync::Arc::new(AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(AtomicUsize::new(0));
+        let job = |running: std::sync::Arc<AtomicUsize>, peak: std::sync::Arc<AtomicUsize>| {
+            move || {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(300));
+                running.fetch_sub(1, Ordering::SeqCst);
+                true
+            }
+        };
+        let mut cancelled = Vec::new();
+        for _ in 0..2 {
+            let (limiter, running, peak) = (limiter.clone(), running.clone(), peak.clone());
+            cancelled.push(tokio::spawn(async move {
+                run_limited(&limiter, job(running, peak)).await
+            }));
+        }
+        // Let both jobs start on the blocking pool, then cancel the request futures.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        for task in &cancelled {
+            task.abort();
+        }
+        for task in cancelled {
+            let _ = task.await;
+        }
+        // Eight more requests arrive while the two orphaned hashes are still running.
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let (limiter, running, peak) = (limiter.clone(), running.clone(), peak.clone());
+            tasks.push(tokio::spawn(async move {
+                run_limited(&limiter, job(running, peak)).await
+            }));
+        }
+        for task in tasks {
+            assert!(task.await.unwrap());
+        }
+        assert!(
+            peak.load(Ordering::SeqCst) <= 2,
+            "in-flight hashes exceeded the limit after cancellation: {}",
+            peak.load(Ordering::SeqCst)
+        );
     }
 
     #[test]
