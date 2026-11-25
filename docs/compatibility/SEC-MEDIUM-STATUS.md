@@ -13,7 +13,9 @@ directory" check and fails about 30 server tests for environmental reasons).
 | Run | Result |
 |---|---|
 | `cargo test --workspace --no-fail-fast` on the final tree | 180 test binaries, **4181 passed, 3 failed** (the three below) |
-| `cargo test -p caddy-rs --features graceful-restart --test zero_downtime_restart`, 5 consecutive runs on an idle host | 5/5 runs, 5 tests each, all passing, including `an_upgrade_hands_the_unix_admin_socket_to_the_new_process` |
+| **Combined tree** (medium fixes + the High fixes + `master`, merge commit `51cffd0`, now `master`): `cargo test --workspace --no-fail-fast` | 181 test binaries, **4218 passed, 4 failed**: the three known failures below plus `caddy-rs-proxy` `client::tests::explicit_port_local_address_sets_reuseaddr_and_not_no_port`, which binds the hard-coded port 45678 and collided during the parallel run (passes 3/3 in isolation; pre-existing flake, not caused by the merge) |
+| Combined tree, `zero_downtime_restart` with `graceful-restart` | 1 run of 3 failed (3 of 5 tests) while another session was running a workspace test on the same machine; 6 of 6 further runs passed (5 tests each) |
+| `cargo test -p caddy-rs --features graceful-restart --test zero_downtime_restart`, 5 consecutive runs on an idle host (tree before the High fixes were merged in) | 5/5 runs, 5 tests each, all passing, including `an_upgrade_hands_the_unix_admin_socket_to_the_new_process` |
 | CLI test binary (`--test cli`) 6 times under 8 busy-loop CPU hogs | base: 6/6 pass; integrated tree: 6/6 pass (133 tests each) |
 | Mutation check of the proxy dial classifier (allow `system.`/`time.`/`$` as operator-controlled) | `vars_handler_cannot_smuggle_request_data_into_system_placeholders` and `template_classification_is_conservative` both fail; original restored |
 | Native Windows `cargo test -p caddy-rs-pm-core -p caddy-rs-pm-compiler` | 40 and 17 passed |
@@ -82,13 +84,15 @@ checkout.
 ## Open items and decisions for later
 
 * **The four HIGH fixes** (`file_server` Windows path traversal, default buffered-body cap, proxy
-  manager first-admin setup token, ACME key file permissions) are on a separate branch and are
-  **not** in this tree. Expect textual overlap when the two are merged in at least:
-  `crates/http/src/file_server.rs`, `crates/server/src/{http,limits,listeners}.rs`,
-  `crates/tls/src/acme/mod.rs`, `crates/authn/src/lib.rs`, `pm/crates/pm-api/src/{lib,tests}.rs`,
-  `pm/crates/pm-cli/src/main.rs`, `pm/ui/src/{api.ts,views/Login.tsx}` and `Cargo.lock`. The
-  setup-token work and this branch's bootstrap-admin changes both touch
-  `bootstrap_admin`/`auth_setup_handler`.
+  manager first-admin setup token, ACME key file permissions) were developed on a separate branch
+  (`claude/rust-caddy-security-review-923b6e`) and are now merged together with this work. The
+  merge conflicted in three files, resolved by keeping both sides: `crates/server/src/limits.rs`
+  (admin limits and handshake timeout plus the buffered-body limit), `crates/server/src/http.rs`
+  (`is_head` for the streaming response plus the body-failure replacement) and
+  `crates/http/src/file_server.rs` (the `HideMatcher` refactor plus the Windows `\`/case
+  normalisation, now `normalise_hide_path`). No new tests were written for the merge itself; it is
+  covered by the existing suites above. The Windows-only `file_server` guards cannot be exercised
+  here (the workspace does not build on Windows).
 * Group notes list residual risks that were accepted and documented rather than fixed (RFC 1918
   reachability from request-derived dials, intermediate-directory symlink swaps in `file_server`,
   no automatic re-issue of revoked managed certificates, no internal-CA name constraints, no
