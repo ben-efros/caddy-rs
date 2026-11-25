@@ -62,14 +62,34 @@ impl IpNet {
         if prefix > max_prefix {
             return Err(format!("CIDR prefix /{prefix} is too large for `{value}`"));
         }
+        // A network spelled as an IPv4-mapped IPv6 block (`::ffff:a.b.c.d/n`, n >= 96) is the same
+        // set of clients as the IPv4 network, which is how `contains` compares them.
+        if let (IpAddr::V6(v6), true) = (address, prefix >= 96) {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return Ok(Self {
+                    network: IpAddr::V4(v4),
+                    prefix: prefix - 96,
+                });
+            }
+        }
         Ok(Self {
             network: address,
             prefix,
         })
     }
 
-    /// Whether `address` falls inside this network (same address family only).
+    /// Whether `address` falls inside this network (same address family only, after IPv4-mapped
+    /// IPv6 canonicalisation).
+    ///
+    /// A dual-stack `[::]` listener reports IPv4 peers as `::ffff:a.b.c.d`; like Caddy's
+    /// `netip.Addr.Unmap()` and the handler-level check, the IPv4 form is compared too
+    /// (SEC-MEDIUM-PROXY C2). The raw spelling is compared first so a range that genuinely covers the
+    /// mapped block (`::/0`) keeps matching.
     pub fn contains(&self, address: IpAddr) -> bool {
+        self.contains_exact(address) || self.contains_exact(address.to_canonical())
+    }
+
+    fn contains_exact(&self, address: IpAddr) -> bool {
         match (self.network, address) {
             (IpAddr::V4(network), IpAddr::V4(address)) => {
                 let mask = if self.prefix == 0 {
@@ -222,7 +242,7 @@ impl ServerTrustedProxies {
             }
             return (false, String::new());
         };
-        let peer_ip = peer.ip();
+        let peer_ip = peer.ip().to_canonical();
         let trusted = self.ranges.iter().any(|network| network.contains(peer_ip));
         if !trusted {
             return (false, peer_ip.to_string());
@@ -380,7 +400,7 @@ fn parse_client_ip(value: &str) -> Option<IpAddr> {
         return None;
     }
     if let Ok(address) = value.parse::<std::net::SocketAddr>() {
-        return Some(address.ip());
+        return Some(address.ip().to_canonical());
     }
     let value = value.strip_prefix('[').unwrap_or(value);
     let value = value.split(']').next().unwrap_or(value);
@@ -390,6 +410,7 @@ fn parse_client_ip(value: &str) -> Option<IpAddr> {
         .unwrap_or(value)
         .parse::<IpAddr>()
         .ok()
+        .map(|address| address.to_canonical())
 }
 
 fn invalid(path: &str, message: impl Into<String>) -> HttpError {
@@ -602,6 +623,64 @@ mod tests {
         let stock = ServerTrustedProxies::from_server_json_with_stock_compat(&unix, "server", true)
             .unwrap();
         assert_eq!(stock.determine(&unix_request).1, "192.0.2.1");
+    }
+
+    /// SEC-MEDIUM-PROXY C2: a dual-stack `[::]` listener reports IPv4 peers as `::ffff:a.b.c.d`.
+    /// They must be matched against the trusted IPv4 ranges (and forwarded entries likewise), and
+    /// the resolved client IP is the canonical dotted form, like the handler-level check.
+    #[test]
+    fn ipv4_mapped_ipv6_addresses_are_canonicalised() {
+        let net = IpNet::parse("10.0.0.0/8").unwrap();
+        assert!(net.contains("::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!net.contains("::ffff:11.1.2.3".parse().unwrap()));
+        assert!(net.contains("10.1.2.3".parse().unwrap()));
+        assert!(!net.contains("2001:db8::1".parse().unwrap()));
+        // A range spelled in mapped form equals the IPv4 range.
+        let mapped_net = IpNet::parse("::ffff:10.0.0.0/104").unwrap();
+        assert!(mapped_net.contains("10.1.2.3".parse().unwrap()));
+        assert!(mapped_net.contains("::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!mapped_net.contains("11.1.2.3".parse().unwrap()));
+        // A genuine IPv6 range covering the mapped block keeps matching.
+        assert!(IpNet::parse("::/0")
+            .unwrap()
+            .contains("::ffff:10.1.2.3".parse().unwrap()));
+
+        let server = serde_json::json!({
+            "trusted_proxies": {"source": "static", "ranges": ["10.0.0.0/8"]}
+        });
+        for strict in [true, false] {
+            let trusted = ServerTrustedProxies::from_server_json_with_stock_compat(
+                &{
+                    let mut server = server.clone();
+                    server["trusted_proxies_strict"] = serde_json::json!(strict);
+                    server
+                },
+                "server",
+                false,
+            )
+            .unwrap();
+            // Mapped trusted peer, mapped client in the header.
+            let mapped = request(Some("[::ffff:10.0.0.5]:1234"), Some("::ffff:203.0.113.9"));
+            assert_eq!(
+                trusted.determine(&mapped),
+                (true, "203.0.113.9".to_string()),
+                "strict={strict}"
+            );
+            // Strict walk must also skip a mapped trusted hop.
+            let hop = request(
+                Some("[::ffff:10.0.0.5]:1234"),
+                Some("203.0.113.9, ::ffff:10.0.0.2"),
+            );
+            if strict {
+                assert_eq!(trusted.determine(&hop).1, "203.0.113.9");
+            }
+            // Untrusted mapped peer: not trusted, client IP is the canonical peer.
+            let outside = request(Some("[::ffff:198.51.100.7]:1234"), Some("203.0.113.9"));
+            assert_eq!(
+                trusted.determine(&outside),
+                (false, "198.51.100.7".to_string())
+            );
+        }
     }
 
     #[test]

@@ -50,6 +50,46 @@ IPv6 with port), `stock_behaviour_is_left_most_with_explicit_opt_out_or_stock_co
 `explicit_non_strict_and_stock_compat_use_the_leftmost_value` (real listeners and a real
 `reverse_proxy` upstream).
 
+## C2 — IPv4-mapped IPv6 peers are canonicalised before range comparisons (parity)
+
+### Upstream source of truth (v2.11.9)
+
+`modules/caddyhttp/ip_range.go` / `matchers.go` (`parseIPZoneFromString`) and `server.go`
+(`determineTrustedProxy`) compare addresses after `netip.Addr.Unmap()`, and caddy-rs already records
+the same behaviour for the reverse-proxy peer in DIV-0098 (`handler.rs`, `to_canonical()`). This is
+therefore parity, applied unconditionally (no `stock_compat` switch). Exact Go call sites are cited
+from knowledge of the upstream tree and should be re-verified against the pinned `external/caddy`
+checkout when the register entry is merged.
+
+### The weakness
+
+A dual-stack `[::]` listener reports an IPv4 client as `::ffff:a.b.c.d`. `IpRange::contains` (layer4
+`ip` matcher) and `IpNet::contains` / `ServerTrustedProxies::determine` (server `trusted_proxies`)
+returned `false` across address families, so a negated or deny-style `ip` matcher
+(`not ip 203.0.113.0/24`) never saw the client inside its range (deny bypass), and a mapped trusted
+proxy was not trusted at the server level while the handler-level check trusted it.
+
+### Implemented behaviour
+
+- `crates/l4/src/matchers.rs` `IpRange::contains` and `crates/proxy/src/trusted_proxies.rs`
+  `IpNet::contains` compare the raw address and its `to_canonical()` form. The raw form is compared
+  first so a genuine IPv6 range covering the mapped block (`::/0`) keeps matching mapped peers.
+- A range written as a mapped block (`::ffff:a.b.c.d/n`, `n >= 96`) is stored as the IPv4 range
+  `a.b.c.d/(n-96)`.
+- `ServerTrustedProxies::determine` canonicalises the peer, and addresses parsed from forwarded
+  headers are canonicalised, so the resolved client IP is the dotted IPv4 string.
+
+HTTP-engine matchers outside this group (`crates/http/src/matchers.rs` `remote_ip`/`client_ip`,
+`crates/http/src/auth.rs`, `crates/http/src/acme_server.rs`) have their own range types with the
+same cross-family `false` and are not changed by this item.
+
+### Tests that pin it
+
+`crates/l4/src/matchers.rs` `ipv4_mapped_ipv6_peers_match_ipv4_ranges` (allow and deny, `/0`, host
+route, IPv6 ranges, mapped range spelling, mixed families, matcher on a mapped peer);
+`crates/proxy/src/trusted_proxies.rs` `ipv4_mapped_ipv6_addresses_are_canonicalised` (mapped peer,
+mapped forwarded entries, strict and non-strict, untrusted mapped peer).
+
 ## Proposed register entries (program repository)
 
 ```text
@@ -70,4 +110,18 @@ IPv6 with port), `stock_behaviour_is_left_most_with_explicit_opt_out_or_stock_co
   `stock_behaviour_is_left_most_with_explicit_opt_out_or_stock_compat`;
   `crates/server/tests/http_trusted_proxies.rs`
   `default_mode_ignores_the_attacker_supplied_leftmost_value`
+```
+
+```text
+## DIV-NNNN — IPv4-mapped IPv6 peers are matched as IPv4 by layer4 `ip` and server trusted_proxies
+
+- Area: layer4 / HTTP trusted proxies
+- Caddy behaviour: addresses are unmapped (`netip.Addr.Unmap()`) before range comparison.
+- caddy-rs behaviour: the same; previously layer4 `IpRange::contains` and `IpNet::contains`
+  returned false across address families, so IPv4 clients on a dual-stack listener escaped deny
+  rules. Parity fix, no `stock_compat` switch.
+- Status: parity (security fix)
+- Tracking: SEC-MEDIUM-PROXY C2
+- Test: `crates/l4/src/matchers.rs` `ipv4_mapped_ipv6_peers_match_ipv4_ranges`;
+  `crates/proxy/src/trusted_proxies.rs` `ipv4_mapped_ipv6_addresses_are_canonicalised`
 ```
