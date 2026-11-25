@@ -14,9 +14,11 @@
 //!
 //! # Divergences from certmagic
 //!
-//! * The OCSP response signature is not cryptographically verified yet; the parser validates the
-//!   response status, the requested certificate serial and the freshness timestamps. This is
-//!   reported as a residual gap (DIV-0087) instead of being silently ignored.
+//! * The OCSP response is fully verified before it is cached or stapled (SEC-MEDIUM D1, closing
+//!   DIV-0087): signature under the issuer key or a delegated id-kp-OCSPSigning responder, the whole
+//!   `CertID` (serial, issuerNameHash, issuerKeyHash), and `thisUpdate <= now < nextUpdate`. This
+//!   is stock parity (certmagic parses with `ocsp.ParseResponse(body, issuer)`), so there is no
+//!   `stock_compat` switch.
 //! * `ocsp_overrides` / responder URL overrides are rejected loudly by the automation-policy
 //!   parser (never dropped).
 //! * `must_staple` is honoured as a requirement on the stapling decision: a policy that requests
@@ -63,6 +65,23 @@ pub enum OcspError {
     /// The response is for a different certificate (serial mismatch).
     #[error("OCSP response serial does not match the requested certificate")]
     SerialMismatch,
+    /// The response's CertID names a different issuer (name or key hash mismatch).
+    #[error("OCSP response CertID does not match the issuer of the requested certificate")]
+    IssuerMismatch,
+    /// The BasicOCSPResponse signature is missing, uses an unsupported algorithm, or does not
+    /// verify against the issuer / delegated responder key.
+    #[error("OCSP response signature is invalid: {0}")]
+    SignatureInvalid(String),
+    /// The response is signed by a delegated responder certificate that is not authorised to sign
+    /// OCSP responses for this issuer.
+    #[error("OCSP responder is not authorised: {0}")]
+    UnauthorizedResponder(String),
+    /// `nextUpdate` is not in the future: the response is stale.
+    #[error("OCSP response has expired (nextUpdate is in the past)")]
+    Expired,
+    /// `thisUpdate` lies in the future beyond the permitted clock skew.
+    #[error("OCSP response is not yet valid (thisUpdate is in the future)")]
+    NotYetValid,
     /// `must_staple` is configured but stapling is disabled.
     #[error("automation policy requires Must-Staple but OCSP stapling is disabled")]
     MustStapleDisabled,
@@ -178,6 +197,33 @@ pub struct OcspResponse {
     pub next_update: Option<SystemTime>,
     /// Serial number from the response's `CertID` (for matching).
     pub serial: Vec<u8>,
+    /// `CertID.hashAlgorithm` OID content bytes.
+    pub hash_algorithm_oid: Vec<u8>,
+    /// `CertID.issuerNameHash`.
+    pub issuer_name_hash: Vec<u8>,
+    /// `CertID.issuerKeyHash`.
+    pub issuer_key_hash: Vec<u8>,
+    /// `ResponseData.responderID`.
+    pub responder_id: ResponderId,
+    /// The complete DER TLV of `tbsResponseData` (the exact bytes the signature covers).
+    pub tbs_response_data: Vec<u8>,
+    /// `signatureAlgorithm` OID content bytes.
+    pub signature_algorithm_oid: Vec<u8>,
+    /// `signature` BIT STRING contents (unused-bits octet removed).
+    pub signature: Vec<u8>,
+    /// `certs`: DER certificates a delegated responder shipped with the response.
+    pub certs: Vec<Vec<u8>>,
+}
+
+/// `ResponseData.responderID` (RFC 6960 section 4.2.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResponderId {
+    /// `byName [1] EXPLICIT Name`: the responder certificate's subject, as DER.
+    ByName(Vec<u8>),
+    /// `byKey [2] EXPLICIT KeyHash`: SHA-1 of the responder's public key BIT STRING contents.
+    ByKey(Vec<u8>),
+    /// Not a recognised `ResponderID` encoding (accepted by the lenient parser, never verifiable).
+    Unrecognised,
 }
 
 /// Status of the certificate in an OCSP response.
@@ -508,13 +554,16 @@ impl OcspStapler {
         let request = build_ocsp_request(leaf_der, issuer_der)?;
         let response_der = self.transport.fetch(&responder_url, &request.der).await?;
         let response = parse_ocsp_response(&response_der)?;
-        if response.serial != request.serial && !response.serial.is_empty() {
-            return Err(OcspError::SerialMismatch);
-        }
+        // The responder URL comes from the certificate and is usually plain `http://`, so the
+        // response is untrusted until the issuer's (or its delegate's) signature, the full CertID
+        // and the freshness window have been verified (SEC-MEDIUM D1). This happens BEFORE the
+        // status is looked at, so a forged `revoked`/`unknown` cannot be told apart from a genuine
+        // one by an attacker who wants to influence the cache.
+        let issuer = ParsedCertificate::parse(issuer_der)?;
+        verify_ocsp_response(&response, &leaf, &issuer, now)?;
         if response.status != OcspCertStatus::Good {
             return Err(OcspError::ResponderStatus(1));
         }
-        let _ = now;
         Ok(Staple {
             response,
             fetched_at: now,
@@ -558,6 +607,20 @@ pub struct ParsedCertificate {
     pub ocsp_responder_url: Option<String>,
     /// Whether the certificate carries the TLS Feature `status_request` (Must-Staple).
     pub must_staple: bool,
+    /// DER-encoded subject `Name` (matched against a `byName` responder ID).
+    pub subject_der: Vec<u8>,
+    /// The complete DER TLV of `tbsCertificate` (what the issuer's signature covers).
+    pub tbs_der: Vec<u8>,
+    /// `signatureAlgorithm` OID content bytes.
+    pub signature_algorithm_oid: Vec<u8>,
+    /// `signatureValue` BIT STRING contents (unused-bits octet removed).
+    pub signature: Vec<u8>,
+    /// `notBefore`, or `None` when it cannot be represented (pre-1970 or malformed).
+    pub not_before: Option<SystemTime>,
+    /// `notAfter`, or `None` when it cannot be represented (malformed).
+    pub not_after: Option<SystemTime>,
+    /// ExtendedKeyUsage purpose OIDs (content bytes), or `None` when the extension is absent.
+    pub extended_key_usage: Option<Vec<Vec<u8>>>,
 }
 
 impl ParsedCertificate {
@@ -668,13 +731,56 @@ fn parse_basic_response(full_der: &[u8], basic_der: &[u8]) -> Result<OcspRespons
         ));
     }
     let mut fields = DerReader::new(sequence);
-    let (tbs_tag, tbs, _) = fields.read_tlv_full()?;
+    let (tbs_tag, tbs, tbs_tlv) = fields.read_tlv_full()?;
     if tbs_tag != 0x30 {
         return Err(OcspError::Malformed(
             "ResponseData is not a SEQUENCE".to_string(),
         ));
     }
-    parse_response_data(full_der, tbs)
+    // signatureAlgorithm AlgorithmIdentifier, signature BIT STRING, certs [0] EXPLICIT OPTIONAL.
+    let (alg_tag, alg, _) = fields.read_tlv_full().map_err(|_| {
+        OcspError::Malformed("BasicOCSPResponse has no signatureAlgorithm".to_string())
+    })?;
+    if alg_tag != 0x30 {
+        return Err(OcspError::Malformed(
+            "BasicOCSPResponse signatureAlgorithm is not a SEQUENCE".to_string(),
+        ));
+    }
+    let signature_algorithm_oid = algorithm_oid(alg)?;
+    let (sig_tag, sig_bits, _) = fields
+        .read_tlv_full()
+        .map_err(|_| OcspError::Malformed("BasicOCSPResponse has no signature".to_string()))?;
+    let signature = bit_string_contents(sig_tag, sig_bits, "BasicOCSPResponse signature")?;
+    let mut certs = Vec::new();
+    if let Some((certs_tag, certs_value, _)) = fields.next_tlv_optional()? {
+        if certs_tag != 0xA0 {
+            return Err(OcspError::Malformed(
+                "BasicOCSPResponse certs is not [0] EXPLICIT".to_string(),
+            ));
+        }
+        let mut wrapper = DerReader::new(certs_value);
+        let (list_tag, list_value, _) = wrapper.read_tlv_full()?;
+        if list_tag != 0x30 {
+            return Err(OcspError::Malformed(
+                "BasicOCSPResponse certs is not a SEQUENCE OF Certificate".to_string(),
+            ));
+        }
+        let mut list = DerReader::new(list_value);
+        while let Some((cert_tag, _value, cert_tlv)) = list.next_tlv_optional()? {
+            if cert_tag != 0x30 {
+                return Err(OcspError::Malformed(
+                    "BasicOCSPResponse certs entry is not a Certificate".to_string(),
+                ));
+            }
+            certs.push(cert_tlv.to_vec());
+        }
+    }
+    let mut response = parse_response_data(full_der, tbs)?;
+    response.tbs_response_data = tbs_tlv.to_vec();
+    response.signature_algorithm_oid = signature_algorithm_oid;
+    response.signature = signature;
+    response.certs = certs;
+    Ok(response)
 }
 
 fn parse_response_data(full_der: &[u8], tbs: &[u8]) -> Result<OcspResponse, OcspError> {
@@ -683,13 +789,32 @@ fn parse_response_data(full_der: &[u8], tbs: &[u8]) -> Result<OcspResponse, Ocsp
     if data.peek_tag()? == 0xA0 {
         data.read_tlv_full()?;
     }
-    // responderID is either a SEQUENCE or [2] EXPLICIT; producedAt is a GeneralizedTime.
-    let (responder_tag, _responder, _) = data.read_tlv_full()?;
-    if responder_tag != 0x30 && responder_tag != 0xA2 {
-        return Err(OcspError::Malformed(
-            "ResponseData responderID is not a SEQUENCE/[2]".to_string(),
-        ));
-    }
+    // responderID is `byName [1] EXPLICIT Name` or `byKey [2] EXPLICIT KeyHash`. A bare SEQUENCE
+    // is not a legal encoding, but the lenient parser keeps accepting it (it can never match a
+    // responder, so it only ever verifies under the issuer key); producedAt is a GeneralizedTime.
+    let (responder_tag, responder_value, _) = data.read_tlv_full()?;
+    let responder_id = match responder_tag {
+        // `[1] EXPLICIT Name`: the content is the Name SEQUENCE TLV.
+        0xA1 => ResponderId::ByName(responder_value.to_vec()),
+        // `[2] EXPLICIT KeyHash`: the content is an OCTET STRING TLV.
+        0xA2 => {
+            let mut inner = DerReader::new(responder_value);
+            match inner.read_tlv_full()? {
+                (0x04, hash, _) => ResponderId::ByKey(hash.to_vec()),
+                _ => {
+                    return Err(OcspError::Malformed(
+                        "ResponseData byKey responderID is not an OCTET STRING".to_string(),
+                    ))
+                }
+            }
+        }
+        0x30 => ResponderId::Unrecognised,
+        _ => {
+            return Err(OcspError::Malformed(
+                "ResponseData responderID is not [1]/[2]".to_string(),
+            ))
+        }
+    };
     let (produced_tag, produced, _) = data.read_tlv_full()?;
     let _ = parse_asn1_time(produced_tag, produced)?;
     let (responses_tag, responses, _) = data.read_tlv_full()?;
@@ -710,11 +835,13 @@ fn parse_response_data(full_der: &[u8], tbs: &[u8]) -> Result<OcspResponse, Ocsp
     if cert_id_tag != 0x30 {
         return Err(OcspError::Malformed("CertID is not a SEQUENCE".to_string()));
     }
-    let serial = parse_cert_id_serial(cert_id)?;
+    let parsed_cert_id = parse_cert_id(cert_id)?;
     let (status_tag, _status_value, _) = single.read_tlv_full()?;
     let status = match status_tag {
         0x80 => OcspCertStatus::Good,
-        0x81 => OcspCertStatus::Revoked,
+        // `revoked [1] IMPLICIT RevokedInfo`: RevokedInfo is a SEQUENCE, so a real responder sends
+        // the constructed form 0xA1; 0x81 is kept for the primitive form older fixtures use.
+        0x81 | 0xA1 => OcspCertStatus::Revoked,
         0x82 => OcspCertStatus::Unknown,
         other => {
             return Err(OcspError::Malformed(format!(
@@ -738,11 +865,27 @@ fn parse_response_data(full_der: &[u8], tbs: &[u8]) -> Result<OcspResponse, Ocsp
         status,
         this_update,
         next_update,
-        serial,
+        serial: parsed_cert_id.serial,
+        hash_algorithm_oid: parsed_cert_id.hash_algorithm_oid,
+        issuer_name_hash: parsed_cert_id.issuer_name_hash,
+        issuer_key_hash: parsed_cert_id.issuer_key_hash,
+        responder_id,
+        // Filled in by `parse_basic_response`, which owns the surrounding BasicOCSPResponse.
+        tbs_response_data: Vec::new(),
+        signature_algorithm_oid: Vec::new(),
+        signature: Vec::new(),
+        certs: Vec::new(),
     })
 }
 
-fn parse_cert_id_serial(cert_id: &[u8]) -> Result<Vec<u8>, OcspError> {
+struct ParsedCertId {
+    hash_algorithm_oid: Vec<u8>,
+    issuer_name_hash: Vec<u8>,
+    issuer_key_hash: Vec<u8>,
+    serial: Vec<u8>,
+}
+
+fn parse_cert_id(cert_id: &[u8]) -> Result<ParsedCertId, OcspError> {
     let mut reader = DerReader::new(cert_id);
     // hashAlgorithm
     let (alg_tag, alg, _) = reader.read_tlv_full()?;
@@ -751,16 +894,16 @@ fn parse_cert_id_serial(cert_id: &[u8]) -> Result<Vec<u8>, OcspError> {
             "CertID hashAlgorithm is not a SEQUENCE".to_string(),
         ));
     }
-    let _ = alg;
+    let hash_algorithm_oid = algorithm_oid(alg)?;
     // issuerNameHash
-    let (name_tag, _name, _) = reader.read_tlv_full()?;
+    let (name_tag, name, _) = reader.read_tlv_full()?;
     if name_tag != 0x04 {
         return Err(OcspError::Malformed(
             "CertID issuerNameHash is not an OCTET STRING".to_string(),
         ));
     }
     // issuerKeyHash
-    let (key_tag, _key, _) = reader.read_tlv_full()?;
+    let (key_tag, key, _) = reader.read_tlv_full()?;
     if key_tag != 0x04 {
         return Err(OcspError::Malformed(
             "CertID issuerKeyHash is not an OCTET STRING".to_string(),
@@ -773,7 +916,20 @@ fn parse_cert_id_serial(cert_id: &[u8]) -> Result<Vec<u8>, OcspError> {
             "CertID serialNumber is not an INTEGER".to_string(),
         ));
     }
-    Ok(serial.to_vec())
+    // A DER INTEGER is never empty. The old matcher treated an empty serial as "matches
+    // anything" (`response.serial != request.serial && !response.serial.is_empty()`), which let a
+    // forged response skip serial matching entirely.
+    if serial.is_empty() {
+        return Err(OcspError::Malformed(
+            "CertID serialNumber INTEGER is empty".to_string(),
+        ));
+    }
+    Ok(ParsedCertId {
+        hash_algorithm_oid,
+        issuer_name_hash: name.to_vec(),
+        issuer_key_hash: key.to_vec(),
+        serial: serial.to_vec(),
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -789,12 +945,21 @@ fn parse_certificate(der: &[u8]) -> Result<ParsedCertificate, OcspError> {
         ));
     }
     let mut cert = DerReader::new(certificate);
-    let (tbs_tag, tbs, _) = cert.read_tlv_full()?;
+    let (tbs_tag, tbs, tbs_tlv) = cert.read_tlv_full()?;
     if tbs_tag != 0x30 {
         return Err(OcspError::Malformed(
             "tbsCertificate is not a SEQUENCE".to_string(),
         ));
     }
+    let (sig_alg_tag, sig_alg, _) = cert.read_tlv_full()?;
+    if sig_alg_tag != 0x30 {
+        return Err(OcspError::Malformed(
+            "certificate signatureAlgorithm is not a SEQUENCE".to_string(),
+        ));
+    }
+    let signature_algorithm_oid = algorithm_oid(sig_alg)?;
+    let (sig_tag, sig_bits, _) = cert.read_tlv_full()?;
+    let signature = bit_string_contents(sig_tag, sig_bits, "certificate signatureValue")?;
     let mut tbs_reader = DerReader::new(tbs);
     if tbs_reader.peek_tag()? == 0xA0 {
         tbs_reader.read_tlv_full()?;
@@ -815,9 +980,14 @@ fn parse_certificate(der: &[u8]) -> Result<ParsedCertificate, OcspError> {
         ));
     }
     // validity
-    tbs_reader.read_tlv_full()?;
+    let (validity_tag, validity, _) = tbs_reader.read_tlv_full()?;
+    let (not_before, not_after) = if validity_tag == 0x30 {
+        parse_validity(validity)
+    } else {
+        (None, None)
+    };
     // subject
-    tbs_reader.read_tlv_full()?;
+    let (_subject_tag, _subject_value, subject_tlv) = tbs_reader.read_tlv_full()?;
     // subjectPublicKeyInfo
     let (spki_tag, spki, _) = tbs_reader.read_tlv_full()?;
     if spki_tag != 0x30 {
@@ -828,6 +998,7 @@ fn parse_certificate(der: &[u8]) -> Result<ParsedCertificate, OcspError> {
     let subject_public_key = parse_spki_public_key(spki)?;
     let mut ocsp_responder_url = None;
     let mut must_staple = false;
+    let mut extended_key_usage = None;
     // Optional issuerUniqueID [1], subjectUniqueID [2], extensions [3].
     while let Some((tag, value, _)) = tbs_reader.next_tlv_optional()? {
         if tag == 0xA3 {
@@ -848,7 +1019,11 @@ fn parse_certificate(der: &[u8]) -> Result<ParsedCertificate, OcspError> {
                 if oid_tag != 0x06 {
                     continue;
                 }
-                let (octet_tag, octet_value, _) = extension.read_tlv_full()?;
+                let (mut octet_tag, mut octet_value, _) = extension.read_tlv_full()?;
+                if octet_tag == 0x01 {
+                    // `critical BOOLEAN DEFAULT FALSE` precedes the extnValue when present.
+                    (octet_tag, octet_value, _) = extension.read_tlv_full()?;
+                }
                 if octet_tag != 0x04 {
                     continue;
                 }
@@ -856,6 +1031,8 @@ fn parse_certificate(der: &[u8]) -> Result<ParsedCertificate, OcspError> {
                     ocsp_responder_url = parse_ocsp_responder_url(octet_value)?;
                 } else if oid == OID_TLS_FEATURE {
                     must_staple = parse_must_staple(octet_value)?;
+                } else if oid == OID_EXTENDED_KEY_USAGE {
+                    extended_key_usage = Some(parse_extended_key_usage(octet_value)?);
                 }
             }
         }
@@ -866,9 +1043,77 @@ fn parse_certificate(der: &[u8]) -> Result<ParsedCertificate, OcspError> {
         subject_public_key,
         ocsp_responder_url,
         must_staple,
+        subject_der: subject_tlv.to_vec(),
+        tbs_der: tbs_tlv.to_vec(),
+        signature_algorithm_oid,
+        signature,
+        not_before,
+        not_after,
+        extended_key_usage,
     })
 }
 
+/// `validity ::= SEQUENCE { notBefore Time, notAfter Time }`. A time that cannot be represented
+/// is reported as `None` (the responder-certificate check then fails closed); a leaf/issuer
+/// certificate never needs its validity here, so a malformed one must not break request building.
+fn parse_validity(validity: &[u8]) -> (Option<SystemTime>, Option<SystemTime>) {
+    let mut reader = DerReader::new(validity);
+    let mut next_time = || {
+        let (tag, value, _) = reader.read_tlv_full().ok()?;
+        parse_asn1_time(tag, value).ok().map(time_from_unix)
+    };
+    let not_before = next_time();
+    let not_after = next_time();
+    (not_before, not_after)
+}
+
+/// The algorithm OID content bytes of an `AlgorithmIdentifier` body.
+fn algorithm_oid(algorithm: &[u8]) -> Result<Vec<u8>, OcspError> {
+    let mut reader = DerReader::new(algorithm);
+    let (tag, oid, _) = reader.read_tlv_full()?;
+    if tag != 0x06 {
+        return Err(OcspError::Malformed(
+            "AlgorithmIdentifier does not start with an OID".to_string(),
+        ));
+    }
+    Ok(oid.to_vec())
+}
+
+/// BIT STRING contents with the unused-bits octet removed; only whole-octet strings are valid for
+/// signatures.
+fn bit_string_contents(tag: u8, value: &[u8], what: &str) -> Result<Vec<u8>, OcspError> {
+    if tag != 0x03 || value.is_empty() {
+        return Err(OcspError::Malformed(format!("{what} is not a BIT STRING")));
+    }
+    if value[0] != 0 {
+        return Err(OcspError::Malformed(format!(
+            "{what} has unused bits (not a whole number of octets)"
+        )));
+    }
+    Ok(value[1..].to_vec())
+}
+
+fn parse_extended_key_usage(value: &[u8]) -> Result<Vec<Vec<u8>>, OcspError> {
+    let mut reader = DerReader::new(value);
+    let (tag, purposes, _) = reader.read_tlv_full()?;
+    if tag != 0x30 {
+        return Err(OcspError::Malformed(
+            "ExtendedKeyUsage is not a SEQUENCE".to_string(),
+        ));
+    }
+    let mut list = DerReader::new(purposes);
+    let mut oids = Vec::new();
+    while let Some((oid_tag, oid, _)) = list.next_tlv_optional()? {
+        if oid_tag == 0x06 {
+            oids.push(oid.to_vec());
+        }
+    }
+    Ok(oids)
+}
+
+const OID_EXTENDED_KEY_USAGE: &[u8] = &[0x55, 0x1D, 0x25];
+/// id-kp-OCSPSigning (1.3.6.1.5.5.7.3.9).
+const OID_KP_OCSP_SIGNING: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x09];
 const OID_AUTHORITY_INFO_ACCESS: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01];
 const OID_TLS_FEATURE: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x18];
 const OID_OCSP_ACCESS_METHOD: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01];
@@ -1192,6 +1437,231 @@ fn unix_seconds_from_civil(
     let days = days as u64;
     days.checked_mul(86_400)?
         .checked_add(hour * 3_600 + minute * 60 + second)
+}
+
+// ---------------------------------------------------------------------------------------------
+// OCSP response verification (SEC-MEDIUM D1)
+// ---------------------------------------------------------------------------------------------
+
+/// Clock skew tolerated for `thisUpdate` (and a delegated responder certificate's `notBefore`).
+/// `nextUpdate` gets no skew: a response is stale the moment it is reached.
+pub const OCSP_CLOCK_SKEW: Duration = Duration::from_secs(5 * 60);
+
+const OID_HASH_SHA1: &[u8] = &[0x2B, 0x0E, 0x03, 0x02, 0x1A];
+const OID_HASH_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+
+/// Verify an untrusted, parsed OCSP response for `leaf` issued by `issuer`, as certmagic does
+/// through `ocsp.ParseResponse(body, issuer)` plus its `NextUpdate` check:
+///
+/// 1. the `CertID` names this certificate: serial (non-empty), issuerNameHash and issuerKeyHash;
+/// 2. the `BasicOCSPResponse` signature verifies under the issuer's key, or under a delegated
+///    responder certificate that the issuer signed, that is valid now and that carries
+///    id-kp-OCSPSigning (RFC 6960 section 4.2.2.2);
+/// 3. `thisUpdate <= now + skew` and, when present, `now < nextUpdate`.
+///
+/// The certificate status is intentionally not judged here.
+pub fn verify_ocsp_response(
+    response: &OcspResponse,
+    leaf: &ParsedCertificate,
+    issuer: &ParsedCertificate,
+    now: SystemTime,
+) -> Result<(), OcspError> {
+    verify_cert_id(response, leaf, issuer)?;
+    verify_response_signature(response, issuer, now)?;
+    if response.this_update > now + OCSP_CLOCK_SKEW {
+        return Err(OcspError::NotYetValid);
+    }
+    if let Some(next_update) = response.next_update {
+        if now >= next_update {
+            return Err(OcspError::Expired);
+        }
+    }
+    Ok(())
+}
+
+/// A serial's value, ignoring redundant leading zero octets (DER INTEGERs are canonical, but a
+/// responder that echoes a non-minimal encoding still names the same number).
+fn serial_value(serial: &[u8]) -> &[u8] {
+    let start = serial
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(serial.len());
+    &serial[start..]
+}
+
+fn cert_id_hash(algorithm_oid: &[u8], data: &[u8]) -> Result<Vec<u8>, OcspError> {
+    if algorithm_oid == OID_HASH_SHA1 {
+        Ok(Sha1::digest(data).to_vec())
+    } else if algorithm_oid == OID_HASH_SHA256 {
+        Ok(sha2::Sha256::digest(data).to_vec())
+    } else {
+        Err(OcspError::Malformed(
+            "unsupported CertID hash algorithm (only SHA-1 and SHA-256)".to_string(),
+        ))
+    }
+}
+
+fn verify_cert_id(
+    response: &OcspResponse,
+    leaf: &ParsedCertificate,
+    issuer: &ParsedCertificate,
+) -> Result<(), OcspError> {
+    let response_serial = serial_value(&response.serial);
+    if response.serial.is_empty()
+        || leaf.serial.is_empty()
+        || response_serial != serial_value(&leaf.serial)
+    {
+        return Err(OcspError::SerialMismatch);
+    }
+    let expected_name = cert_id_hash(&response.hash_algorithm_oid, &leaf.issuer_name_der)?;
+    let expected_key = cert_id_hash(&response.hash_algorithm_oid, &issuer.subject_public_key)?;
+    if response.issuer_name_hash != expected_name || response.issuer_key_hash != expected_key {
+        return Err(OcspError::IssuerMismatch);
+    }
+    Ok(())
+}
+
+fn responder_matches(id: &ResponderId, certificate: &ParsedCertificate) -> bool {
+    match id {
+        ResponderId::ByName(name) => *name == certificate.subject_der,
+        ResponderId::ByKey(hash) => {
+            *hash == Sha1::digest(&certificate.subject_public_key).as_slice()
+        }
+        ResponderId::Unrecognised => false,
+    }
+}
+
+fn verify_response_signature(
+    response: &OcspResponse,
+    issuer: &ParsedCertificate,
+    now: SystemTime,
+) -> Result<(), OcspError> {
+    // Signed by the issuer itself: the common case.
+    let delegate = if responder_matches(&response.responder_id, issuer) {
+        None
+    } else {
+        // A delegated responder: the certificate the response ships with whose identity the
+        // responderID names. When none matches the response is verified under the issuer's key
+        // (as Go's `ocsp.ParseResponse` does): a valid issuer signature is authority enough,
+        // and anything else fails the signature check.
+        response
+            .certs
+            .iter()
+            .filter_map(|der| ParsedCertificate::parse(der).ok())
+            .find(|candidate| responder_matches(&response.responder_id, candidate))
+    };
+    let signer_key = match &delegate {
+        None => &issuer.subject_public_key,
+        Some(certificate) => {
+            authorize_delegated_responder(certificate, issuer, now)?;
+            &certificate.subject_public_key
+        }
+    };
+    verify_signature(
+        &response.signature_algorithm_oid,
+        signer_key,
+        &response.tbs_response_data,
+        &response.signature,
+    )
+}
+
+/// RFC 6960 section 4.2.2.2: a delegated responder certificate must be issued directly by the CA
+/// the response speaks for, be valid now, and carry id-kp-OCSPSigning.
+fn authorize_delegated_responder(
+    certificate: &ParsedCertificate,
+    issuer: &ParsedCertificate,
+    now: SystemTime,
+) -> Result<(), OcspError> {
+    verify_signature(
+        &certificate.signature_algorithm_oid,
+        &issuer.subject_public_key,
+        &certificate.tbs_der,
+        &certificate.signature,
+    )
+    .map_err(|_| {
+        OcspError::UnauthorizedResponder(
+            "delegated responder certificate was not issued by the certificate's issuer"
+                .to_string(),
+        )
+    })?;
+    let has_ocsp_signing = certificate
+        .extended_key_usage
+        .as_ref()
+        .is_some_and(|purposes| purposes.iter().any(|oid| oid == OID_KP_OCSP_SIGNING));
+    if !has_ocsp_signing {
+        return Err(OcspError::UnauthorizedResponder(
+            "delegated responder certificate lacks the id-kp-OCSPSigning extended key usage"
+                .to_string(),
+        ));
+    }
+    match (certificate.not_before, certificate.not_after) {
+        (Some(not_before), Some(not_after))
+            if now + OCSP_CLOCK_SKEW >= not_before && now < not_after => {}
+        _ => {
+            return Err(OcspError::UnauthorizedResponder(
+                "delegated responder certificate is not valid at this time".to_string(),
+            ))
+        }
+    }
+    Ok(())
+}
+
+/// Verify `signature` over `message` with `public_key` (the SPKI BIT STRING contents) under the
+/// X.509 signature algorithm `algorithm_oid`.
+///
+/// Supported: ECDSA with SHA-256/384/512, RSA PKCS#1 v1.5 with SHA-256/384/512 (2048-8192 bit
+/// keys) and Ed25519, i.e. the algorithms certmagic-managed issuers use. SHA-1 based signatures
+/// and anything else fail closed.
+fn verify_signature(
+    algorithm_oid: &[u8],
+    public_key: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), OcspError> {
+    use aws_lc_rs::signature as sig;
+    use sig::VerificationAlgorithm;
+    // ECDSA OIDs name only the hash; the curve comes from the key, so try each curve that the hash
+    // is defined for (a wrong-curve key simply fails to verify).
+    let candidates: &[&'static dyn VerificationAlgorithm] = match algorithm_oid {
+        // ecdsa-with-SHA256 / 384 / 512
+        [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02] => {
+            &[&sig::ECDSA_P256_SHA256_ASN1, &sig::ECDSA_P384_SHA256_ASN1]
+        }
+        [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03] => {
+            &[&sig::ECDSA_P384_SHA384_ASN1, &sig::ECDSA_P256_SHA384_ASN1]
+        }
+        [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x04] => {
+            &[&sig::ECDSA_P521_SHA512_ASN1, &sig::ECDSA_P384_SHA512_ASN1]
+        }
+        // sha256WithRSAEncryption / sha384 / sha512
+        [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B] => {
+            &[&sig::RSA_PKCS1_2048_8192_SHA256]
+        }
+        [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C] => {
+            &[&sig::RSA_PKCS1_2048_8192_SHA384]
+        }
+        [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D] => {
+            &[&sig::RSA_PKCS1_2048_8192_SHA512]
+        }
+        // id-Ed25519
+        [0x2B, 0x65, 0x70] => &[&sig::ED25519],
+        _ => {
+            return Err(OcspError::SignatureInvalid(
+                "unsupported signature algorithm".to_string(),
+            ))
+        }
+    };
+    for algorithm in candidates {
+        if sig::UnparsedPublicKey::new(*algorithm, public_key)
+            .verify(message, signature)
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    Err(OcspError::SignatureInvalid(
+        "signature does not verify under the issuer / responder key".to_string(),
+    ))
 }
 
 #[cfg(test)]
