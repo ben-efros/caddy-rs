@@ -1915,13 +1915,22 @@ struct HideMatcher {
 impl HideMatcher {
     /// Caddy's `fileHidden` against one filesystem path.
     fn is_hidden(&self, filename: &str) -> bool {
+        self.is_hidden_for(filename, cfg!(windows))
+    }
+
+    /// [`is_hidden`](Self::is_hidden) with the path syntax passed in.
+    ///
+    /// `windows` selects the target's path semantics so the Windows branch stays testable on any
+    /// host: `is_hidden` only ever reaches it on a real Windows build, and an untested branch is
+    /// one that regresses silently (the earlier hardcoded `false` here did exactly that).
+    fn is_hidden_for(&self, filename: &str, windows: bool) -> bool {
         // The basename comparison below splits on `/`, and glob matching is case-insensitive on
         // Windows, so the filename is put in the same normalised form as the expanded patterns.
         let filename_abs = {
             let path = fast_abs(Path::new(filename), &self.cwd)
                 .to_string_lossy()
                 .into_owned();
-            if cfg!(windows) {
+            if windows {
                 path.replace('\\', "/").to_ascii_lowercase()
             } else {
                 path
@@ -1931,7 +1940,7 @@ impl HideMatcher {
             if !pattern.contains('/') {
                 if filename_abs
                     .split('/')
-                    .any(|component| glob_match(pattern, component, cfg!(windows)))
+                    .any(|component| glob_match(pattern, component, windows))
                 {
                     return true;
                 }
@@ -1940,7 +1949,7 @@ impl HideMatcher {
                     return true;
                 }
             }
-            glob_match(pattern, &filename_abs, cfg!(windows))
+            glob_match(pattern, &filename_abs, windows)
         })
     }
 }
@@ -3790,6 +3799,45 @@ mod tests {
             hide_entry_matches("c:\\SITE\\Secret.TXT", filename_abs, cwd, true),
             "Windows matching is case-insensitive"
         );
+    }
+
+    /// The Windows branch of `is_hidden`'s glob matching, which no Linux test could reach before
+    /// `is_hidden` was parameterised: it passes `cfg!(windows)`, so on this host the branch was dead
+    /// code and a hardcoded `false` in it survived every test.
+    ///
+    /// What this asserts is narrow and worth being precise about, because a first attempt at this
+    /// test passed while proving nothing. The matcher is constructed with patterns already in the
+    /// form a Windows host builds (lower-cased `/`-form), and the filename is lower-cased before
+    /// matching when `windows` is set — so a case-insensitive result here can come from that
+    /// normalisation alone. To force the decision through `glob_match`'s own `case_insensitive`
+    /// argument the pattern must be the mixed-case side, which normalisation never touches.
+    #[test]
+    fn matcher_hides_windows_style_paths_when_told_it_is_windows() {
+        // A pattern a Windows host would still hold in mixed case cannot arise from `hide_matcher`
+        // (it lower-cases), but `HideMatcher` does not enforce that, and this test needs the
+        // pattern to be the mixed-case side so `glob_match`'s own flag decides the outcome.
+        let matcher = HideMatcher {
+            cwd: Path::new("/").to_path_buf(),
+            patterns: vec!["*.ENV".to_string(), "/site/private".to_string()],
+        };
+
+        // `glob_match(pattern, component, windows)` with a mixed-case pattern and a lower-case
+        // filename: only `windows = true` makes it case-insensitive. This is the assertion a
+        // hardcoded `false` fails.
+        assert!(
+            matcher.is_hidden_for("/site/a.env", true),
+            "windows glob matching is case-insensitive"
+        );
+        assert!(
+            !matcher.is_hidden_for("/site/a.env", false),
+            "POSIX glob matching is case-sensitive: *.ENV must not match a.env"
+        );
+
+        // Directory entries hide below themselves on a separator boundary, both ways round.
+        assert!(matcher.is_hidden_for("/site/private/x.txt", true));
+        assert!(matcher.is_hidden_for("/site/private/x.txt", false));
+        assert!(!matcher.is_hidden_for("/site/privateer.txt", true));
+        assert!(!matcher.is_hidden_for("/site/privateer.txt", false));
     }
 
     #[tokio::test]
