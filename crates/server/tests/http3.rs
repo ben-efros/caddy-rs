@@ -476,7 +476,7 @@ async fn http2_responses_also_advertise_alt_svc() {
         headers
             .get(http::header::ALT_SVC)
             .and_then(|value| value.to_str().ok()),
-        Some(format!("h3=\":{udp}\"; ma=2592000").as_str()),
+        Some(format!("h3=\":{}\"; ma=2592000", udp_address(&status, udp).port()).as_str()),
         "HTTP/2 responses advertise the HTTP/3 alternate service"
     );
     runtime.shutdown().await;
@@ -537,7 +537,7 @@ async fn mixed_tcp_and_udp_listener_serves_both_protocols() {
         headers
             .get(http::header::ALT_SVC)
             .and_then(|value| value.to_str().ok()),
-        Some(format!("h3=\":{udp}\"; ma=2592000").as_str()),
+        Some(format!("h3=\":{}\"; ma=2592000", udp_address(&status, udp).port()).as_str()),
         "HTTP/1.1 responses advertise the UDP listener when h3 is enabled"
     );
     let response = h3_request(udp_address(&status, udp), "GET", "/mixed", None)
@@ -1371,8 +1371,15 @@ fn record_panics() {
     INSTALL.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            if let Ok(mut panics) = PANICS.lock() {
-                panics.push(info.to_string());
+            // Only panics from the server and its libraries count: a failing assertion in some
+            // other test of this file is that test's own failure, not a server-task panic.
+            let from_this_file = info
+                .location()
+                .is_some_and(|location| location.file().ends_with("tests/http3.rs"));
+            if !from_this_file {
+                if let Ok(mut panics) = PANICS.lock() {
+                    panics.push(info.to_string());
+                }
             }
             previous(info);
         }));
@@ -1764,4 +1771,408 @@ async fn http3_malformed_content_length_is_a_400() {
     .expect("a response");
     assert_eq!(ok.status, 200);
     runtime.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Requests on one QUIC connection are served concurrently (one task per request stream), and a
+// graceful shutdown drains the ones in flight.
+// ---------------------------------------------------------------------------------------------
+
+/// Open one QUIC connection with an HTTP/3 client on it.
+async fn h3_client(
+    address: SocketAddr,
+) -> (
+    quinn::Endpoint,
+    h3::client::Connection<h3_quinn::Connection, Bytes>,
+    h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+) {
+    let endpoint = quic_endpoint(client_config(vec![b"h3".to_vec()]));
+    let connection = connect(&endpoint, address).await.expect("QUIC connect");
+    let (driver, send_request) = h3::client::new(h3_quinn::Connection::new(connection))
+        .await
+        .expect("HTTP/3 client");
+    (endpoint, driver, send_request)
+}
+
+/// A slow or stalled request must not hold up other requests on the same QUIC connection. The
+/// connection loop used to handle requests inline, one at a time, so a stalled upload blocked
+/// every other request multiplexed on that connection (quic-go serves each stream in its own
+/// goroutine).
+#[tokio::test]
+async fn http3_stalled_request_does_not_block_other_requests_on_the_connection() {
+    record_panics();
+    let upstream = spawn_counting_upstream().await;
+    let tcp = free_port();
+    let udp = free_port();
+    let (runtime, status) = start(config(
+        tcp,
+        Some(udp),
+        Some(&["h1", "h2", "h3"]),
+        proxy_routes(upstream, serde_json::json!({})),
+    ))
+    .await;
+    let (_endpoint, driver, mut send_request) = h3_client(udp_address(&status, udp)).await;
+
+    // A request that sends a few bytes and then goes silent (never finishes its stream).
+    let stalled_request = http::Request::builder()
+        .method("POST")
+        .uri("https://example.com/stalled")
+        .body(())
+        .unwrap();
+    let mut stalled = send_request
+        .send_request(stalled_request)
+        .await
+        .expect("send");
+    stalled
+        .send_data(Bytes::from_static(b"partial"))
+        .await
+        .expect("send a few bytes");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Other requests on the SAME connection are answered while it is stalled.
+    for index in 0..3 {
+        let request = http::Request::builder()
+            .method("GET")
+            .uri(format!("https://example.com/other{index}"))
+            .body(())
+            .unwrap();
+        let mut stream = send_request.send_request(request).await.expect("send");
+        stream.finish().await.expect("finish");
+        let response = tokio::time::timeout(Duration::from_secs(5), stream.recv_response())
+            .await
+            .expect("a request on the same connection must not wait for the stalled one")
+            .expect("response");
+        assert_eq!(response.status(), 200, "request {index}");
+    }
+
+    drop(stalled);
+    drop(driver);
+    runtime.shutdown().await;
+    assert_no_task_panics();
+}
+
+/// A graceful shutdown stops accepting but lets a request that is already uploading finish; the
+/// supervisor returns once it has. Previously the connection loop ran requests inline and so
+/// drained by accident; with one task per request the drain must be explicit.
+#[tokio::test]
+async fn http3_graceful_shutdown_lets_an_in_flight_upload_finish() {
+    record_panics();
+    let upstream = spawn_counting_upstream().await;
+    let tcp = free_port();
+    let udp = free_port();
+    let (runtime, status) = start(config(
+        tcp,
+        Some(udp),
+        Some(&["h1", "h2", "h3"]),
+        proxy_routes(upstream, serde_json::json!({})),
+    ))
+    .await;
+    let address = udp_address(&status, udp);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (_force_tx, force_rx) = tokio::sync::watch::channel(false);
+    let running = tokio::spawn(async move { runtime.run_with_force(shutdown_rx, force_rx).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let (_endpoint, driver, mut send_request) = h3_client(address).await;
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("https://example.com/upload")
+        .body(())
+        .unwrap();
+    let mut stream = send_request.send_request(request).await.expect("send");
+    let chunk = Bytes::from(vec![b'g'; 1024 * 1024]);
+    let mut sent = 0usize;
+    for index in 0..6 {
+        if index == 2 {
+            // Mid-upload: ask the server to shut down gracefully.
+            shutdown_tx.send(true).expect("signal shutdown");
+        }
+        stream.send_data(chunk.clone()).await.expect("send chunk");
+        sent += chunk.len();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    stream.finish().await.expect("finish");
+    let response = tokio::time::timeout(Duration::from_secs(10), stream.recv_response())
+        .await
+        .expect("the in-flight upload is answered, not cut off by the shutdown")
+        .expect("response");
+    assert_eq!(response.status(), 200);
+    let mut body = BytesMut::new();
+    while let Ok(Some(data)) = stream.recv_data().await {
+        body.extend_from_slice(data.chunk());
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&body),
+        format!("received={sent}"),
+        "every byte of the upload that straddled the shutdown arrived"
+    );
+
+    drop(driver);
+    let finished = tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the supervisor returns once the in-flight request has drained");
+    finished.expect("runtime task").expect("run returns Ok");
+    assert_no_task_panics();
+}
+
+/// A second (force) signal aborts in-flight requests instead of waiting for them.
+#[tokio::test]
+async fn http3_forced_shutdown_aborts_an_in_flight_upload() {
+    record_panics();
+    let upstream = spawn_counting_upstream().await;
+    let tcp = free_port();
+    let udp = free_port();
+    let (runtime, status) = start(config(
+        tcp,
+        Some(udp),
+        Some(&["h1", "h2", "h3"]),
+        proxy_routes(upstream, serde_json::json!({})),
+    ))
+    .await;
+    let address = udp_address(&status, udp);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (force_tx, force_rx) = tokio::sync::watch::channel(false);
+    let running = tokio::spawn(async move { runtime.run_with_force(shutdown_rx, force_rx).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let (_endpoint, driver, mut send_request) = h3_client(address).await;
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("https://example.com/stalled")
+        .body(())
+        .unwrap();
+    let mut stalled = send_request.send_request(request).await.expect("send");
+    stalled
+        .send_data(Bytes::from_static(b"partial"))
+        .await
+        .expect("send a few bytes");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    shutdown_tx.send(true).expect("first signal");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!running.is_finished(), "the stalled request is still draining");
+    force_tx.send(true).expect("second signal");
+    let finished = tokio::time::timeout(Duration::from_secs(5), running)
+        .await
+        .expect("a forced shutdown returns promptly");
+    finished.expect("runtime task").expect("run returns Ok");
+    drop(stalled);
+    drop(driver);
+    assert_no_task_panics();
+}
+
+/// Removing an HTTP/3 listener in a reload must not wait for requests still in flight on it: the
+/// reload applies immediately and the old listener drains in the background (TCP listeners behave
+/// the same). The drain used to be joined by the reload, so one stalled upload blocked the whole
+/// reload, and shutdown/force signals were not seen until it finished.
+#[tokio::test]
+async fn http3_reload_removing_the_listener_does_not_wait_for_in_flight_requests() {
+    record_panics();
+    let upstream = spawn_counting_upstream().await;
+    let tcp = free_port();
+    let udp = free_port();
+    let store = Arc::new(GenerationStore::with_builtin_registry());
+    store
+        .load(config(
+            tcp,
+            Some(udp),
+            Some(&["h1", "h2", "h3"]),
+            proxy_routes(upstream, serde_json::json!({})),
+        ))
+        .expect("config validates");
+    let mut runtime = ServerRuntime::new(Arc::clone(&store));
+    let status = runtime.apply().await.expect("first apply");
+    let (_endpoint, driver, mut send_request) = h3_client(udp_address(&status, udp)).await;
+
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("https://example.com/stalled")
+        .body(())
+        .unwrap();
+    let mut stalled = send_request.send_request(request).await.expect("send");
+    stalled
+        .send_data(Bytes::from_static(b"partial"))
+        .await
+        .expect("send a few bytes");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Reload with the UDP listener removed while that request is still in flight.
+    store
+        .load(config(
+            tcp,
+            None,
+            Some(&["h1", "h2"]),
+            proxy_routes(upstream, serde_json::json!({})),
+        ))
+        .expect("removal config validates");
+    let started = std::time::Instant::now();
+    // A blocked reload waits for the stalled request, i.e. its 60 s idle timeout; the bound is far
+    // below that but generous enough for a machine saturated by the heavy tests in this binary.
+    tokio::time::timeout(Duration::from_secs(25), runtime.apply())
+        .await
+        .expect("the reload must not wait for the in-flight request")
+        .expect("removal applies");
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "reload took {:?}",
+        started.elapsed()
+    );
+
+    drop(stalled);
+    drop(driver);
+    runtime.shutdown().await;
+    assert_no_task_panics();
+}
+
+/// While a graceful shutdown drains, a NEW request on the draining connection is refused promptly
+/// (GOAWAY), and a NEW connection is refused outright, instead of both hanging until the slowest
+/// in-flight request finishes.
+#[tokio::test]
+async fn http3_draining_listener_refuses_new_streams_and_connections() {
+    record_panics();
+    let upstream = spawn_counting_upstream().await;
+    let tcp = free_port();
+    let udp = free_port();
+    let (runtime, status) = start(config(
+        tcp,
+        Some(udp),
+        Some(&["h1", "h2", "h3"]),
+        proxy_routes(upstream, serde_json::json!({})),
+    ))
+    .await;
+    let address = udp_address(&status, udp);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (force_tx, force_rx) = tokio::sync::watch::channel(false);
+    let running = tokio::spawn(async move { runtime.run_with_force(shutdown_rx, force_rx).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let (_endpoint, driver, mut send_request) = h3_client(address).await;
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("https://example.com/stalled")
+        .body(())
+        .unwrap();
+    let mut stalled = send_request.send_request(request).await.expect("send");
+    stalled
+        .send_data(Bytes::from_static(b"partial"))
+        .await
+        .expect("send a few bytes");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    shutdown_tx.send(true).expect("first signal: graceful shutdown");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(!running.is_finished(), "the stalled request is still draining");
+
+    // A new request on the draining connection must fail fast, not hang.
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(4), async {
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("https://example.com/new")
+            .body(())
+            .unwrap();
+        let mut stream = send_request.send_request(request).await?;
+        stream.finish().await?;
+        stream.recv_response().await.map(|_| ())
+    })
+    .await;
+    match outcome {
+        Ok(Err(_)) => {}
+        Ok(Ok(())) => panic!("a new request on a draining connection must not be served"),
+        Err(_) => panic!(
+            "a new request on a draining connection hung for {:?} instead of being refused",
+            started.elapsed()
+        ),
+    }
+
+    // A new connection is refused outright (not left to time out on the handshake).
+    let started = std::time::Instant::now();
+    let endpoint = quic_endpoint(client_config(vec![b"h3".to_vec()]));
+    let refused = connect(&endpoint, address).await;
+    assert!(refused.is_err(), "a draining listener must refuse new connections");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the refusal took {:?}; it must be immediate, not a handshake timeout",
+        started.elapsed()
+    );
+
+    force_tx.send(true).expect("second signal");
+    let finished = tokio::time::timeout(Duration::from_secs(5), running)
+        .await
+        .expect("a forced shutdown returns promptly");
+    finished.expect("runtime task").expect("run returns Ok");
+    drop(stalled);
+    drop(driver);
+    assert_no_task_panics();
+}
+
+/// The body reader is cancelled while clients are still sending, again and again, from many
+/// concurrent connections with different timings and body sizes. h3-quinn panics when
+/// `stop_sending` is called on a stream that has a read in flight, and h3 reads ahead after a data
+/// frame, so that panic is timing dependent: a single request rarely triggers it (it first showed up
+/// intermittently in a full parallel test run). Large bodies fill the reader's channel so it is
+/// blocked handing chunks over when the handler finishes, and many simultaneous connections vary the
+/// interleaving. The panic recorder turns a panic in the spawned reader task into a test failure.
+#[tokio::test]
+async fn http3_body_reader_survives_repeated_early_cancellation() {
+    record_panics();
+    let tcp = free_port();
+    let udp = free_port();
+    // The static handler never reads the body, so every request ends (and cancels the reader)
+    // while the client is still uploading.
+    let routes = serde_json::json!([{
+        "handle": [{"handler": "static_response", "status_code": 200, "body": "early"}]
+    }]);
+    let (runtime, status) = start(config(tcp, Some(udp), Some(&["h1", "h2", "h3"]), routes)).await;
+    let address = udp_address(&status, udp);
+
+    let mut clients = tokio::task::JoinSet::new();
+    for client in 0..8u32 {
+        clients.spawn(async move {
+            for round in 0..12u32 {
+                let endpoint = quic_endpoint(client_config(vec![b"h3".to_vec()]));
+                let Ok(connection) = connect(&endpoint, address).await else {
+                    continue;
+                };
+                let Ok((driver, mut send_request)) =
+                    h3::client::new(h3_quinn::Connection::new(connection.clone())).await
+                else {
+                    continue;
+                };
+                let request = http::Request::builder()
+                    .method("POST")
+                    .uri("https://example.com/early")
+                    .body(())
+                    .unwrap();
+                let Ok(mut stream) = send_request.send_request(request).await else {
+                    continue;
+                };
+                // Bodies large enough to fill the reader's channel (depth 4) several times over.
+                let chunk = Bytes::from(vec![b'c'; 256 * 1024]);
+                for _ in 0..((client + round) % 10) + 2 {
+                    if stream.send_data(chunk.clone()).await.is_err() {
+                        break;
+                    }
+                }
+                let _ = tokio::time::timeout(Duration::from_secs(10), stream.recv_response()).await;
+                for _ in 0..((client * 3 + round) % 6) {
+                    if stream.send_data(chunk.clone()).await.is_err() {
+                        break;
+                    }
+                }
+                // Drop the stream and the connection abruptly, sometimes before the server noticed.
+                drop(stream);
+                if (client + round) % 3 == 0 {
+                    tokio::time::sleep(Duration::from_millis(u64::from((client + round) % 4) * 2))
+                        .await;
+                }
+                drop(driver);
+                connection.close(0u32.into(), b"done");
+            }
+        });
+    }
+    while clients.join_next().await.is_some() {}
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    runtime.shutdown().await;
+    assert_no_task_panics();
 }
