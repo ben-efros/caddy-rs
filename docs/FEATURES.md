@@ -36,7 +36,9 @@ resolved client address used by the `client_ip` matcher, forwarding decisions an
 When `trusted_proxies_strict` is absent the client IP is the right-most address outside the trusted
 ranges (stock Caddy takes the client-controlled left-most one); `stock_compat true` or an explicit
 `"trusted_proxies_strict": false` restores the stock behaviour
-([SEC-MEDIUM-PROXY](compatibility/SEC-MEDIUM-PROXY.md)).
+([SEC-MEDIUM-PROXY](compatibility/SEC-MEDIUM-PROXY.md)). Common breakage: with CDN -> load balancer
+-> caddy and `trusted_proxies` covering only the load balancer, `client_ip` is now the CDN edge
+address; add the CDN ranges to `trusted_proxies`.
 
 The derived `trusted_proxy`/`client_ip` variables are also consumed by `reverse_proxy`,
 `forward_auth` and the `acme_server` external-origin selection, and the per-request decision is

@@ -38,6 +38,19 @@ explicit `false`. The strict walk is the existing implementation (skips unparsab
 `ip:port`, `[v6]:port` and zoned forms, falls back to the direct peer when every entry is trusted
 or no header is present). The setting applies to Unix-socket peers (`trusted_proxies_unix`) too.
 
+### Most common breakage
+
+CDN -> load balancer -> caddy with `trusted_proxies` listing only the load balancer: the walk now
+stops at the first address outside the trusted ranges, which is the CDN edge, so `client_ip` becomes
+the CDN edge IP (it used to be the left-most, client-supplied value). Add the CDN ranges to
+`trusted_proxies` (so the walk continues to the real client), or restore the stock behaviour with
+`stock_compat true` / an explicit `"trusted_proxies_strict": false`.
+
+Unparsable entries: Caddy's `strictUntrustedClientIP` skips an entry that does not parse and moves
+on to the next one (it does not stop and does not return an empty string); caddy-rs does the same.
+This is stated from recollection of the Go source and has not been checked against the pinned
+`external/caddy` tree.
+
 ### Tests that pin it
 
 `crates/proxy/src/trusted_proxies.rs`:
@@ -79,9 +92,24 @@ proxy was not trusted at the server level while the handler-level check trusted 
 - `ServerTrustedProxies::determine` canonicalises the peer, and addresses parsed from forwarded
   headers are canonicalised, so the resolved client IP is the dotted IPv4 string.
 
-HTTP-engine matchers outside this group (`crates/http/src/matchers.rs` `remote_ip`/`client_ip`,
-`crates/http/src/auth.rs`, `crates/http/src/acme_server.rs`) have their own range types with the
-same cross-family `false` and are not changed by this item.
+- **HTTP engine (review fix, pre-existing bug).** `crates/http/src/matchers.rs` `IpRange` (used by
+  `remote_ip`, `client_ip` and `local_ip`), `crates/http/src/auth.rs` `Cidr` (forward_auth trusted
+  proxies) and `crates/http/src/acme_server.rs` `IpRange` (the ACME server's IP allow/deny policy)
+  had the same cross-family `false`: on the default dual-stack listener `not remote_ip
+  203.0.113.0/24` never matched an IPv4 client (deny bypass), allow lists failed closed, and the IP
+  identifier `::ffff:10.0.0.1` passed an IPv4 deny policy. Each `contains` now tries the raw and the
+  canonical form, and `crates/server/src/http.rs` `canonical_peer` turns a mapped peer into plain IPv4
+  where it enters the request (as Go's `net` reports it), which also makes
+  `{http.request.remote.host}` the dotted form. A shared helper in a common crate was not extracted
+  to keep the hunks small next to concurrent edits; the four copies are now identical in behaviour.
+  Tests: `ip_ranges_match_ipv4_mapped_peers`, `trusted_proxy_cidrs_match_ipv4_mapped_peers`,
+  `acme_ip_ranges_match_ipv4_mapped_identifiers`, `mapped_peers_enter_the_request_as_plain_ipv4`.
+- **Known deviation: `::ffff:0:0/96`.** `IpNet::parse`/`IpRange::parse` store `::ffff:0:0/96` as
+  `0.0.0.0/0`, so that range matches every IPv4 address. Go's `netip.Prefix` never contains an
+  unmapped IPv4 address in an IPv6 prefix, so this is NOT parity (the "parity" label above covers
+  the canonical comparison of peers, not this spelling). It is kept because an operator writing the
+  mapped block means "IPv4 clients" on a dual-stack listener; it is pinned by the mapped-range
+  assertions in the tests above.
 
 ### Tests that pin it
 
@@ -224,6 +252,15 @@ Tests: `crates/proxy/src/dns.rs` `query_ids_are_not_a_predictable_sequence`,
 | absent or `""` | false (default) | a random 32-byte per-process secret (one per process, so a config reload keeps clients pinned; a restart re-pins them; configure `secret` for stickiness across restarts or instances) |
 | absent or `""` | true | empty secret, stock behaviour |
 
+Limit of the random secret: it stops a client from *computing* the cookie for an upstream it has
+not been issued, but it does not let the operator prevent a client from choosing its upstream. A
+client can collect the cookies that the fallback policy hands out (reconnecting until every
+reachable upstream has been issued once) and replay the one it prefers. Stickiness is a routing
+hint, not an access control.
+
+The 502 detail is logged through `tracing` at debug level (not stderr), and `forward_auth`
+`status_code` expansions that are not a valid status answer a fixed `invalid status code` body.
+
 Tests: `crates/proxy/src/balancer.rs` `cookie_policy_without_a_secret_is_not_forgeable_by_default`,
 `cookie_policy_keeps_the_stock_secret_under_stock_compat_and_honours_explicit_ones`;
 `crates/proxy/src/handler.rs` `cookie_secret_default_follows_stock_compat`,
@@ -238,14 +275,19 @@ Tests: `crates/proxy/src/balancer.rs` `cookie_policy_without_a_secret_is_not_for
   `DEFAULT_DIAL_TIMEOUT` = 10 s, `with_dial_timeout(Duration::ZERO)` disables it. The 10 s default is
   this implementation's choice; I could not verify from the pinned caddy-l4 source whether its proxy
   handler applies a default dial timeout (Caddy's own `dial_timeout` convention is zero = unlimited),
-  so treat the default as a hardening that stock caddy-l4 may not have. The l4 crate has no JSON
-  configuration for `ProxyOptions` today, so there is no config field to document.
+  so treat the default as a hardening that stock caddy-l4 may not have. The L4 `ProxyOptions` /
+  `proxy_connection` hardening is NOT reachable from runtime configuration today (the l4 crate has
+  no JSON configuration for them), so it protects embedders of the crate only, and there is no
+  config field to document.
 - **FastCGI response head** (`crates/proxy/src/fastcgi.rs`): `read_response_head` buffered STDOUT
   until the blank line with no limit, and STDERR without limit. The head is now capped at
   `MAX_RESPONSE_HEAD_BYTES` = 1 MiB (Go's `net/textproto.ReadMIMEHeader`, used by Caddy's client,
   bounds it at the same size); exceeding it is a `FastCgiError::Protocol` (`... response headers
   exceed 1048576 bytes`) and thus a 502. STDERR kept while waiting for the head is capped at 1 MiB
-  (the excess is dropped; it is only logged). Body bytes after the head are not counted.
+  (the excess is dropped; it is only logged). Body bytes after the head are not counted. The
+  head scan is incremental (new bytes plus a 3-byte overlap, so it is linear) and at most 65536
+  records may be read before the head ends (`MAX_HEAD_RECORDS`): one-byte and zero-length records
+  made the old scan quadratic and, for empty records, made no progress at all.
 
 Both are unconditional (no stock_compat switch): they only reject inputs no legitimate backend
 produces.
@@ -322,7 +364,8 @@ Tests: `crates/l4/src/handlers/proxy.rs`
 - caddy-rs behaviour: an absent or empty `secret` becomes a random per-process secret unless
   `stock_compat true`. Stickiness survives config reloads but not restarts; set `secret` for that.
   Proxy-generated 502 bodies are always the fixed text `502 Bad Gateway` (details are logged).
-- Rationale: a forgeable sticky cookie lets a client pick its upstream; reflecting expanded dial
+- Rationale: an unkeyed cookie lets a client compute the pin for any upstream without being issued
+  it (a client can still replay cookies it was issued, so this is not access control); reflecting expanded dial
   strings leaks configuration and attacker-controlled text.
 - Status: intentional divergence, secure default (502 bodies: unconditional)
 - Tracking: SEC-MEDIUM-PROXY C5
