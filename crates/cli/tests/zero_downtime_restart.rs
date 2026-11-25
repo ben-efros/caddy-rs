@@ -372,6 +372,155 @@ fn serve_status(port: u16) -> u16 {
         .unwrap_or(0)
 }
 
+/// One request to the Unix admin socket, returning the status code, or 0 if nothing answered.
+fn admin_status(socket: &std::path::Path) -> u16 {
+    use std::io::Write as _;
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket) else {
+        return 0;
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("set read timeout");
+    let _ = stream
+        .write_all(b"GET /config/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    String::from_utf8_lossy(&response)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0)
+}
+
+/// The Unix admin socket is not inherited through the binder: the child binds it itself while the
+/// parent still serves it until the child is ready. The child must replace the parent's *live*
+/// socket (the admin liveness probe that refuses to steal a running process's socket must not
+/// apply to an upgrade child), and the old process must then exit cleanly without unlinking the
+/// path that now belongs to the new one. This test ran with `admin off` before, so the probe
+/// breaking upgrades went unnoticed.
+#[test]
+fn an_upgrade_hands_the_unix_admin_socket_to_the_new_process() {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "caddy-rs-admin-upgrade-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).expect("create the scratch directory");
+    let port = free_port();
+    let socket = dir.join("admin.sock");
+    let config = dir.join("config.json");
+    std::fs::write(
+        &config,
+        serde_json_config(port, &socket),
+    )
+    .expect("write the config");
+    let log_path = dir.join("caddy-rs.stderr");
+    let mut parent = Command::new(binary())
+        .args([
+            "run",
+            "--config",
+            config.to_str().expect("utf-8 path"),
+            "--adapter",
+            "json",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(&log_path).expect("create the log file"),
+        ))
+        .spawn()
+        .expect("spawn caddy-rs");
+    let log = || std::fs::read_to_string(&log_path).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while serve_status(port) != 200 || admin_status(&socket) != 200 {
+        assert!(
+            Instant::now() < deadline,
+            "the parent never served on the port and the admin socket:\n{}",
+            log()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let cleanup = |dir: &std::path::Path| {
+        // The new process is a child of the old one (fork/exec), not of the test.
+        let _ = Command::new("pkill")
+            .arg("-f")
+            .arg(dir.to_str().expect("utf-8 path"))
+            .status();
+    };
+
+    let status = Command::new("kill")
+        .arg(format!("-{}", libc::SIGUSR2))
+        .arg(parent.id().to_string())
+        .status()
+        .expect("run kill");
+    assert!(status.success());
+
+    // The parent reports the hand-over once the child is ready. If the child cannot bind the
+    // admin socket (the liveness probe refusing a socket the parent still serves) it never becomes
+    // ready and the parent logs "FAILED, still serving" instead.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !log().contains("the new process is ready") {
+        if Instant::now() >= deadline || log().contains("graceful restart FAILED") {
+            let _ = parent.kill();
+            let _ = parent.wait();
+            cleanup(&dir);
+            panic!(
+                "the new process never became ready (does the admin liveness probe block an \
+                 upgrade child?)\n{}",
+                log()
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    // Stop the old process; its shutdown must leave the replaced admin path alone.
+    let status = Command::new("kill")
+        .arg(format!("-{}", libc::SIGTERM))
+        .arg(parent.id().to_string())
+        .status()
+        .expect("run kill");
+    assert!(status.success());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let exit = loop {
+        if let Some(exit) = parent.try_wait().expect("poll the parent") {
+            break exit;
+        }
+        if Instant::now() >= deadline {
+            let _ = parent.kill();
+            let _ = parent.wait();
+            cleanup(&dir);
+            panic!("the old process did not exit on SIGTERM:\n{}", log());
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    assert!(exit.success(), "the old process exited with {exit}:\n{}", log());
+
+    // The new process owns the admin socket: it answers, and the old process's exit did not
+    // unlink the replaced path.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while admin_status(&socket) != 200 {
+        if Instant::now() >= deadline {
+            cleanup(&dir);
+            panic!(
+                "no process answers on the admin socket after the upgrade (the old one removed it?)\n{}",
+                log()
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(serve_status(port), 200, "the new process serves the site");
+    cleanup(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// JSON config: one static site on `port` and the admin API on a Unix socket.
+fn serde_json_config(port: u16, socket: &std::path::Path) -> String {
+    format!(
+        r#"{{"admin":{{"listen":"unix/{}"}},"apps":{{"http":{{"servers":{{"s":{{"listen":[":{port}"],"routes":[{{"handle":[{{"handler":"static_response","body":"ok"}}]}}]}}}}}}}}}}"#,
+        socket.display()
+    )
+}
+
 /// A long-lived streaming connection survives the restart (the second case the row names).
 ///
 /// A plain held-open TCP connection proves the socket was not torn down, but not that a stream

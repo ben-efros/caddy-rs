@@ -253,6 +253,22 @@ pub(crate) struct ListenerHandle {
     pub(crate) task: JoinHandle<()>,
     pub(crate) bound: String,
     pub(crate) socket_addr: Option<SocketAddr>,
+    /// For a Unix admin listener: the socket path and the identity of the file this listener
+    /// created there (the `/stop` exit path removes it only if it is still that file).
+    pub(crate) unix_socket: Option<(std::path::PathBuf, SocketIdentity)>,
+}
+
+/// How an admin listener is bound, decided by the caller from the generation being applied and the
+/// process role (not re-derived from whatever generation happens to be active).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AdminBindOptions {
+    /// The generation being applied sets `stock_compat true`: replace a Unix socket
+    /// unconditionally like stock Caddy, and lift the body cap/slots.
+    pub stock_compat: bool,
+    /// This process is the child of a zero-downtime upgrade. The parent keeps serving its admin
+    /// socket until the child reports ready, so a socket that still accepts is expected and is
+    /// replaced (the parent's cleanup then leaves the replaced path alone: different inode).
+    pub replace_live: bool,
 }
 
 impl ListenerHandle {
@@ -364,6 +380,7 @@ pub(crate) async fn bind(
                 task,
                 bound: socket_addr.to_string(),
                 socket_addr: Some(socket_addr),
+                unix_socket: None,
             })
         }
         Network::Unix => {
@@ -416,6 +433,7 @@ pub(crate) async fn bind(
                 task,
                 bound: path,
                 socket_addr: None,
+                unix_socket: None,
             })
         }
         #[cfg(feature = "http3")]
@@ -487,6 +505,7 @@ pub(crate) async fn bind(
                 task,
                 bound: socket_addr.to_string(),
                 socket_addr: Some(socket_addr),
+                unix_socket: None,
             })
         }
         #[cfg(not(feature = "http3"))]
@@ -3302,9 +3321,9 @@ impl hyper::service::Service<hyper::Request<Incoming>> for AdminService {
 
 /// The `(device, inode)` of the socket file this process created at the admin path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SocketIdentity {
-    device: u64,
-    inode: u64,
+pub(crate) struct SocketIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
 }
 
 impl SocketIdentity {
@@ -3382,8 +3401,9 @@ fn set_admin_socket_permissions(path: &std::path::Path) -> std::io::Result<()> {
 /// now at `socket_path`, so cleanup removes only that file.
 fn bind_admin_unix_private(
     socket_path: &std::path::Path,
-    stock_compat: bool,
+    options: AdminBindOptions,
 ) -> std::io::Result<(UnixListener, SocketIdentity)> {
+    let stock_compat = options.stock_compat || options.replace_live;
     use std::io::{Error, ErrorKind};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
@@ -3593,9 +3613,10 @@ async fn bind_admin_unix(
     configured: &str,
     path: &str,
     api: AdminApi,
+    options: AdminBindOptions,
 ) -> Result<ListenerHandle, Error> {
     let socket_path = std::path::Path::new(path);
-    let (listener, identity) = bind_admin_unix_private(socket_path, api_stock_compat(&api))
+    let (listener, identity) = bind_admin_unix_private(socket_path, options)
         .map_err(|error| Error::bind(configured, error))?;
     let (shutdown, mut receiver) = watch::channel(false);
     let (force, mut force_receiver) = watch::channel(false);
@@ -3669,7 +3690,22 @@ async fn bind_admin_unix(
         task,
         bound: configured.to_string(),
         socket_addr: None,
+        unix_socket: Some((socket_path.to_path_buf(), identity)),
     })
+}
+
+/// [`bind_admin_with`] with options derived from the active generation, for tests.
+#[cfg(test)]
+pub(crate) async fn bind_admin(
+    configured: &str,
+    api: AdminApi,
+    binder: BinderRef<'_>,
+) -> Result<ListenerHandle, Error> {
+    let options = AdminBindOptions {
+        stock_compat: api_stock_compat(&api),
+        replace_live: false,
+    };
+    bind_admin_with(configured, api, binder, options).await
 }
 
 /// Bind the admin API listener.
@@ -3677,17 +3713,18 @@ async fn bind_admin_unix(
 /// Supports the same transports as Caddy's `admin.listen`: TCP (`[host]:port`) and Unix domain
 /// sockets (`unix/<absolute path>`, bound with owner-only permissions). The Unix socket file is
 /// removed when the listener stops, so reloads never leave stale sockets behind.
-pub(crate) async fn bind_admin(
+pub(crate) async fn bind_admin_with(
     configured: &str,
     api: AdminApi,
     #[cfg_attr(not(feature = "graceful-restart"), allow(unused_variables))] binder: BinderRef<'_>,
+    options: AdminBindOptions,
 ) -> Result<ListenerHandle, Error> {
     let address = ListenAddr::parse(configured).map_err(|reason| Error::Listen {
         listen: configured.to_string(),
         reason,
     })?;
     if address.network == Network::Unix {
-        return bind_admin_unix(configured, &address.address, api).await;
+        return bind_admin_unix(configured, &address.address, api, options).await;
     }
     if address.network != Network::Tcp {
         return Err(Error::NotImplemented {
@@ -3765,6 +3802,7 @@ pub(crate) async fn bind_admin(
         task,
         bound: socket_addr.to_string(),
         socket_addr: Some(socket_addr),
+        unix_socket: None,
     })
 }
 
@@ -4005,6 +4043,7 @@ pub(crate) async fn bind_admin_remote(
         task,
         bound: socket_addr.to_string(),
         socket_addr: Some(socket_addr),
+        unix_socket: None,
     })
 }
 

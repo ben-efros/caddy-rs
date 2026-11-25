@@ -42,7 +42,8 @@ use crate::auto_https::{PreparedAutomaticHttps, RedirectPolicy};
 use crate::error::{Error, Result};
 use crate::limits::ServerLimits;
 use crate::listeners::{
-    bind, bind_admin, bind_admin_remote, remote_admin_tls_config, ListenerHandle, ListenerState,
+    bind, bind_admin_remote, bind_admin_with, remote_admin_tls_config, AdminBindOptions,
+    ListenerHandle, ListenerState,
     SharedListeners,
 };
 use crate::observability::{record_certificate_metrics, AccessLogRuntime, ServerAccessLogPolicy};
@@ -469,6 +470,12 @@ impl ServerRuntime {
     #[cfg(feature = "graceful-restart")]
     fn binder_ref(&self) -> Option<&crate::graceful_restart::ListenerBinder> {
         self.binder.as_deref()
+    }
+
+    /// Without the `graceful-restart` feature there is never an upgrade parent.
+    #[cfg(not(feature = "graceful-restart"))]
+    fn is_upgrade_child(&self) -> bool {
+        false
     }
 
     /// See the `graceful-restart` variant: with the feature off there is no registry.
@@ -1403,7 +1410,19 @@ impl ServerRuntime {
                 handle.stop().await;
             }
             if let Some(listen) = &desired_admin {
-                let handle = bind_admin(listen, self.admin_api.clone(), self.binder_ref()).await?;
+                // Both inputs come from the generation being applied and this process's role,
+                // not from whichever generation the store currently holds.
+                let options = AdminBindOptions {
+                    stock_compat: generation.config().stock_compat(),
+                    replace_live: self.is_upgrade_child(),
+                };
+                let handle = bind_admin_with(
+                    listen,
+                    self.admin_api.clone(),
+                    self.binder_ref(),
+                    options,
+                )
+                .await?;
                 tracing::info!(listen, bound = %handle.bound, "admin API listening");
                 // The `/stop` exit path removes this file itself if the runtime has not finished
                 // shutting down within its budget: `process::exit` skips the listener task's
