@@ -193,19 +193,63 @@ after the legitimate client noticed the failure and replayed its stale copy.
 refresh token of that user and bumps `auth_epoch` (retiring outstanding access tokens). The caller
 still receives `RefreshTokenRevoked` (pm-api: `401 invalid refresh token`, unchanged) and must log in
 again. Unknown and expired tokens revoke nothing; `revoke_refresh_token` (logout) is unchanged and
-idempotent. A store failure while containing the reuse is returned, not swallowed. Trade-off: a stale
-client presenting a token revoked by logout or a password change also ends the user's other
-sessions, because the record does not say why a token was revoked. Each reuse presentation bumps the
-epoch once.
+idempotent. A store failure while containing the reuse is returned, not swallowed.
+
+**Follow-up (review).** The first version treated *any* revoked token as reuse, which cascaded: a
+second device's routine refresh after a reset, a refresh racing a logout, or anyone who ever held an
+old token could keep signing the user out. Records now carry a `RevokeReason` (`Rotated`,
+`LoggedOut`, `Revoked`) and the `auth_epoch` they were issued under; only a `Rotated`, unexpired
+token whose epoch still equals the user's triggers the family revocation (the epoch compare and bump
+are one atomic `modify_user`). Everything else is a plain `RefreshTokenRevoked`, and expiry is
+checked before revocation. The earlier "stale client ends other sessions" trade-off no longer
+exists.
 
 ### Tests
 
 `crates/authn/src/tests_security.rs`: `replaying_a_consumed_refresh_token_revokes_the_whole_family`,
 `reuse_by_one_user_never_touches_another_user`, `unknown_and_expired_tokens_revoke_nothing`,
-`an_idempotent_logout_replay_does_not_sign_out_other_sessions`. Three pre-existing tests were
+`an_idempotent_logout_replay_does_not_sign_out_other_sessions`, and for the follow-up
+`refresh_after_logout_is_a_plain_rejection_with_no_side_effects`,
+`refresh_after_a_password_change_does_not_end_the_new_session`,
+`a_multi_device_reset_does_not_cascade`,
+`a_rotated_token_replayed_after_the_epoch_moved_is_not_theft`,
+`an_expired_rotated_token_is_just_expired`. Three pre-existing tests were
 adjusted because they encoded the old behaviour (`login_and_refresh_rotation`,
 `revoke_all_for_user_invalidates_access_and_refresh`,
 `revoke_refresh_token_ends_one_session_and_is_replay_safe`).
+
+## Follow-up review round (authn)
+
+- **Password-guessing oracle.** `update_password` verified the current password with no throttle.
+  It now reserves/clears an attempt under the same per-username key as `login`
+  (`update_password_shares_the_login_failure_budget`).
+- **One password policy.** `check_password_policy` (8 characters minimum, 1024 bytes maximum) is
+  applied by `create_user`, `create_first_admin`, `set_password` and `update_password`; the pm-cli
+  bootstrap fails startup naming `PM_BOOTSTRAP_ADMIN_PASSWORD`
+  (`every_password_setting_path_applies_the_same_policy`,
+  `a_too_short_bootstrap_password_fails_startup_naming_the_setting`). Existing accounts and stored
+  hashes are untouched.
+- **Throttle weaknesses.** The idle reset forgot the backoff level (about ten guesses per 45
+  minutes instead of one per 15); it now decays one level per idle period and a penalised key
+  re-locks on its first further failure. Eviction preferred the oldest unlocked entry, so ~10k
+  invented usernames reset a victim whose lockout had expired; it now evicts by (locked, level,
+  failures, age). Tests: `an_idle_period_decays_the_backoff_level_gradually_instead_of_forgetting_it`,
+  `an_entry_whose_lockout_expired_is_not_the_one_evicted_by_username_flooding`.
+- **Panic.** `now + lockout` overflowed `Instant` for a huge `max_lockout`; it is now `checked_add`
+  with a far-future fallback, and `validate()` rejects `max_lockout` above one day
+  (`an_enormous_max_lockout_neither_panics_nor_validates`).
+- **Key vs store.** The store is case-sensitive, so the throttle key is the exact username (a folded
+  key let anyone lock out `Bob` by failing as `bob`): `the_failure_budget_is_per_exact_username`.
+- **Atomic updates.** `UserStore::modify_user` is new; the reuse response, `confirm_reenrolment`,
+  `totp_disable`, `totp_setup`, `totp_reenroll`, `totp_confirm`, passwords, roles and
+  `revoke_all_for_user` use it instead of rewriting a whole record read earlier, which could revert
+  a concurrently consumed `totp_last_step` and revive a used code
+  (`service_updates_do_not_revert_a_concurrently_consumed_totp_step`, with a store that serves a
+  stale read).
+- **Breaking changes.** `AuthError` is `#[non_exhaustive]`; `UserStore` gained `modify_user` and
+  `consume_refresh_token` takes a `RevokeReason`; new fields on `User`, `AuthnConfig`,
+  `RefreshTokenRecord` (see `docs/AUTHN.md`). In-tree consumers (pm-api, pm-cli, the `caddy-rs` CLI)
+  needed no change beyond the pm-cli bootstrap message.
 
 ## E6 — secrets in logs and arguments in `pm-cli`
 
@@ -220,11 +264,13 @@ environment variables through clap's `env`).
 
 ### Behaviour
 
-- The URI is printed to stderr once (`announce_bootstrap_totp`); the structured log only says it was
-  printed. The fatal-error path logs the error with every `secret=` value replaced by `[redacted]`
-  and prints the full text, URI included, to stderr only. Under systemd stderr still reaches the
-  journal, which is documented in `docs/INSTALL.md` together with the alternative (`POST
-  /auth/totp/setup`).
+- The URI is shown once by `announce_bootstrap_totp`, and the structured log only says where it
+  went. On a terminal it is printed to stderr. Without one (under systemd both streams reach the
+  journal, the shared retained sink) it is written to an owner-only (0600) file
+  `bootstrap-totp-uri.txt` in the data directory and only the path is logged; if that write fails
+  startup fails. The fatal-error path logs the error with every `secret=` value redacted and prints
+  the full text to a terminal only (a non-terminal stderr gets the redacted text; a fresh start
+  enrols a fresh secret, so nothing usable is lost).
 - The credential flags keep working (removing them would break existing invocations); `main` logs a
   warning naming the flag (never the value) when either is present on the command line, steering
   operators to the environment variables / the 0600 environment file. Not changed: the bootstrap
@@ -236,7 +282,10 @@ environment variables through clap's `env`).
 `pm-cli`: `the_bootstrap_totp_uri_goes_to_stderr_and_never_to_the_structured_log` (captures the
 tracing output; with the old `warn!(totp_uri = ...)` it fails with the secret in the log),
 `totp_secrets_are_redacted_from_text_that_may_be_logged`,
-`credential_flags_on_the_command_line_are_detected_by_name_only`. The wiring in `main`
+`credential_flags_on_the_command_line_are_detected_by_name_only`,
+`without_a_terminal_the_uri_goes_to_an_owner_only_file_and_nowhere_else`,
+`a_failure_to_place_the_uri_is_reported_not_swallowed`,
+`the_fatal_error_shown_without_a_terminal_carries_no_secret`. The wiring in `main`
 (`error!`/`eprintln!` and the flag warning) is not unit-tested.
 
 ## Exact program-repository text to merge
@@ -260,3 +309,6 @@ equivalent; `stock_compat` does not apply):
 > tokens and bumps the authentication epoch. The proxy-manager daemon prints the bootstrap TOTP
 > enrolment URI to stderr instead of the structured log and warns when a bootstrap credential is
 > passed as a command-line argument.
+> (Follow-up review: reuse detection reacts only to a rotated, unexpired token of the current
+> epoch, `update_password` shares the login failure budget, one password policy covers every
+> setter, and user-record updates are atomic.)

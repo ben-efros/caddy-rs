@@ -157,14 +157,19 @@ credentials deletes a stale file left by an earlier install. Supply the email an
 
 `PM_BOOTSTRAP_ADMIN_TOTP` also works (fixed in T-AUTH-002). The bootstrap enrols a TOTP secret and
 then confirms the supplied code against it, so the code must come from the same enrolment. Because
-the secret is minted at bootstrap time, the enrolment URI is printed **to the process's stderr** on
-success and, if the code is rejected, in the error text on stderr; scan it to keep receiving codes.
-The URI embeds the secret, so it is deliberately kept out of the structured log (the log line only
-says it was printed, and any `secret=` value in a logged error is replaced by `[redacted]`). Under
-systemd stderr is still captured by the journal; where that is not acceptable, enrol TOTP through
-`POST /api/v1/auth/totp/setup` after first login instead of using `PM_BOOTSTRAP_ADMIN_TOTP`. A
-rejected code removes the administrator it created rather than leaving an account with an unconfirmed
-factor.
+the secret is minted at bootstrap time, the enrolment URI is shown once, and where depends on
+whether a person is watching. On a terminal it is printed to stderr. Under a service manager (where
+both stdout and stderr go to the journal) it is written to an owner-only (0600) file,
+`bootstrap-totp-uri.txt` in the data directory (`/var/lib/caddy-rs/` by default), and only the path
+is logged; scan it and delete the file. If the file cannot be written the start fails. The URI embeds
+the secret, so it is never put in the structured log, and a fatal error shown without a terminal has
+every `secret=` value replaced by `[redacted]`. A rejected code removes the administrator it created
+rather than leaving an account with an unconfirmed factor (the next start enrols a fresh secret).
+Where even a file is unacceptable, enrol TOTP through `POST /api/v1/auth/totp/setup` after first
+login instead of using `PM_BOOTSTRAP_ADMIN_TOTP`.
+
+`PM_BOOTSTRAP_ADMIN_PASSWORD` must be at least 8 characters; a shorter one makes the service fail to
+start with an error naming the variable.
 
 Pass the bootstrap password and TOTP code through the environment (`PM_BOOTSTRAP_ADMIN_PASSWORD`,
 `PM_BOOTSTRAP_ADMIN_TOTP`, i.e. the 0600 environment file `install` writes), not as
