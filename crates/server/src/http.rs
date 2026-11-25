@@ -822,6 +822,63 @@ mod tests {
         );
         assert_eq!(declared_content_length(&headers), None);
     }
+
+    /// SEC-MEDIUM-HTTP B2 review: a streamed static file (over the 256 KiB threshold) must keep
+    /// its `Content-Length` after `to_hyper_streaming`, like Go's `ServeContent`, for the full
+    /// 200, a single-range 206 and a multipart 206; otherwise HTTP/1.1 falls back to chunked
+    /// framing and HTTP/2/3 clients get no length.
+    #[tokio::test]
+    async fn streamed_static_files_keep_content_length_through_to_hyper_streaming() {
+        let dir = tempfile::tempdir().unwrap();
+        let content: Vec<u8> = (0..700_000usize).map(|index| (index % 251) as u8).collect();
+        std::fs::write(dir.path().join("big.bin"), &content).unwrap();
+        let routes = serde_json::json!([{ "handle": [{
+            "handler": "file_server", "root": dir.path().to_string_lossy(), "hide": []
+        }]}]);
+        let router = caddy_rs_http::RouterBuilder::new()
+            .build(routes.as_array().unwrap())
+            .unwrap();
+
+        for (range, status) in [
+            (None, StatusCode::OK),
+            (Some("bytes=5-399999"), StatusCode::PARTIAL_CONTENT),
+            (
+                Some("bytes=0-199999,300000-599999"),
+                StatusCode::PARTIAL_CONTENT,
+            ),
+        ] {
+            let mut request =
+                caddy_rs_http::Request::new(http::Method::GET, "/big.bin".parse().unwrap());
+            if let Some(range) = range {
+                request
+                    .headers
+                    .insert(http::header::RANGE, HeaderValue::from_str(range).unwrap());
+            }
+            let Ok(ResponseOutcome::Response(response)) = router.handle_upgradable(request).await
+            else {
+                panic!("expected a response for {range:?}");
+            };
+            assert!(
+                matches!(response.body, caddy_rs_http::Body::Stream(_)),
+                "{range:?} must take the streaming path"
+            );
+            let hyper_response = to_hyper_streaming(response);
+            assert_eq!(hyper_response.status(), status, "{range:?}");
+            let declared = hyper_response
+                .headers()
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("Content-Length was dropped for {range:?}"));
+            assert_eq!(
+                hyper_response.body().exact_size(),
+                Some(declared),
+                "{range:?}"
+            );
+            let body = hyper_response.into_body().into_bytes().await.unwrap();
+            assert_eq!(body.len() as u64, declared, "{range:?}");
+        }
+    }
 }
 
 /// Whether HTTP/2 extended CONNECT (RFC 8441) is enabled for this process.
