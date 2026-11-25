@@ -161,6 +161,35 @@ Tests: `crates/proxy/src/dns.rs` `query_ids_are_not_a_predictable_sequence`,
 `responses_must_echo_the_question_that_was_asked`,
 `forged_udp_replies_with_the_wrong_question_are_ignored`, `a_forged_only_reply_is_never_accepted`.
 
+## C5 — generic 502 bodies; random `cookie` secret by default
+
+### Upstream source of truth (v2.11.9)
+
+- `modules/caddyhttp/reverseproxy/reverseproxy.go`: a failed proxy attempt returns
+  `caddyhttp.Error(502, err)`; with no error routes the client gets an empty body. caddy-rs already
+  answered with the text `502 Bad Gateway`, but several paths appended the internal error
+  (`502 Bad Gateway: <detail>`), reflecting the configured dial template, the attacker-controlled
+  placeholder expansion and resolver/I-O errors. Unconditional fix, no `stock_compat` switch: every
+  proxy-generated 502 body is exactly `502 Bad Gateway` and the detail is logged (debug-escaped) to
+  stderr with the prefix `caddy-rs: reverse_proxy: 502 Bad Gateway:`.
+- `modules/caddyhttp/reverseproxy/selectionpolicies.go` `CookieHashSelection`: the cookie value is
+  `hex(HMAC-SHA256(secret, dial))` with `secret` defaulting to empty, so by default anyone can
+  compute the cookie for any upstream and pin themselves to it.
+
+### Implemented behaviour for the `cookie` policy
+
+| `secret` | `stock_compat` | Cookie key |
+|---|---|---|
+| non-empty | either | the configured secret (unchanged) |
+| absent or `""` | false (default) | a random 32-byte per-process secret (one per process, so a config reload keeps clients pinned; a restart re-pins them; configure `secret` for stickiness across restarts or instances) |
+| absent or `""` | true | empty secret, stock behaviour |
+
+Tests: `crates/proxy/src/balancer.rs` `cookie_policy_without_a_secret_is_not_forgeable_by_default`,
+`cookie_policy_keeps_the_stock_secret_under_stock_compat_and_honours_explicit_ones`;
+`crates/proxy/src/handler.rs` `cookie_secret_default_follows_stock_compat`,
+`refusals_do_not_reflect_the_expanded_dial_in_the_response`,
+`dynamic_upstream_empty_or_invalid_expansion_is_a_located_error`.
+
 ## Proposed register entries (program repository)
 
 ```text
@@ -215,4 +244,21 @@ Tests: `crates/proxy/src/dns.rs` `query_ids_are_not_a_predictable_sequence`,
 - Test: `crates/proxy/src/handler.rs` `request_derived_dials_cannot_reach_restricted_addresses_by_default`,
   `dial_allow_and_stock_compat_permit_what_the_guard_denies`,
   `dynamic_client_cache_is_bounded_and_evicts_least_recently_used`
+```
+
+```text
+## DIV-NNNN — `cookie` load-balancing policy defaults to a random per-process secret
+
+- Area: reverse_proxy load balancing
+- Caddy behaviour: `lb_policy cookie` without `secret` keys the HMAC with the empty string, so the
+  sticky cookie is the unkeyed hash of the upstream address and can be computed by any client.
+- caddy-rs behaviour: an absent or empty `secret` becomes a random per-process secret unless
+  `stock_compat true`. Stickiness survives config reloads but not restarts; set `secret` for that.
+  Proxy-generated 502 bodies are always the fixed text `502 Bad Gateway` (details are logged).
+- Rationale: a forgeable sticky cookie lets a client pick its upstream; reflecting expanded dial
+  strings leaks configuration and attacker-controlled text.
+- Status: intentional divergence, secure default (502 bodies: unconditional)
+- Tracking: SEC-MEDIUM-PROXY C5
+- Test: `crates/proxy/src/balancer.rs` `cookie_policy_without_a_secret_is_not_forgeable_by_default`;
+  `crates/proxy/src/handler.rs` `cookie_secret_default_follows_stock_compat`
 ```

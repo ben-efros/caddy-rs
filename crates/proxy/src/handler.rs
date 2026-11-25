@@ -591,6 +591,7 @@ impl ReverseProxyHandler {
             Arc::new(SystemDnsResolver),
             Some(format!("caddy-rs/{}", env!("CARGO_PKG_VERSION"))),
             false,
+            false,
         )
     }
 
@@ -607,6 +608,7 @@ impl ReverseProxyHandler {
             resolver,
             Some(format!("caddy-rs/{}", env!("CARGO_PKG_VERSION"))),
             false,
+            false,
         )
     }
 
@@ -622,6 +624,7 @@ impl ReverseProxyHandler {
             path,
             Arc::new(SystemDnsResolver),
             server_software,
+            false,
             false,
         )
     }
@@ -643,6 +646,27 @@ impl ReverseProxyHandler {
             Arc::new(SystemDnsResolver),
             server_software,
             security_profile_enabled,
+            false,
+        )
+    }
+
+    /// Build from Caddy JSON for the production router factories: the generation's `stock_compat`
+    /// selects stock Caddy's defaults where caddy-rs hardens them (the `cookie` policy's empty
+    /// default secret, SEC-MEDIUM-PROXY C5).
+    pub fn from_json_with_stock_compat(
+        value: &Value,
+        path: &str,
+        server_software: Option<String>,
+        security_profile_enabled: bool,
+        stock_compat: bool,
+    ) -> HttpResult<Self> {
+        Self::from_json_full(
+            value,
+            path,
+            Arc::new(SystemDnsResolver),
+            server_software,
+            security_profile_enabled,
+            stock_compat,
         )
     }
 
@@ -652,6 +676,7 @@ impl ReverseProxyHandler {
         resolver: Arc<dyn DnsResolver>,
         server_software: Option<String>,
         security_profile_enabled: bool,
+        stock_compat: bool,
     ) -> HttpResult<Self> {
         let object = value
             .as_object()
@@ -730,18 +755,21 @@ impl ReverseProxyHandler {
 
         let load_balancing = object.get("load_balancing");
         let selection_policy = load_balancing.and_then(|lb| lb.get("selection_policy"));
-        let balancer =
-            balancer::from_selection_policy(selection_policy, &format!("{path}.load_balancing"))
-                .map_err(|error| match error {
-                    balancer::BalancerError::Invalid(message) => invalid(path, message),
-                    balancer::BalancerError::NotImplemented {
-                        feature,
-                        tracking_id,
-                    } => HttpError::NotImplemented {
-                        feature,
-                        tracking_id,
-                    },
-                })?;
+        let balancer = balancer::from_selection_policy_with_stock_compat(
+            selection_policy,
+            &format!("{path}.load_balancing"),
+            stock_compat,
+        )
+        .map_err(|error| match error {
+            balancer::BalancerError::Invalid(message) => invalid(path, message),
+            balancer::BalancerError::NotImplemented {
+                feature,
+                tracking_id,
+            } => HttpError::NotImplemented {
+                feature,
+                tracking_id,
+            },
+        })?;
         let retries = load_balancing
             .and_then(|lb| lb.get("retries"))
             .and_then(Value::as_u64)
@@ -1856,7 +1884,7 @@ impl Handler for ReverseProxyHandler {
                     mark_proxy_failure(&request);
                     return Ok(Outcome::Respond(Response::text(
                         StatusCode::BAD_GATEWAY,
-                        format!("502 Bad Gateway: cannot read request body: {error}"),
+                        bad_gateway_body(&format!("cannot read request body: {error}")),
                     )));
                 }
             }
@@ -1908,7 +1936,7 @@ impl Handler for ReverseProxyHandler {
                         mark_proxy_failure(&request);
                         let mut response = Response::text(
                             StatusCode::BAD_GATEWAY,
-                            format!("502 Bad Gateway: {error}"),
+                            bad_gateway_body(&error.to_string()),
                         );
                         merge_selection_cookie(&mut response, &selection);
                         return Ok(Outcome::Respond(response));
@@ -1928,10 +1956,8 @@ impl Handler for ReverseProxyHandler {
                     // itself: a handler-chain error (see `mark_proxy_failure`). Unreachable today
                     // because retries imply a buffered body, marked for uniformity.
                     mark_proxy_failure(&request);
-                    let mut response = Response::text(
-                        StatusCode::BAD_GATEWAY,
-                        format!("502 Bad Gateway: {message}"),
-                    );
+                    let mut response =
+                        Response::text(StatusCode::BAD_GATEWAY, bad_gateway_body(message));
                     merge_selection_cookie(&mut response, &selection);
                     return Ok(Outcome::Respond(response));
                 }
@@ -2100,7 +2126,7 @@ impl Handler for ReverseProxyHandler {
                     return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
                         Response::text(
                             StatusCode::BAD_GATEWAY,
-                            format!("502 Bad Gateway: cannot read request body: {error}"),
+                            bad_gateway_body(&format!("cannot read request body: {error}")),
                         ),
                     )));
                 }
@@ -2150,7 +2176,7 @@ impl Handler for ReverseProxyHandler {
                         mark_proxy_failure(&request);
                         let mut response = Response::text(
                             StatusCode::BAD_GATEWAY,
-                            format!("502 Bad Gateway: {error}"),
+                            bad_gateway_body(&error.to_string()),
                         );
                         merge_selection_cookie(&mut response, &selection);
                         return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
@@ -2171,10 +2197,8 @@ impl Handler for ReverseProxyHandler {
                     // Same as the buffered path: an unreplayable body fails the attempt, which is
                     // a handler-chain error (see `mark_proxy_failure`).
                     mark_proxy_failure(&request);
-                    let mut response = Response::text(
-                        StatusCode::BAD_GATEWAY,
-                        format!("502 Bad Gateway: {message}"),
-                    );
+                    let mut response =
+                        Response::text(StatusCode::BAD_GATEWAY, bad_gateway_body(message));
                     merge_selection_cookie(&mut response, &selection);
                     return Ok(StreamingOutcome::Respond(StreamingResponse::from_buffered(
                         response,
@@ -2277,30 +2301,30 @@ impl Handler for ReverseProxyHandler {
                         // `copy_response` needs the complete upstream body; buffer it only when
                         // the configuration asks for it (other response handlers drop or replace
                         // the body).
-                        let (buffered_upstream_body, upstream_stream) = if self
-                            .handle_response
-                            .requires_upstream_body()
-                        {
-                            match forwarded.body.into_bytes().await {
-                                Ok(body) => (Some(body), None),
-                                Err(error) => {
-                                    // `copy_response` could not read the upstream body, so the
-                                    // response handler fails the request: a handler-chain error
-                                    // (see `mark_proxy_failure`).
-                                    mark_proxy_failure(&request);
-                                    let mut response = Response::text(
-                                        StatusCode::BAD_GATEWAY,
-                                        format!("502 Bad Gateway: cannot read upstream response body: {error}"),
-                                    );
-                                    merge_selection_cookie(&mut response, &selection);
-                                    return Ok(StreamingOutcome::Respond(
-                                        StreamingResponse::from_buffered(response),
-                                    ));
+                        let (buffered_upstream_body, upstream_stream) =
+                            if self.handle_response.requires_upstream_body() {
+                                match forwarded.body.into_bytes().await {
+                                    Ok(body) => (Some(body), None),
+                                    Err(error) => {
+                                        // `copy_response` could not read the upstream body, so the
+                                        // response handler fails the request: a handler-chain error
+                                        // (see `mark_proxy_failure`).
+                                        mark_proxy_failure(&request);
+                                        let mut response = Response::text(
+                                            StatusCode::BAD_GATEWAY,
+                                            bad_gateway_body(&format!(
+                                                "cannot read upstream response body: {error}"
+                                            )),
+                                        );
+                                        merge_selection_cookie(&mut response, &selection);
+                                        return Ok(StreamingOutcome::Respond(
+                                            StreamingResponse::from_buffered(response),
+                                        ));
+                                    }
                                 }
-                            }
-                        } else {
-                            (None, Some(forwarded.body))
-                        };
+                            } else {
+                                (None, Some(forwarded.body))
+                            };
                         if let Some(result) = self.handle_response.evaluate(
                             &request,
                             forwarded.status,
@@ -3406,17 +3430,29 @@ fn parse_health_checks(
     Ok((active, passive))
 }
 
+/// The body of a proxy-generated `502 Bad Gateway`.
+///
+/// The detail (dial templates, attacker-controlled placeholder expansions, resolver and I/O errors)
+/// is logged, never reflected to the client (SEC-MEDIUM-PROXY C5). Stock Caddy answers these
+/// failures with an empty 502 body, so the client sees no more than it does there. The detail is
+/// logged debug-escaped so request-derived control characters cannot forge log lines.
+fn bad_gateway_body(detail: &str) -> &'static str {
+    eprintln!("caddy-rs: reverse_proxy: 502 Bad Gateway: {detail:?}");
+    "502 Bad Gateway"
+}
+
 /// The handler factory installed in the HTTP router builder.
 pub fn handler_factory() -> CustomHandlerFactory {
     Arc::new(|value: &Value, path: &str, context: &HandlerBuildContext| {
         let name = value.get("handler").and_then(Value::as_str);
         if name == Some("reverse_proxy") {
             Ok(Some(Arc::new(
-                ReverseProxyHandler::from_json_with_profile(
+                ReverseProxyHandler::from_json_with_stock_compat(
                     value,
                     path,
                     Some(format!("caddy-rs/{}", env!("CARGO_PKG_VERSION"))),
                     security_profile_enabled(context),
+                    context.stock_compat,
                 )?
                 .with_dial_guard(!context.stock_compat),
             )))
@@ -3449,11 +3485,12 @@ pub fn handler_factory_with_status_sink_and_server_software(
             let name = value.get("handler").and_then(Value::as_str);
             if name == Some("reverse_proxy") {
                 let handler = Arc::new(
-                    ReverseProxyHandler::from_json_with_profile(
+                    ReverseProxyHandler::from_json_with_stock_compat(
                         value,
                         path,
                         server_software.clone(),
                         security_profile_enabled(context),
+                        context.stock_compat,
                     )?
                     .with_dial_guard(!context.stock_compat),
                 );
@@ -4085,9 +4122,27 @@ mod tests {
             panic!("expected a 502 response");
         };
         assert_eq!(response.status, StatusCode::BAD_GATEWAY);
-        let body = body_text(&response);
-        assert!(body.contains("empty after placeholder expansion"), "{body}");
-        assert!(body.contains("{http.request.header.X-Upstream}"), "{body}");
+        // The body is generic (SEC-MEDIUM-PROXY C5): the dial template and the attacker-controlled
+        // expansion are logged, never reflected to the client. The located detail stays on the
+        // internal error that gets logged.
+        assert_eq!(body_text(&response), "502 Bad Gateway");
+        let upstream = Arc::clone(&handler.upstreams()[0]);
+        let detail = handler
+            .resolve_target(
+                &upstream,
+                &get_request("/dynamic", Some("203.0.113.7:5555")),
+            )
+            .err()
+            .expect("empty expansion fails")
+            .to_string();
+        assert!(
+            detail.contains("empty after placeholder expansion"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("{http.request.header.X-Upstream}"),
+            "{detail}"
+        );
 
         // A non-address expansion is rejected before dialing.
         let mut request = get_request("/dynamic", Some("203.0.113.7:5555"));
@@ -4098,9 +4153,18 @@ mod tests {
             panic!("expected a 502 response");
         };
         assert_eq!(response.status, StatusCode::BAD_GATEWAY);
-        let body = body_text(&response);
-        assert!(body.contains("invalid dial address"), "{body}");
-        assert!(body.contains("not an address"), "{body}");
+        assert_eq!(body_text(&response), "502 Bad Gateway");
+        let mut request = get_request("/dynamic", Some("203.0.113.7:5555"));
+        request
+            .headers
+            .insert("x-upstream", "not an address".parse().unwrap());
+        let detail = handler
+            .resolve_target(&upstream, &request)
+            .err()
+            .expect("invalid expansion fails")
+            .to_string();
+        assert!(detail.contains("invalid dial address"), "{detail}");
+        assert!(detail.contains("not an address"), "{detail}");
     }
 
     #[tokio::test]
@@ -4200,6 +4264,62 @@ mod tests {
         // `stock_compat true` (guard off) is stock Caddy: anything the expansion yields is dialed.
         let stock = ssrf_handler(serde_json::json!({}), false);
         assert_eq!(status_for(&stock, &echo).await, StatusCode::OK);
+    }
+
+    /// The refusal must not echo the attacker-chosen target (or the configured template) back.
+    #[tokio::test]
+    async fn refusals_do_not_reflect_the_expanded_dial_in_the_response() {
+        let handler = ssrf_handler(serde_json::json!({}), true);
+        let Outcome::Respond(response) = handler
+            .handle(backend_request("169.254.169.254:80"))
+            .await
+            .unwrap()
+        else {
+            panic!("expected a response");
+        };
+        assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body_text(&response), "502 Bad Gateway");
+    }
+
+    /// The `cookie` policy's secret default follows `stock_compat` (SEC-MEDIUM-PROXY C5).
+    #[test]
+    fn cookie_secret_default_follows_stock_compat() {
+        let value = serde_json::json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": "localhost:9000"}, {"dial": "localhost:9001"}],
+            "load_balancing": {"selection_policy": {
+                "policy": "cookie", "name": "lb", "fallback": {"policy": "first"}
+            }}
+        });
+        for (stock_compat, forgeable) in [(false, false), (true, true)] {
+            let handler = ReverseProxyHandler::from_json_with_stock_compat(
+                &value,
+                "handler",
+                None,
+                false,
+                stock_compat,
+            )
+            .unwrap();
+            let mut request = get_request("/", None);
+            request.headers.insert(
+                http::header::COOKIE,
+                format!(
+                    "lb={}",
+                    crate::digest::hmac_sha256_hex(b"", b"localhost:9001")
+                )
+                .parse()
+                .unwrap(),
+            );
+            let chosen = handler
+                .balancer
+                .select(&handler.upstreams, &request, &mut Response::ok())
+                .unwrap();
+            assert_eq!(
+                chosen.dial == "localhost:9001",
+                forgeable,
+                "stock_compat={stock_compat}"
+            );
+        }
     }
 
     /// The production factory wires the guard to the generation's `stock_compat`.

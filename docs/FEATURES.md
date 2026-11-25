@@ -270,7 +270,7 @@ Set `load_balancing.selection_policy` to choose a policy. The default is `random
 | `random` | `{"policy": "random"}` | Uniformly random healthy upstream. |
 | `random_choose` | `{"policy": "random_choose", "choose": 2}` | Chooses a random sub-pool (at least 2), then the least-loaded member. |
 | `weighted_round_robin` | `{"policy": "weighted_round_robin", "weights": [3, 1]}` | Weighted rotation. |
-| `cookie` | `{"policy": "cookie", "name": "lb", "secret": "...", "max_age": 0, "fallback": "random"}` | Sticky sessions: the cookie value is an HMAC of the selected dial address. A missing or stale cookie falls back to the fallback policy and re-pins the client with `Set-Cookie`. |
+| `cookie` | `{"policy": "cookie", "name": "lb", "secret": "...", "max_age": 0, "fallback": "random"}` | Sticky sessions: the cookie value is an HMAC of the selected dial address. Without a `secret` a random per-process secret is used (stickiness survives reloads, not restarts; `stock_compat true` restores Caddy's empty secret). A missing or stale cookie falls back to the fallback policy and re-pins the client with `Set-Cookie`. |
 | `ip_hash` | `{"policy": "ip_hash"}` | Hashes the peer IP. |
 | `client_ip_hash` | `{"policy": "client_ip_hash"}` | Hashes the resolved client IP. |
 | `uri_hash` | `{"policy": "uri_hash"}` | Hashes the request URI. |
