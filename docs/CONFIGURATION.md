@@ -71,7 +71,7 @@ validation; each module's own fields are validated against its schema.
 
 | Key | Purpose |
 |---|---|
-| `admin` | The management endpoint. `listen` defaults to `localhost:2019`; `disabled: true` turns it off; `enforce_origin` with `origins` restricts cross-origin requests. |
+| `admin` | The management endpoint. `listen` defaults to `localhost:2019` (bound on both `127.0.0.1` and `[::1]`); `disabled: true` turns it off; `enforce_origin` with `origins` restricts cross-origin requests. |
 | `logging` | Structured logging targets. `logs.<name>` selects a writer, encoder, level, sampling and include/exclude filters, and the `default` log is where access entries normally go. |
 | `storage` | The certificate and ACME storage backend. It is a module object: `{"module": "file_system", "root": "/var/lib/caddy-rs"}` selects the filesystem backend and its root. |
 | `apps` | Applications keyed by module name. |

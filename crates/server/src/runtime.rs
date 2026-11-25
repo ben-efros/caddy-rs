@@ -1364,6 +1364,9 @@ impl ServerRuntime {
                     if let Some(addr) = handle.socket_addr {
                         binder.forget(addr);
                     }
+                    for addr in &handle.secondary_addrs {
+                        binder.forget(*addr);
+                    }
                 }
                 handle.begin_graceful();
                 if let Some(grace) = timing.grace_period {

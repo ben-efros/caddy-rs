@@ -135,8 +135,14 @@ Tests: `crates/http/tests/file_server_path_validation.rs` (the corpus, run as GE
    `symlinks follow`. Also hides resolved targets, applies the policy to index files and sidecars, and
    verifies the opened handle.
 2. **Strict UTF-8 in file request paths** — invalid escapes are 404 instead of a lossy lookup.
-3. **Windows request-path refusals** — `:`/trailing-dot/space 403; reserved device names and unstorable
-   characters 404.
+3. **Windows request-path refusals** — `:`/trailing-dot/space and reserved device names 403 (stock Caddy
+   refuses the latter too); unstorable characters 404.
 4. **Windows glob escaping with character classes** — placeholder values cannot become globs.
 5. **`browse` omits hidden, refused and dangling entries.**
 6. **Windows platform differences** listed in section 4.
+7. **`localhost` listens on both loopback families (all platforms)** — a listen or admin address whose
+   host is `localhost` binds `127.0.0.1` and `[::1]` on the same port; stock Caddy binds one address
+   (the IPv4 one). The IPv4 socket is required and is the address reported as bound; the IPv6 one is
+   best effort (a host without IPv6, or a port taken on `::1`, is logged and IPv4-only service
+   continues). Any other hostname binds one address, IPv4 preferred as in Go, instead of the
+   resolver's first (which is `::1` on Windows). HTTP/3 (UDP) `localhost` listeners are unchanged.
