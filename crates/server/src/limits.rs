@@ -126,16 +126,18 @@ impl ServerLimits {
     /// The longest a TLS handshake may take before the connection is dropped.
     ///
     /// Go's `net/http` (`Server.tlsHandshakeTimeout`) sets a read/write deadline before the
-    /// handshake equal to the smaller of the non-zero `ReadTimeout` and `ReadHeaderTimeout`, so
-    /// stock Caddy bounds a silent or trickling ClientHello by `read_header_timeout` (default
-    /// 1 minute). `TimedIo` and hyper's header timer only start after the handshake, so without
-    /// this a client holding a TCP connection open pinned a task and descriptor forever
+    /// handshake equal to the smallest of the non-zero `ReadHeaderTimeout`, `ReadTimeout` and
+    /// `WriteTimeout`, so stock Caddy bounds a silent or trickling ClientHello by
+    /// `read_header_timeout` (default 1 minute) or by a tighter configured read/write timeout.
+    /// `TimedIo` and hyper's header timer only start after the handshake, so without this a client
+    /// holding a TCP connection open pinned a task and descriptor forever
     /// (SEC-MEDIUM-ADMIN-SERVER A4).
     pub fn tls_handshake_timeout(&self) -> Duration {
-        match self.read_timeout {
-            Some(read_timeout) => read_timeout.min(self.read_header_timeout),
-            None => self.read_header_timeout,
-        }
+        [self.read_timeout, self.write_timeout]
+            .into_iter()
+            .flatten()
+            .filter(|timeout| !timeout.is_zero())
+            .fold(self.read_header_timeout, Duration::min)
     }
 
     /// Parse the limits and timeouts of one Caddy HTTP server object.
@@ -421,8 +423,9 @@ mod tests {
     }
 
     #[test]
-    fn tls_handshake_timeout_is_the_smaller_of_read_and_read_header_timeout() {
-        // Go: Server.tlsHandshakeTimeout() = min of the non-zero ReadTimeout/ReadHeaderTimeout.
+    fn tls_handshake_timeout_is_the_smallest_of_read_header_read_and_write_timeout() {
+        // Go: Server.tlsHandshakeTimeout() = min of the non-zero ReadHeaderTimeout, ReadTimeout
+        // and WriteTimeout (net/http server.go).
         let mut limits = ServerLimits::default();
         assert_eq!(limits.tls_handshake_timeout(), DEFAULT_READ_HEADER_TIMEOUT);
         limits.read_header_timeout = Duration::from_secs(5);
@@ -433,6 +436,16 @@ mod tests {
         assert_eq!(limits.tls_handshake_timeout(), Duration::from_secs(5));
         limits.read_timeout = Some(Duration::from_secs(5));
         assert_eq!(limits.tls_handshake_timeout(), Duration::from_secs(5));
+        // WriteTimeout participates like the others: smaller than both wins, larger loses.
+        limits.write_timeout = Some(Duration::from_secs(1));
+        assert_eq!(limits.tls_handshake_timeout(), Duration::from_secs(1));
+        limits.write_timeout = Some(Duration::from_secs(30));
+        assert_eq!(limits.tls_handshake_timeout(), Duration::from_secs(5));
+        // With only a write timeout set it still bounds the handshake below the 1 minute default.
+        limits.read_timeout = None;
+        limits.read_header_timeout = DEFAULT_READ_HEADER_TIMEOUT;
+        limits.write_timeout = Some(Duration::from_secs(7));
+        assert_eq!(limits.tls_handshake_timeout(), Duration::from_secs(7));
     }
 
     #[test]
