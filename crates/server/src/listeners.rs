@@ -4460,13 +4460,11 @@ mod remote_admin_tests {
             .expect("write");
         stream.flush().await.expect("flush");
         let mut buffer = [0_u8; 512];
-        let read = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            stream.read(&mut buffer),
-        )
-        .await
-        .expect("a refusal must arrive without waiting for the body")
-        .expect("read");
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut buffer))
+                .await
+                .expect("a refusal must arrive without waiting for the body")
+                .expect("read");
         assert!(
             buffer[..read].starts_with(b"HTTP/1.1 403"),
             "{:?}",
@@ -5027,7 +5025,9 @@ mod admin_limits_tests {
         assert!(slots.try_acquire("c").is_none(), "global cap");
         assert!(slots.try_acquire("a").is_none());
         drop(a1);
-        let _c = slots.try_acquire("c").expect("a release frees a global slot");
+        let _c = slots
+            .try_acquire("c")
+            .expect("a release frees a global slot");
         assert_eq!(slots.available(), 0);
     }
 
@@ -5152,9 +5152,7 @@ mod admin_limits_tests {
             let (response, mut body) = sender.send_request(request(), false).expect("send");
             body.send_data(bytes::Bytes::from_static(b"{}"), true)
                 .expect("body");
-            if let Ok(Ok(response)) =
-                tokio::time::timeout(Duration::from_secs(2), response).await
-            {
+            if let Ok(Ok(response)) = tokio::time::timeout(Duration::from_secs(2), response).await {
                 if response.status() == 503 {
                     refused = true;
                     break;
@@ -5331,10 +5329,11 @@ mod admin_host_check_tests {
         let mut stream = TcpStream::connect(address).await.expect("connect");
         stream.write_all(request.as_bytes()).await.expect("write");
         let mut buffer = [0_u8; 512];
-        let read = tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut buffer))
-            .await
-            .expect("a 403 must arrive without waiting for the body")
-            .expect("read");
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut buffer))
+                .await
+                .expect("a 403 must arrive without waiting for the body")
+                .expect("read");
         assert!(
             buffer[..read].starts_with(b"HTTP/1.1 403"),
             "{:?}",
@@ -5348,7 +5347,10 @@ mod admin_host_check_tests {
             stream.read_to_end(&mut rest),
         )
         .await;
-        assert!(closed.is_ok(), "the connection is closed after refusing an unread body");
+        assert!(
+            closed.is_ok(),
+            "the connection is closed after refusing an unread body"
+        );
         handle.stop().await;
     }
 
@@ -5398,7 +5400,8 @@ mod admin_host_check_tests {
         };
         use http::Version as V;
         // Origin-form keeps the header.
-        let resolved = admin_request_headers(with_host("a.example"), &uri("/x"), V::HTTP_11).unwrap();
+        let resolved =
+            admin_request_headers(with_host("a.example"), &uri("/x"), V::HTTP_11).unwrap();
         assert_eq!(resolved.get(http::header::HOST).unwrap(), "a.example");
         // An authority (absolute-form / :authority) replaces it; userinfo is not part of the host.
         let resolved = admin_request_headers(
@@ -5685,7 +5688,10 @@ mod admin_unix_tests {
             .await
             .err()
             .expect("a live socket must not be replaced");
-        assert!(error.to_string().contains("in use by a running process"), "{error}");
+        assert!(
+            error.to_string().contains("in use by a running process"),
+            "{error}"
+        );
         // The first instance still owns the path and still answers.
         let response = raw_exchange(
             &path,
