@@ -10,11 +10,13 @@ The goal is still to build something useful, correct, fast, and maintainable. Th
 
 ## Getting started
 
-First, get the code:
+First, get the code. Contributions land through the program repository, which carries this
+implementation as its `caddy-rs/` submodule — work started in a detached copy of the implementation
+repository alone cannot be reviewed, queued or merged:
 
 ```bash
-git clone https://github.com/ben-efros/caddy-rs.git
-cd caddy-rs
+git clone --recurse-submodules https://github.com/ben-efros/caddy-rs-project.git
+cd caddy-rs-project/caddy-rs
 ```
 
 Then make sure it builds:
@@ -87,6 +89,12 @@ Please don't ask an agent to redesign half the project before anyone has agreed 
 
 Avoid breaking existing behavior unless the change is intentional and discussed.
 
+Accepted configuration, emitted JSON and runtime behavior are this project's compatibility surface,
+and matching stock Caddy is the promise. If a change alters any of them, it needs a test that proves
+the new behavior and an entry in the compatibility documentation. If it deliberately differs from
+Caddy, register the difference rather than approximating it quietly — an advertised "not supported",
+with a located error and a test, is an acceptable outcome; a silent approximation is a defect.
+
 If something changes, document it. If something stops working, tell us. If something works only on your machine, that machine is now part of the problem.
 
 ## Found something broken?
@@ -96,6 +104,11 @@ Excellent. Please report it.
 Include enough detail to reproduce the issue: logs, configuration, expected behavior, actual behavior, and steps to reproduce.
 
 "Doesn't work" is a valid emotional state, but a difficult debugging strategy.
+
+One important exception: if the problem is security-sensitive (a vulnerability, a way to escape the
+request-path checks, a leaked secret), **do not open a public issue**. Follow [SECURITY.md](SECURITY.md)
+and report it privately through GitHub's advisory channel, so it can be fixed before it is described
+in a thread anyone can read.
 
 ## Reviews
 
