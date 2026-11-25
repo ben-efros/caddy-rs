@@ -92,10 +92,11 @@ impl LoginLimiter {
     }
 }
 
-/// Usernames are matched case-sensitively by the store, but a limiter keyed case-insensitively
-/// cannot be dodged by changing the spelling of the same account.
+/// Usernames are matched case-sensitively by the store (`Bob` and `bob` are two accounts), so the
+/// limiter keys on the exact name, like the authentication service: a folded key would let failures
+/// as `bob` lock out `Bob`.
 fn normalize(username: &str) -> String {
-    username.to_ascii_lowercase()
+    username.to_owned()
 }
 
 /// Request body for `POST /api/v1/auth/login`.
@@ -673,8 +674,8 @@ mod tests {
             "five attempts exhaust the window"
         );
         assert!(
-            limiter.reserve_attempt("ALICE").is_err(),
-            "spelling changes must not dodge the limiter"
+            limiter.reserve_attempt("ALICE").is_ok(),
+            "a differently-cased name is a different account (the store is case-sensitive)"
         );
         assert!(
             limiter.reserve_attempt("bob").is_ok(),
