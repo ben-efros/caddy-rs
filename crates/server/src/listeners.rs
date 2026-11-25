@@ -2934,6 +2934,57 @@ fn set_admin_socket_permissions(path: &std::path::Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
+/// Bind the admin Unix socket without ever exposing it under `socket_path` with umask-derived
+/// permissions, and without deleting anything that is not a socket (SEC-MEDIUM-ADMIN-SERVER A3).
+///
+/// A path we bind ourselves may hold a stale socket from a killed process (Caddy removes it too),
+/// but the previous `exists()` + `remove_file` happily deleted a regular file, and `bind` followed
+/// by `chmod` left the socket connectable per the umask for a moment. Here the type of whatever
+/// sits at the path is checked with `symlink_metadata` (never following links): only a socket is
+/// replaced; a regular file, directory or symlink is a bind error and is left untouched. The
+/// socket is bound inside a freshly created `0700` staging directory next to the final path,
+/// `chmod`ed `0600`, and atomically `rename`d into place (`rename` replaces a stale socket, or a
+/// symlink raced in afterwards, without following it). The staging directory is always removed.
+fn bind_admin_unix_private(socket_path: &std::path::Path) -> std::io::Result<UnixListener> {
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
+    static STAGING_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    match std::fs::symlink_metadata(socket_path) {
+        Ok(metadata) if metadata.file_type().is_socket() => {}
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "refusing to replace {}: it exists and is not a socket",
+                    socket_path.display()
+                ),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let parent = match socket_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    };
+    let staging = parent.join(format!(
+        ".caddy-rs-admin-{}-{}",
+        std::process::id(),
+        STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::DirBuilder::new().mode(0o700).create(&staging)?;
+    let staged_socket = staging.join("s");
+    let result = (|| {
+        let listener = UnixListener::bind(&staged_socket)?;
+        set_admin_socket_permissions(&staged_socket)?;
+        std::fs::rename(&staged_socket, socket_path)?;
+        Ok(listener)
+    })();
+    let _ = std::fs::remove_file(&staged_socket);
+    let _ = std::fs::remove_dir(&staging);
+    result
+}
+
 /// Bind the admin API to a Unix domain socket.
 async fn bind_admin_unix(
     configured: &str,
@@ -2941,17 +2992,8 @@ async fn bind_admin_unix(
     api: AdminApi,
 ) -> Result<ListenerHandle, Error> {
     let socket_path = std::path::Path::new(path);
-    // Unlike an inherited socket, a path we bind ourselves may hold a stale file from a killed
-    // process; `bind(2)` refuses an existing path, so remove it first (Caddy does the same).
-    if socket_path.exists() {
-        std::fs::remove_file(socket_path).map_err(|error| Error::bind(configured, error))?;
-    }
-    let listener =
-        UnixListener::bind(socket_path).map_err(|error| Error::bind(configured, error))?;
-    if let Err(error) = set_admin_socket_permissions(socket_path) {
-        let _ = std::fs::remove_file(socket_path);
-        return Err(Error::bind(configured, error));
-    }
+    let listener = bind_admin_unix_private(socket_path)
+        .map_err(|error| Error::bind(configured, error))?;
     let (shutdown, mut receiver) = watch::channel(false);
     let (force, mut force_receiver) = watch::channel(false);
     let tracker = Arc::new(ConnectionTracker::default());
@@ -4124,14 +4166,15 @@ mod admin_unix_tests {
     }
 
     #[tokio::test]
-    async fn replaces_a_stale_path_and_can_rebind_after_stop() {
+    async fn replaces_a_stale_socket_and_can_rebind_after_stop() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let (configured, path) = unix_listen(directory.path());
-        // A crashed process leaves the path behind; binding must reclaim it.
-        std::fs::write(&path, b"stale").expect("plant stale path");
+        // A crashed process leaves its socket file behind; binding must reclaim it.
+        drop(std::os::unix::net::UnixListener::bind(&path).expect("plant stale socket"));
+        assert!(path.exists());
         let handle = bind_admin(&configured, api(), None)
             .await
-            .expect("bind over a stale path");
+            .expect("bind over a stale socket");
         assert!(path.exists());
         handle.stop().await;
         assert!(!path.exists());
@@ -4140,6 +4183,77 @@ mod admin_unix_tests {
             .expect("rebind after stop");
         handle.stop().await;
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn refuses_to_delete_a_regular_file_at_the_socket_path() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (configured, path) = unix_listen(directory.path());
+        std::fs::write(&path, b"precious").expect("plant regular file");
+        let error = bind_admin(&configured, api(), None)
+            .await
+            .err()
+            .expect("a regular file must not be replaced");
+        assert!(error.to_string().contains("not a socket"), "{error}");
+        assert_eq!(
+            std::fs::read(&path).expect("file survives"),
+            b"precious",
+            "the regular file is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_to_delete_a_symlink_or_directory_at_the_socket_path() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (configured, path) = unix_listen(directory.path());
+        let victim = directory.path().join("victim");
+        std::fs::write(&victim, b"victim").expect("victim file");
+        std::os::unix::fs::symlink(&victim, &path).expect("plant symlink");
+        assert!(bind_admin(&configured, api(), None).await.is_err());
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .expect("symlink survives")
+                .file_type()
+                .is_symlink(),
+            "the symlink itself is not removed"
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim");
+        std::fs::remove_file(&path).unwrap();
+        // A dangling symlink is refused too (`exists()` reports false for it).
+        std::os::unix::fs::symlink(directory.path().join("missing"), &path).unwrap();
+        assert!(bind_admin(&configured, api(), None).await.is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(bind_admin(&configured, api(), None).await.is_err());
+        assert!(path.is_dir());
+    }
+
+    #[tokio::test]
+    async fn socket_is_never_visible_with_wider_than_owner_permissions() {
+        // The socket is bound inside a private 0700 staging directory and renamed into place, so
+        // no path under the configured name ever has umask-derived permissions. After bind the
+        // staging directory is gone and only the socket remains.
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (configured, path) = unix_listen(directory.path());
+        let handle = bind_admin(&configured, api(), None).await.expect("bind");
+        let names: Vec<_> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("admin.sock")], "{names:?}");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        handle.stop().await;
+        // A failed bind (non-socket in the way) leaves no staging directory behind either.
+        std::fs::write(&path, b"x").unwrap();
+        assert!(bind_admin(&configured, api(), None).await.is_err());
+        let names: Vec<_> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("admin.sock")], "{names:?}");
     }
 }
 

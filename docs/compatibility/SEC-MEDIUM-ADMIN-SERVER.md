@@ -54,3 +54,28 @@ byte over, declared `Content-Length` over the cap, malformed `Content-Length`, u
 read failure with and without a cap, `stock_compat` on/off via a loaded generation) and
 `admin_unix_tests::oversized_admin_request_bodies_are_rejected_with_413` (end to end over the unix
 admin socket).
+
+## A3. Admin unix socket: creation window and delete-anything TOCTOU
+
+Upstream (`admin.go`, `unixlistener`/`listenAdmin`): Caddy removes a stale socket and binds with
+`net.Listen("unix", ...)`, then applies the configured `0200`-style permissions afterwards; it does
+not check what it deletes. That is the same weakness, so this is a hardening that does not change
+any valid configuration's behaviour (no `stock_compat` switch; both modes behave identically).
+
+Implemented (`bind_admin_unix_private`, `crates/server/src/listeners.rs`):
+
+- Only a socket at the configured path is replaced. A regular file, directory or symlink (including
+  a dangling one) is a located bind error (`... exists and is not a socket`) and is left untouched;
+  the check uses `symlink_metadata`, so links are never followed.
+- The socket is bound inside a fresh `0700` staging directory next to the final path, set to
+  `0600`, and atomically renamed into place, so the final name never exists with umask-derived
+  permissions. The staging directory is removed on success and on failure.
+- Behaviour change relative to before: a stale *regular file* at the path used to be silently
+  deleted and is now refused. The staging name adds about 27 bytes to the bind path, so a socket
+  path within that margin of the 108-byte `sun_path` limit now fails to bind at startup.
+
+Tests: `admin_unix_tests::refuses_to_delete_a_regular_file_at_the_socket_path`,
+`refuses_to_delete_a_symlink_or_directory_at_the_socket_path`,
+`socket_is_never_visible_with_wider_than_owner_permissions` (staging directory cleaned on success
+and failure, final mode `0600`), `replaces_a_stale_socket_and_can_rebind_after_stop` (replaces the
+former test that planted a regular file).
