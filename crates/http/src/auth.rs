@@ -682,6 +682,79 @@ pub struct BasicAuthHandler {
     /// Caddy's fixed fake hashes, verified for unknown usernames to avoid a user-existence timing
     /// side channel (see `BcryptHash.FakeHash`/`Argon2idHash.FakeHash` upstream).
     fake_hash: std::sync::Arc<PasswordHash>,
+    /// Memoised comparison results (Caddy's `hash_cache`), keyed by a secret-keyed MAC.
+    cache: std::sync::Arc<HashCache>,
+    /// Hash-permit pool; the process-wide one unless a test injects its own.
+    limiter: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Longest a request may wait for a hash permit before a 503. `None` (`stock_compat: true`)
+    /// waits indefinitely, like stock Caddy.
+    max_wait: Option<std::time::Duration>,
+}
+
+/// Longest wait for a hash permit under the secure default before answering 503 + `Retry-After`.
+const HASH_QUEUE_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Entries kept by the hash cache (Caddy's `HashCache` also stops growing at 1000 entries).
+const HASH_CACHE_CAPACITY: usize = 1000;
+
+/// Caddy's `hash_cache`: remembers whether a (stored hash, presented password) pair matched, so a
+/// repeated credential pair is answered without recomputing bcrypt/argon2id.
+///
+/// Unlike a map keyed by the plaintext, entries are keyed by `HMAC-SHA256(secret, hash || 0 ||
+/// password)` with a random per-handler secret that never leaves the process, so the cache
+/// contents cannot be used to test password guesses offline.
+struct HashCache {
+    key: ring::hmac::Key,
+    entries: std::sync::Mutex<std::collections::HashMap<[u8; 32], bool>>,
+}
+
+impl std::fmt::Debug for HashCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("HashCache").finish_non_exhaustive()
+    }
+}
+
+impl HashCache {
+    fn new() -> Self {
+        let rng = ring::rand::SystemRandom::new();
+        Self {
+            key: ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng)
+                .expect("the system random source is available"),
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn key(&self, identity: &[u8], password: &[u8]) -> [u8; 32] {
+        let mut message = Vec::with_capacity(8 + identity.len() + password.len());
+        message.extend_from_slice(&(identity.len() as u64).to_be_bytes());
+        message.extend_from_slice(identity);
+        message.extend_from_slice(password);
+        let tag = ring::hmac::sign(&self.key, &message);
+        let mut key = [0u8; 32];
+        key.copy_from_slice(tag.as_ref());
+        key
+    }
+
+    fn get(&self, key: &[u8; 32]) -> Option<bool> {
+        self.entries.lock().ok()?.get(key).copied()
+    }
+
+    fn insert(&self, key: [u8; 32], matched: bool) {
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        if entries.len() >= HASH_CACHE_CAPACITY && !entries.contains_key(&key) {
+            if let Some(victim) = entries.keys().next().copied() {
+                entries.remove(&victim);
+            }
+        }
+        entries.insert(key, matched);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.lock().map_or(0, |entries| entries.len())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -740,6 +813,36 @@ impl BasicAuthHandler {
     /// Build from Caddy JSON. Accepts the canonical `authentication` handler shape as well as the
     /// caddy-rs `basic_auth` shorthand that carries the `http_basic` provider fields directly.
     pub fn from_json(value: &serde_json::Value, path: &str) -> Result<Self> {
+        Self::from_json_with_stock_compat(value, path, false)
+    }
+
+    /// Like [`Self::from_json`] with the generation's `stock_compat`: `true` keeps Caddy's
+    /// unbounded wait for a hash permit, `false` (the secure default) answers 503 + `Retry-After`
+    /// once the wait exceeds [`HASH_QUEUE_MAX_WAIT`].
+    pub fn from_json_with_stock_compat(
+        value: &serde_json::Value,
+        path: &str,
+        stock_compat: bool,
+    ) -> Result<Self> {
+        let mut handler = Self::from_json_inner(value, path)?;
+        handler.max_wait = (!stock_compat).then_some(HASH_QUEUE_MAX_WAIT);
+        Ok(handler)
+    }
+
+    #[cfg(test)]
+    fn with_hash_limits(
+        mut self,
+        limiter: std::sync::Arc<tokio::sync::Semaphore>,
+        max_wait: std::time::Duration,
+    ) -> Self {
+        self.limiter = limiter;
+        if self.max_wait.is_some() {
+            self.max_wait = Some(max_wait);
+        }
+        self
+    }
+
+    fn from_json_inner(value: &serde_json::Value, path: &str) -> Result<Self> {
         let object = value
             .as_object()
             .ok_or_else(|| invalid(path, "basic_auth handler must be an object"))?;
@@ -779,6 +882,9 @@ impl BasicAuthHandler {
                     accounts: BTreeMap::new(),
                     realm: "restricted".to_string(),
                     fake_hash: std::sync::Arc::new(fake_hash(PasswordAlgorithm::Bcrypt)),
+                    cache: std::sync::Arc::new(HashCache::new()),
+                    limiter: std::sync::Arc::clone(hash_verification_limiter()),
+                    max_wait: Some(HASH_QUEUE_MAX_WAIT),
                 });
             }
             Some(provider) => provider.as_object().ok_or_else(|| {
@@ -891,6 +997,9 @@ impl BasicAuthHandler {
             accounts,
             realm,
             fake_hash: std::sync::Arc::new(fake_hash(algorithm)),
+            cache: std::sync::Arc::new(HashCache::new()),
+            limiter: std::sync::Arc::clone(hash_verification_limiter()),
+            max_wait: Some(HASH_QUEUE_MAX_WAIT),
         })
     }
 }
@@ -1182,28 +1291,101 @@ async fn run_limited<F>(limiter: &std::sync::Arc<tokio::sync::Semaphore>, work: 
 where
     F: FnOnce() -> bool + Send + 'static,
 {
-    let Ok(permit) = std::sync::Arc::clone(limiter).acquire_owned().await else {
-        return false;
-    };
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        work()
-    })
-    .await
-    .unwrap_or(false)
+    run_limited_within(limiter, None, work)
+        .await
+        .unwrap_or(false)
 }
 
-/// Verify `password` against `hash` without blocking an async worker. bcrypt (cost 14 for the
-/// unknown-user fake hash) and argon2id take 100 ms to seconds of CPU; the constant-time
-/// plaintext extension is trivially cheap and stays inline.
-async fn verify_password_offloaded(hash: std::sync::Arc<PasswordHash>, password: Vec<u8>) -> bool {
-    if matches!(*hash, PasswordHash::Plaintext(_)) {
-        return verify_password(&hash, &password);
+/// [`run_limited`] with an optional cap on the wait for a permit: `None` waits indefinitely;
+/// `Some(limit)` gives up with `None` (the caller answers 503) once the wait exceeds `limit`.
+async fn run_limited_within<F>(
+    limiter: &std::sync::Arc<tokio::sync::Semaphore>,
+    max_wait: Option<std::time::Duration>,
+    work: F,
+) -> Option<bool>
+where
+    F: FnOnce() -> bool + Send + 'static,
+{
+    let acquire = std::sync::Arc::clone(limiter).acquire_owned();
+    let permit = match max_wait {
+        None => acquire.await,
+        Some(limit) => tokio::time::timeout(limit, acquire).await.ok()?,
+    };
+    let Ok(permit) = permit else {
+        return Some(false);
+    };
+    Some(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work()
+        })
+        .await
+        .unwrap_or(false),
+    )
+}
+
+impl PasswordHash {
+    /// Stable bytes identifying the stored hash, mixed into the hash-cache key.
+    fn cache_identity(&self) -> Vec<u8> {
+        match self {
+            Self::Bcrypt(encoded) => [b"bcrypt:".as_slice(), encoded.as_bytes()].concat(),
+            Self::Argon2id(hash) => {
+                let mut identity = b"argon2id:".to_vec();
+                for value in [
+                    hash.params.m_cost(),
+                    hash.params.t_cost(),
+                    hash.params.p_cost(),
+                ] {
+                    identity.extend_from_slice(&value.to_be_bytes());
+                }
+                identity.extend_from_slice(&(hash.salt.len() as u64).to_be_bytes());
+                identity.extend_from_slice(&hash.salt);
+                identity.extend_from_slice(&hash.key);
+                identity
+            }
+            Self::Plaintext(expected) => [b"plaintext:".as_slice(), expected].concat(),
+        }
     }
-    run_limited(hash_verification_limiter(), move || {
-        verify_password(&hash, &password)
-    })
-    .await
+}
+
+impl BasicAuthHandler {
+    /// Verify `password` against `hash` without blocking an async worker. bcrypt (cost 14 for the
+    /// unknown-user fake hash) and argon2id take 100 ms to seconds of CPU; the constant-time
+    /// plaintext extension is trivially cheap and stays inline. Repeated pairs are answered from
+    /// the hash cache. `None` means the hash pool stayed saturated past the secure-default wait.
+    async fn verify_offloaded(
+        &self,
+        hash: std::sync::Arc<PasswordHash>,
+        password: Vec<u8>,
+    ) -> Option<bool> {
+        if matches!(*hash, PasswordHash::Plaintext(_)) {
+            return Some(verify_password(&hash, &password));
+        }
+        let key = self.cache.key(&hash.cache_identity(), &password);
+        if let Some(matched) = self.cache.get(&key) {
+            return Some(matched);
+        }
+        let cache = std::sync::Arc::clone(&self.cache);
+        run_limited_within(&self.limiter, self.max_wait, move || {
+            let matched = verify_password(&hash, &password);
+            // Cached from inside the job so a hash whose request was cancelled still pays off.
+            cache.insert(key, matched);
+            matched
+        })
+        .await
+    }
+}
+
+fn overloaded() -> Outcome {
+    let mut response = Response {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        headers: HeaderMap::new(),
+        body: Bytes::new(),
+    };
+    response
+        .headers
+        .insert(http::header::RETRY_AFTER, HeaderValue::from_static("5"));
+    Outcome::Respond(response)
 }
 
 /// Expand `{env.NAME}` placeholders the way Caddy's global replacer does at provision time.
@@ -1325,7 +1507,9 @@ impl Handler for BasicAuthHandler {
             || std::sync::Arc::clone(&self.fake_hash),
             |account| std::sync::Arc::clone(&account.hash),
         );
-        let matches = verify_password_offloaded(hash, password.into_bytes()).await;
+        let Some(matches) = self.verify_offloaded(hash, password.into_bytes()).await else {
+            return Ok(overloaded());
+        };
         if !matches || account.is_none() {
             return Ok(challenge(&self.realm));
         }
@@ -1628,7 +1812,10 @@ mod tests {
     }
 
     fn basic_auth_handler(value: serde_json::Value) -> BasicAuthHandler {
-        BasicAuthHandler::from_json(&value, "handler").expect("basic_auth config")
+        // `stock_compat` (unbounded hash-permit wait) keeps these functional tests independent of
+        // load on the shared process-wide hash pool; the capped default has its own tests.
+        BasicAuthHandler::from_json_with_stock_compat(&value, "handler", true)
+            .expect("basic_auth config")
     }
 
     fn plaintext_handler(accounts: serde_json::Value) -> BasicAuthHandler {
@@ -2333,6 +2520,120 @@ mod tests {
         );
     }
 
+    fn cached_handler(
+        stock_compat: bool,
+        limiter: &Arc<tokio::sync::Semaphore>,
+    ) -> BasicAuthHandler {
+        let value = serde_json::json!({
+            "handler": "basic_auth",
+            "hash": {"algorithm": "bcrypt"},
+            "accounts": [{"username": "alice", "password": bcrypt::hash("pw", 4).unwrap()}]
+        });
+        BasicAuthHandler::from_json_with_stock_compat(&value, "handler", stock_compat)
+            .expect("config")
+            .with_hash_limits(Arc::clone(limiter), Duration::from_millis(150))
+    }
+
+    async fn attempt(handler: &BasicAuthHandler, user: &str, password: &str) -> Outcome {
+        let mut request = base_request();
+        request
+            .headers
+            .insert(header::AUTHORIZATION, authorization(user, password));
+        handler.handle(request).await.unwrap()
+    }
+
+    fn status_of(outcome: &Outcome) -> Option<StatusCode> {
+        match outcome {
+            Outcome::Respond(response) => Some(response.status),
+            _ => None,
+        }
+    }
+
+    /// B1 review: like Caddy's `hash_cache`, a repeated credential pair (success or failure) is
+    /// answered from the cache without computing a hash, so legitimate clients are unaffected by a
+    /// saturated hash pool. Proven by exhausting the pool: cached pairs still answer, uncached
+    /// pairs time out with 503.
+    #[tokio::test]
+    async fn hash_cache_answers_repeat_credentials_while_the_pool_is_exhausted() {
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let handler = cached_handler(false, &limiter);
+        assert!(matches!(
+            attempt(&handler, "alice", "pw").await,
+            Outcome::Continue(_)
+        ));
+        assert_eq!(
+            status_of(&attempt(&handler, "alice", "wrong").await),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+
+        let _held = Arc::clone(&limiter).acquire_owned().await.unwrap();
+        assert!(
+            matches!(attempt(&handler, "alice", "pw").await, Outcome::Continue(_)),
+            "a cached success must not need a hash permit"
+        );
+        assert_eq!(
+            status_of(&attempt(&handler, "alice", "wrong").await),
+            Some(StatusCode::UNAUTHORIZED),
+            "a cached failure must not need a hash permit"
+        );
+        assert_eq!(
+            status_of(&attempt(&handler, "alice", "never-seen").await),
+            Some(StatusCode::SERVICE_UNAVAILABLE),
+            "an uncached pair needs a permit and must not queue forever"
+        );
+    }
+
+    /// Secure default: waiting for a hash permit is capped; the overload answer is 503 with
+    /// `Retry-After`, not an unbounded queue.
+    #[tokio::test]
+    async fn queue_wait_is_capped_with_503_and_retry_after_by_default() {
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let handler = cached_handler(false, &limiter);
+        let _held = Arc::clone(&limiter).acquire_owned().await.unwrap();
+        let Outcome::Respond(response) = attempt(&handler, "alice", "pw").await else {
+            panic!("expected a response");
+        };
+        assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers.contains_key(http::header::RETRY_AFTER));
+    }
+
+    /// `stock_compat: true` keeps Caddy's behaviour: wait as long as it takes, never 503.
+    #[tokio::test]
+    async fn stock_compat_waits_for_a_permit_without_a_cap() {
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let handler = cached_handler(true, &limiter);
+        let held = Arc::clone(&limiter).acquire_owned().await.unwrap();
+        let pending = attempt(&handler, "alice", "pw");
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), &mut pending)
+                .await
+                .is_err(),
+            "stock_compat must keep waiting past the secure-default cap"
+        );
+        drop(held);
+        assert!(matches!(pending.await, Outcome::Continue(_)));
+    }
+
+    #[test]
+    fn hash_cache_keys_are_secret_keyed_and_the_cache_is_bounded() {
+        let first = HashCache::new();
+        let second = HashCache::new();
+        assert_ne!(
+            first.key(b"hash", b"pw"),
+            second.key(b"hash", b"pw"),
+            "keys must depend on a per-cache secret so the cache is not a password oracle"
+        );
+        assert_ne!(first.key(b"hash", b"pw"), first.key(b"hash", b"pw2"));
+        assert_ne!(first.key(b"hash", b"pw"), first.key(b"hash2", b"pw"));
+        // Unambiguous framing: moving a byte between hash and password changes the key.
+        assert_ne!(first.key(b"ab", b"c"), first.key(b"a", b"bc"));
+        for index in 0..(HASH_CACHE_CAPACITY * 2) {
+            first.insert(first.key(b"hash", index.to_string().as_bytes()), true);
+        }
+        assert!(first.len() <= HASH_CACHE_CAPACITY);
+    }
+
     #[test]
     fn hash_verification_limit_is_a_small_multiple_of_parallelism() {
         let limit = hash_verification_limit();
@@ -2351,12 +2652,21 @@ mod tests {
             )
             .unwrap(),
         );
-        assert!(verify_password_offloaded(bcrypt.clone(), b"pw".to_vec()).await);
-        assert!(!verify_password_offloaded(bcrypt, b"nope".to_vec()).await);
+        let handler = basic_auth_handler(serde_json::json!({"handler": "basic_auth"}));
+        let accept = handler
+            .verify_offloaded(bcrypt.clone(), b"pw".to_vec())
+            .await;
+        assert_eq!(accept, Some(true));
+        let reject = handler.verify_offloaded(bcrypt, b"nope".to_vec()).await;
+        assert_eq!(reject, Some(false));
 
         let plain = std::sync::Arc::new(PasswordHash::Plaintext(b"pw".to_vec()));
-        assert!(verify_password_offloaded(plain.clone(), b"pw".to_vec()).await);
-        assert!(!verify_password_offloaded(plain, b"px".to_vec()).await);
+        let accept = handler
+            .verify_offloaded(plain.clone(), b"pw".to_vec())
+            .await;
+        assert_eq!(accept, Some(true));
+        let reject = handler.verify_offloaded(plain, b"px".to_vec()).await;
+        assert_eq!(reject, Some(false));
     }
 }
 
