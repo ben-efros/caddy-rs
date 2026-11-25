@@ -1240,7 +1240,14 @@ async fn read_etag_sidecar(filename: &Path, suffixes: &[String]) -> Result<Optio
         };
         match read.await {
             Ok(Some(bytes)) if bytes.len() as u64 <= MAX_ETAG_SIDECAR => {
-                let text = String::from_utf8_lossy(&bytes).replace('\n', "");
+                // Newlines are removed like Caddy; a CR (CRLF files) and surrounding whitespace
+                // are stripped too. A value that still is not a valid header value (control
+                // characters) is ignored, so the computed ETag is used instead of a 500.
+                let text = String::from_utf8_lossy(&bytes).replace(['\r', '\n'], "");
+                let text = text.trim().to_string();
+                if HeaderValue::from_str(&text).is_err() {
+                    continue;
+                }
                 return Ok(Some(text));
             }
             Ok(_) => continue,
@@ -3388,6 +3395,38 @@ mod tests {
             "the symlinked sidecar was followed: {etag}"
         );
         assert_eq!(etag, calculate_etag(&std::fs::metadata(&file).unwrap()));
+    }
+
+    /// B2 round 3: editors write CRLF; the CR is stripped (not a 500), and a sidecar whose content
+    /// is not a valid header value falls back to the computed ETag instead of failing the request.
+    #[tokio::test]
+    async fn etag_sidecar_crlf_is_stripped_and_invalid_values_fall_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.txt");
+        std::fs::write(&file, b"0123456789").unwrap();
+        let sidecar = dir.path().join("x.txt.etag");
+        let handler = etag_handler(dir.path());
+
+        std::fs::write(&sidecar, b"\"v1\"\r\n").unwrap();
+        let response = respond(&handler, make_request(Method::GET, "/x.txt")).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(header(&response, header::ETAG), "\"v1\"");
+
+        std::fs::write(&sidecar, b"\"v2\"  \n\n").unwrap();
+        let response = respond(&handler, make_request(Method::GET, "/x.txt")).await;
+        assert_eq!(header(&response, header::ETAG), "\"v2\"");
+
+        std::fs::write(&sidecar, b"\"bad\x01etag\"\n").unwrap();
+        let response = respond(&handler, make_request(Method::GET, "/x.txt")).await;
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "an invalid sidecar must not 500"
+        );
+        assert_eq!(
+            header(&response, header::ETAG),
+            calculate_etag(&std::fs::metadata(&file).unwrap())
+        );
     }
 
     /// An absurdly large sidecar is ignored (read capped at 1 KiB), not loaded into memory and
