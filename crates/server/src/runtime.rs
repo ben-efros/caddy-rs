@@ -121,9 +121,14 @@ fn missing_certificates_error(
     stock_compat: bool,
 ) -> Option<Error> {
     if stock_compat {
-        // Upstream `autohttps.go:185` simply continues: the server produces no subjects and its TLS
-        // listener has no certificate of its own. Stock compatibility matches that instead of
-        // refusing to start. The secure default (below) is unchanged.
+        // Upstream accepts this configuration, and it is *not* because `autohttps.go:185` simply
+        // continues. `:142-146` runs first and installs an implicit TLS connection policy for a
+        // server whose listeners are all on the HTTPS port, so that server's `TLSConnPolicies` is
+        // no longer empty and the `continue` at `:185` does not fire. `app.go:568` then computes
+        // `useTLS := len(srv.TLSConnPolicies) > 0 && ...`, which is true, so the listener
+        // terminates TLS with no certificate selected for that server. The server contributes no
+        // subject to `uniqueDomainsForCerts`; the empty `serverDomainSet` only skips HTTP->HTTPS
+        // redirect registration. Caddy emits no error and no warning (DIV-0165).
         return None;
     }
     Some(Error::Config(caddy_rs_core::Error::invalid(
@@ -2302,6 +2307,9 @@ impl ServerRuntime {
         // selected identity rather than its own.
         let mut automatic_identity: Option<caddy_rs_core::ResolvedIdentity> = None;
         let mut automatic_identities: Vec<(String, caddy_rs_core::ResolvedIdentity)> = Vec::new();
+        // Read once from the same accessor the rest of this function uses (DIV-0130), so the
+        // certificates guard sees exactly the mode the rest of the apply sees.
+        let stock_compat = generation.config().stock_compat();
         for (server_name, server) in &http.servers {
             let limits = Arc::new(ServerLimits::from_http_server(
                 server_name,
@@ -2464,9 +2472,11 @@ impl ServerRuntime {
                                     stock_compat,
                                 ) {
                                     Some(error) => return Err(error),
-                                    // `stock_compat`: upstream `autohttps.go:185` continues with no
-                                    // subjects, so this listener serves nothing rather than failing
-                                    // the apply. Handshakes fail; the process starts.
+                                    // `stock_compat`: upstream accepts this configuration. Its
+                                    // listener terminates TLS with no certificate selected for the
+                                    // server (`autohttps.go:142-146` installs the implicit policy, so
+                                    // `:185` does not fire), so handshakes fail but the process
+                                    // starts (DIV-0165).
                                     None => {
                                         stock_compat_resolver =
                                             Arc::new(CertificateResolver::default());
