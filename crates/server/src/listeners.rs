@@ -3401,48 +3401,14 @@ fn set_admin_socket_permissions(path: &std::path::Path) -> std::io::Result<()> {
 /// now at `socket_path`, so cleanup removes only that file.
 fn bind_admin_unix_private(
     socket_path: &std::path::Path,
-    options: AdminBindOptions,
 ) -> std::io::Result<(UnixListener, SocketIdentity)> {
-    let stock_compat = options.stock_compat || options.replace_live;
     use std::io::{Error, ErrorKind};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
 
     let existing = match std::fs::symlink_metadata(socket_path) {
         Ok(metadata) if metadata.file_type().is_socket() => {
-            // Liveness probe: a socket something still accepts on belongs to a running process
-            // (typically a second instance with the same admin path); stealing it would silently
-            // redirect that instance's admin clients. Stock Caddy removes unconditionally, so
-            // `stock_compat true` keeps doing that. Only "nobody is listening" (refused/gone)
-            // means stale; any other failure to probe is reported rather than assumed stale.
-            if !stock_compat {
-                match std::os::unix::net::UnixStream::connect(socket_path) {
-                    Ok(_live) => {
-                        return Err(Error::new(
-                            ErrorKind::AddrInUse,
-                            format!(
-                                "admin socket {} is in use by a running process; stop it, choose \
-                                 another admin address, or set stock_compat to replace it anyway",
-                                socket_path.display()
-                            ),
-                        ));
-                    }
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            ErrorKind::ConnectionRefused | ErrorKind::NotFound
-                        ) => {}
-                    Err(error) => {
-                        return Err(Error::new(
-                            error.kind(),
-                            format!(
-                                "cannot tell whether admin socket {} is stale: {error}",
-                                socket_path.display()
-                            ),
-                        ));
-                    }
-                }
-            }
+            // (The liveness probe ran before this, in `bind_admin_unix`.)
             Some(SocketIdentity::of(&metadata))
         }
         Ok(_) => {
@@ -3608,6 +3574,97 @@ fn install_staged_socket(
     }
 }
 
+/// What probing an existing admin socket found.
+#[derive(Debug, PartialEq, Eq)]
+enum SocketProbe {
+    /// Something accepts on it (or did not answer within the budget): a running process owns it.
+    Live,
+    /// Nobody is listening: replace it.
+    Stale,
+    /// Could not tell; carries the reason.
+    Unknown(String),
+}
+
+/// Interpret the outcome of connecting to an existing admin socket.
+///
+/// `owner_uid` is the socket file's owner and `our_uid` this process's (when known). A connect
+/// refused with a permission error to a socket owned by someone else is a stale socket of another
+/// user (for example a crashed `sudo caddy-rs run`) that this process could never have been
+/// talking to: it counts as stale, and the later replace fails clearly if the directory does not
+/// let us unlink it. A timeout counts as live: wrongly refusing is the safe error.
+fn classify_probe(
+    outcome: Result<(), &std::io::Error>,
+    timed_out: bool,
+    owner_uid: u32,
+    our_uid: Option<u32>,
+) -> SocketProbe {
+    use std::io::ErrorKind;
+    if timed_out {
+        return SocketProbe::Live;
+    }
+    match outcome {
+        Ok(()) => SocketProbe::Live,
+        Err(error) => match error.kind() {
+            ErrorKind::ConnectionRefused | ErrorKind::NotFound => SocketProbe::Stale,
+            ErrorKind::PermissionDenied if our_uid.is_some_and(|uid| uid != owner_uid) => {
+                SocketProbe::Stale
+            }
+            _ => SocketProbe::Unknown(error.to_string()),
+        },
+    }
+}
+
+/// This process's effective uid without `unsafe` (Linux; `None` elsewhere): the owner of
+/// `/proc/self`.
+fn current_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").ok().map(|m| m.uid())
+}
+
+/// Liveness probe for an existing admin socket at `socket_path`: refuse to replace one a running
+/// process still accepts on (typically a second instance with the same admin path), since
+/// stealing it would silently redirect that instance's admin clients. Does nothing when the path
+/// is absent or is not a socket (the bind reports non-sockets itself). Async with a 1 s budget so
+/// a wedged peer cannot block the runtime.
+async fn probe_existing_admin_socket(socket_path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let Ok(metadata) = std::fs::symlink_metadata(socket_path) else {
+        return Ok(());
+    };
+    if !metadata.file_type().is_socket() {
+        return Ok(());
+    }
+    let attempt = tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio::net::UnixStream::connect(socket_path),
+    )
+    .await;
+    let (outcome, timed_out) = match &attempt {
+        Ok(Ok(_)) => (Ok(()), false),
+        Ok(Err(error)) => (Err(error), false),
+        Err(_elapsed) => (Ok(()), true),
+    };
+    match classify_probe(outcome, timed_out, metadata.uid(), current_uid()) {
+        SocketProbe::Stale => Ok(()),
+        SocketProbe::Live => Err(Error::new(
+            ErrorKind::AddrInUse,
+            format!(
+                "admin socket {} is in use by a running process; stop it, choose another admin \
+                 address, or set stock_compat to replace it anyway",
+                socket_path.display()
+            ),
+        )),
+        SocketProbe::Unknown(reason) => Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "cannot tell whether admin socket {} is stale: {reason}",
+                socket_path.display()
+            ),
+        )),
+    }
+}
+
 /// Bind the admin API to a Unix domain socket.
 async fn bind_admin_unix(
     configured: &str,
@@ -3616,8 +3673,13 @@ async fn bind_admin_unix(
     options: AdminBindOptions,
 ) -> Result<ListenerHandle, Error> {
     let socket_path = std::path::Path::new(path);
-    let (listener, identity) = bind_admin_unix_private(socket_path, options)
-        .map_err(|error| Error::bind(configured, error))?;
+    if !(options.stock_compat || options.replace_live) {
+        probe_existing_admin_socket(socket_path)
+            .await
+            .map_err(|error| Error::bind(configured, error))?;
+    }
+    let (listener, identity) =
+        bind_admin_unix_private(socket_path).map_err(|error| Error::bind(configured, error))?;
     let (shutdown, mut receiver) = watch::channel(false);
     let (force, mut force_receiver) = watch::channel(false);
     let tracker = Arc::new(ConnectionTracker::default());
@@ -5727,6 +5789,61 @@ mod admin_unix_tests {
             vec![std::ffi::OsString::from("admin.sock")],
             "{names:?}"
         );
+    }
+
+    #[test]
+    fn probe_outcomes_are_classified_for_stale_other_user_and_wedged_sockets() {
+        use super::{classify_probe, SocketProbe};
+        use std::io::{Error, ErrorKind};
+        let refused = Error::from(ErrorKind::ConnectionRefused);
+        let denied = Error::from(ErrorKind::PermissionDenied);
+        let other = Error::other("boom");
+        assert_eq!(classify_probe(Ok(()), false, 1000, Some(1000)), SocketProbe::Live);
+        assert_eq!(classify_probe(Err(&refused), false, 1000, Some(1000)), SocketProbe::Stale);
+        // A wedged peer that never accepts within the budget counts as live (safe error).
+        assert_eq!(classify_probe(Ok(()), true, 1000, Some(1000)), SocketProbe::Live);
+        // EACCES on a socket another user owns (a crashed `sudo caddy-rs run`): stale.
+        assert_eq!(classify_probe(Err(&denied), false, 0, Some(1000)), SocketProbe::Stale);
+        // EACCES on our own socket, or when we cannot tell who we are: report, do not guess.
+        assert!(matches!(
+            classify_probe(Err(&denied), false, 1000, Some(1000)),
+            SocketProbe::Unknown(_)
+        ));
+        assert!(matches!(
+            classify_probe(Err(&denied), false, 0, None),
+            SocketProbe::Unknown(_)
+        ));
+        assert!(matches!(
+            classify_probe(Err(&other), false, 0, Some(1000)),
+            SocketProbe::Unknown(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn explicit_bind_options_decide_replacement_not_the_stores_current_generation() {
+        use super::{bind_admin_with, AdminBindOptions};
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (configured, path) = unix_listen(directory.path());
+        // The api's store has no generation (stock_compat false there), but the generation being
+        // applied says stock_compat true, or this is an upgrade child: replace the live socket.
+        for options in [
+            AdminBindOptions {
+                stock_compat: true,
+                replace_live: false,
+            },
+            AdminBindOptions {
+                stock_compat: false,
+                replace_live: true,
+            },
+        ] {
+            let first = bind_admin(&configured, api(), None).await.expect("bind");
+            let second = bind_admin_with(&configured, api(), None, options)
+                .await
+                .expect("explicit options replace a live socket");
+            assert!(path.exists());
+            second.stop().await;
+            first.stop().await;
+        }
     }
 
     #[tokio::test]
