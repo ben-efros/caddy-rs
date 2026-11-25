@@ -650,6 +650,21 @@ pub struct AdminApi {
 /// loop already ended) must not hold the exit.
 const STOP_EXIT_WAIT: Duration = Duration::from_secs(2);
 
+/// Whether `path` is (not through a link) a Unix socket with this device and inode.
+#[cfg(unix)]
+fn is_socket_with_identity(path: &std::path::Path, device: u64, inode: u64) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.file_type().is_socket() && metadata.dev() == device && metadata.ino() == inode
+    })
+}
+
+/// There are no Unix admin sockets on other platforms.
+#[cfg(not(unix))]
+fn is_socket_with_identity(_path: &std::path::Path, _device: u64, _inode: u64) -> bool {
+    false
+}
+
 /// Completion signal from the hosting runtime's shutdown, used to order `POST /stop`'s process
 /// exit after the runtime loop.
 ///
@@ -669,7 +684,7 @@ pub struct ShutdownLatch {
     /// the exit budget expires before that guard runs - `std::process::exit` then skips every
     /// destructor - the exit path removes them itself, so a `/stop` never leaves a stale socket
     /// behind for the next start to clean up.
-    owned_socket_paths: std::sync::Mutex<Vec<std::path::PathBuf>>,
+    owned_socket_paths: std::sync::Mutex<Vec<(std::path::PathBuf, u64, u64)>>,
 }
 
 #[derive(Debug, Default)]
@@ -696,18 +711,31 @@ impl ShutdownLatch {
     ///
     /// The runtime registers the bound admin socket path here after binding it; the admin
     /// listener's `Drop` guard still does the ordinary unlink on a clean shutdown.
-    pub fn own_socket_path(&self, path: impl Into<std::path::PathBuf>) {
+    ///
+    /// `device`/`inode` identify the socket file this process created there; the timeout cleanup
+    /// removes the path only if it still is that socket (same check as the listener's `Drop`).
+    /// Registering a path again replaces its identity.
+    pub fn own_socket_path(&self, path: impl Into<std::path::PathBuf>, device: u64, inode: u64) {
         let path = path.into();
         let mut paths = self
             .owned_socket_paths
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !paths.contains(&path) {
-            paths.push(path);
-        }
+        paths.retain(|(owned, _, _)| owned != &path);
+        paths.push((path, device, inode));
     }
 
-    /// Remove every owned socket path. Best-effort and idempotent.
+    /// Forget a socket path (the admin socket moved elsewhere and the old one was removed).
+    pub fn disown_socket_path(&self, path: &std::path::Path) {
+        self.owned_socket_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(owned, _, _)| owned != path);
+    }
+
+    /// Remove every owned socket path that still holds the socket this process created.
+    /// Best-effort and idempotent; a path now holding a file, a link or another process's socket
+    /// is left alone.
     ///
     /// Used by the `/stop` exit path on its timeout branch: the runtime never reported back, so
     /// the listener's `Drop` guard will not run before `std::process::exit`.
@@ -716,7 +744,10 @@ impl ShutdownLatch {
             .owned_socket_paths
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for path in paths.iter() {
+        for (path, device, inode) in paths.iter() {
+            if !is_socket_with_identity(path, *device, *inode) {
+                continue;
+            }
             match std::fs::remove_file(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2080,6 +2111,53 @@ mod tests {
             "released by completion"
         );
         assert!(report.elapsed() < Duration::from_secs(5));
+    }
+
+    /// The `/stop` timeout cleanup removes a registered admin socket only while the path still
+    /// holds the socket this process created (SEC-MEDIUM-ADMIN-SERVER A3), like the listener's
+    /// own `Drop` guard; a file, a link or another process's socket put there is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn timeout_cleanup_removes_only_the_socket_this_process_created() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::net::UnixListener;
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("admin.sock");
+        let latch = ShutdownLatch::new();
+
+        let ours = UnixListener::bind(&path).expect("bind");
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        latch.own_socket_path(&path, metadata.dev(), metadata.ino());
+        // Replaced by a regular file: untouched.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"precious").unwrap();
+        latch.remove_owned_socket_paths();
+        assert_eq!(std::fs::read(&path).unwrap(), b"precious");
+        // Replaced by another process's socket (different inode): untouched.
+        std::fs::remove_file(&path).unwrap();
+        let theirs = UnixListener::bind(&path).expect("bind another");
+        latch.remove_owned_socket_paths();
+        assert!(
+            std::fs::symlink_metadata(&path).is_ok(),
+            "foreign socket survives"
+        );
+        // The path moved on: a disowned path is never touched either.
+        latch.disown_socket_path(&path);
+        latch.remove_owned_socket_paths();
+        assert!(std::fs::symlink_metadata(&path).is_ok());
+        drop(theirs);
+        std::fs::remove_file(&path).unwrap();
+        // The very socket we registered is removed.
+        drop(ours);
+        let again = UnixListener::bind(&path).expect("bind again");
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        latch.own_socket_path(&path, metadata.dev(), metadata.ino());
+        latch.remove_owned_socket_paths();
+        assert!(
+            std::fs::symlink_metadata(&path).is_err(),
+            "our own socket is removed"
+        );
+        drop(again);
     }
 
     #[test]

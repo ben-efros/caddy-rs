@@ -39,9 +39,10 @@ Implemented (same in both modes; this is stock behaviour, so there is no `stock_
 Remaining intentional differences from stock (none usable by a rebinding attacker, whose `Host`
 names the attacker's domain):
 
-1. A request with no `Host` header and no URI authority passes only as HTTP/1.0 (as in Go, where it
-   then has `Host == ""`) or as a synthetic in-process request; an HTTP/1.1 request without `Host`
-   is `400 missing required Host header` like Go (hyper alone would have served it).
+1. A request with no `Host` header and no URI authority passes only as HTTP/1.0 or as a synthetic
+   in-process request; an HTTP/1.1 request without `Host` is `400 missing required Host header`
+   like Go (hyper alone would have served it). This is a divergence, not parity: stock `checkHost`
+   with `Host == ""` returns `403`, whereas an HTTP/1.0 host-less request is served here.
 2. A port-less `Host` that names an allowed host is accepted, uniformly for `localhost`,
    `127.0.0.1` and `[::1]` (CLI/test harness convenience). Stock compares `host:port` exactly.
 3. Host names compare case-insensitively (stock: exact). Origins already did.
@@ -94,8 +95,17 @@ Implemented (`crates/server/src/listeners.rs`, `crates/server/src/limits.rs`):
     (DIV-0029: `read_timeout` still runs on every stalled read there, so a slow handler on a server
     with a `read_timeout` can still be cut; not changed here).
   - hyper has one header timer for both the idle wait and a request's header read, so on the admin
-    listeners it is set to the idle budget: a request's headers may take up to 60 s, not stock's
-    5 s (a listed divergence; the first request's first byte is still bounded to 5 s).
+    listeners it is set to the idle budget (60 s, the idle wait between requests), and the
+    transport adds Go's `ReadHeaderTimeout` itself: a request whose first byte arrives on an idle
+    connection must deliver its headers within 5 s in total, however slowly they trickle (test:
+    `a_trickled_request_header_is_cut_off_after_the_header_budget`, after an earlier request on the
+    same keep-alive connection). The trigger is a letter as first byte (an HTTP/1 method); HTTP/2
+    frames after the preface are not timed this way (stock does not serve h2c at all).
+  - Connection caps (caddy-rs addition, not in stock, not gated by `stock_compat`): each admin
+    listener keeps at most `ADMIN_MAX_CONNECTIONS` (128) connections, at most
+    `ADMIN_MAX_CONNECTIONS_PER_PEER` (32) per peer; connections beyond that are dropped at accept.
+    File descriptors are process-wide, so unbounded admin connections could starve the public
+    listeners.
   - A request body must also arrive within 10 s in total (`ADMIN_BODY_DEADLINE`, `408`), Go's
     whole-request `ReadTimeout`. `stock_compat true` does not lift the 10 s deadline or the 5 s
     first-byte bound (they are stock behaviour); it lifts only the size cap and the slot limits.
@@ -105,9 +115,12 @@ Implemented (`crates/server/src/listeners.rs`, `crates/server/src/limits.rs`):
   pre-handshake gap (the handshake budget covers it); a client that completes the handshake and
   then stays silent is cut by the idle timeout, not 5 s.
 - Upload slots (caddy-rs addition, not in stock): each admin listener admits at most
-  `ADMIN_MAX_CONCURRENT_BODIES` (4) concurrent requests with a body, and one peer (remote address;
-  the certificate's issuer+serial on the mTLS listener; one shared principal on the unix socket) at
-  most `ADMIN_MAX_BODIES_PER_PEER` (2); beyond that `503`, connection closed. A body is detected
+  `ADMIN_MAX_CONCURRENT_BODIES` (4) concurrent requests with a body, and one peer at most
+  `ADMIN_MAX_BODIES_PER_PEER` (2); beyond that `503`, connection closed. A peer is the certificate
+  (issuer+serial) on the mTLS listener, a remote address on TCP, and one principal for the unix
+  socket and for every loopback address (127.0.0.0/8 is all local, so per-address limits would be
+  moot). So "4 per listener" holds only across several remote peers or certificates: local
+  clients (unix socket, loopback TCP) share a limit of 2 concurrent uploads. A body is detected
   from the body itself (`!is_end_stream()`), not the headers, so HTTP/2 streams with DATA frames
   and no `content-length` also take a slot (they used to bypass the limit entirely). Worst-case body
   memory is 4 x 64 MiB per listener. `stock_compat true` lifts the slots together with the cap.
@@ -149,9 +162,20 @@ Implemented (`bind_admin_unix_private`, `install_staged_socket`, `AdminSocketPat
 - Liveness probe: before replacing a stale socket a `connect` is tried; success means a running
   process owns it and the bind fails with "in use by a running process" (a second caddy-rs on the
   same admin path used to silently steal the first one's socket). Only `ECONNREFUSED`/`ENOENT`
-  count as stale; other probe failures are reported. `stock_compat true` replaces unconditionally,
-  like stock Caddy. (A listener replaced during reload is stopped, removing its socket, before the
-  new one binds, so reloads are unaffected.)
+  count as stale (and `EACCES` on a socket owned by another user, such as a crashed `sudo` run,
+  where this process could never have been the peer); the connect is async with a 1 s budget and a
+  timeout counts as live; other probe failures are reported. `stock_compat true` of the generation
+  being applied (passed explicitly to the bind, not read from the store's current generation)
+  replaces unconditionally, like stock Caddy. The probe is also skipped in a zero-downtime upgrade
+  child: the Unix admin socket is not inherited through the binder, the parent keeps serving it
+  until the child is ready, and the child must replace it (the parent's cleanup then leaves the
+  replaced path alone, by inode); a test upgrades a process with a Unix admin socket. Plain
+  reloads (SIGHUP, `caddy-rs reload`, `/load`) keep the same address and never rebind, and a
+  `/stop` followed by an immediate start finds a stale socket, not a live one.
+- A reload that moves `admin.listen` binds the new listener before stopping the old one, so a
+  refused bind (path in use, permissions) leaves the old admin API serving and the apply returns
+  the error. An address that differs only in spelling but collides (`AddrInUse`) falls back to
+  stop-then-bind.
 - The `link(2)` fallback to `rename` applies only to `EPERM`/`EOPNOTSUPP`/`ENOTSUP`/`ENOSYS`
   (`hard_link_unsupported`); `EACCES`, `EMLINK`, `ENOSPC` and the like are reported.
 - Honest limit: the stale-socket replacement is narrowed, not eliminated. `rename` cannot be made
@@ -162,6 +186,9 @@ Implemented (`bind_admin_unix_private`, `install_staged_socket`, `AdminSocketPat
 - Cleanup (`AdminSocketPath::drop`) removes the path only if it is still a socket with the device
   and inode this listener created; a regular file, symlink or another process's socket placed there
   afterwards is left alone (its `lstat`/`unlink` pair has the same narrowed-not-eliminated window).
+  The `/stop` timeout cleanup (`ShutdownLatch::remove_owned_socket_paths`) applies the same
+  type+device+inode check to the identities recorded at bind time, and a path is forgotten when the
+  admin socket moves.
 - The staging directory name is 8 hex digits from the OS RNG (`getrandom`, retried on `EEXIST`), so
   it cannot be pre-created by a squatter in a world-writable parent. It adds 12 bytes to the bind
   path (previously about 28); when that would overflow `sun_path` but the final path fits, a
@@ -234,7 +261,8 @@ before: write_timeout ignored); `proxy_protocol::tests::silent_client_is_dropped
 > **DIV (proposed) SEC-MEDIUM-ADMIN-SERVER-A2** - Admin request bodies are capped at 64 MiB (`413`),
 > and each admin listener admits at most 4 concurrent requests that carry a body, at most 2 per
 > peer (`503` beyond that; HTTP/2 streams count). Requests are authorised before their body is read.
-> The admin request-header read may take up to the 60 s idle budget (stock 5 s).
+> Each admin listener also caps connections (128 per listener, 32 per peer; loopback is one peer).
+> Local clients (unix socket, loopback TCP) share a limit of 2 concurrent uploads.
 > Stock Caddy v2.11.9 reads `/load` and `/adapt` bodies without a limit. `stock_compat true` removes
 > both bounds. A failed body read is a `400` in both modes, never an empty body. The admin servers use
 > stock Caddy's timeouts in both modes, plus a 10 s total deadline for a request body (`408`) and a
@@ -250,7 +278,8 @@ before: write_timeout ignored); `proxy_protocol::tests::silent_client_is_dropped
 > The stale-socket replacement is narrowed, not eliminated, against a concurrent local attacker.
 >
 > **DIV (proposed) SEC-MEDIUM-ADMIN-SERVER-A1** - The admin Host check matches stock Caddy except:
-> a request with no Host header and no URI authority passes; a port-less Host naming an allowed host
+> an HTTP/1.0 request with no Host header and no URI authority is served (stock: 403; HTTP/1.1
+> without Host is 400); a port-less Host naming an allowed host
 > is accepted; host names compare case-insensitively; listeners configured with port 0 do not
 > enforce it.
 >
