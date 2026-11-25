@@ -588,9 +588,16 @@ async fn the_certificates_gap_guard_is_mode_aware() {
         .await
         .expect("stock_compat must match upstream and start");
 
-    // What the listener ACTUALLY does, not merely that apply returned Ok: upstream's
-    // `autohttps.go:185` continues with no subjects, so the listener carries an empty resolver and
-    // a handshake fails. T-TLS-105 requires this to be measured rather than assumed.
+    // What the listener ACTUALLY does, not merely that apply returned Ok: the listener carries an
+    // empty resolver, so a handshake fails. T-TLS-105 requires this to be measured rather than
+    // assumed.
+    //
+    // Corrects an earlier misreading: this comment used to say upstream's `autohttps.go:185`
+    // `continue`s with no subjects. It does not. `:142-146` runs first and installs an implicit TLS
+    // connection policy when a server has no explicit policies and every listener is on the HTTPS
+    // port, so the server's `TLSConnPolicies` is non-empty and the bare `continue` at `:185` does
+    // not fire. `app.go:568` then computes `useTLS` true and the listener terminates TLS with no
+    // certificate selected for it (DIV-0165).
     let addr = runtime
         .listener_address("127.0.0.1:0")
         .expect("the uncovered TLS listener is bound");
@@ -619,8 +626,10 @@ async fn the_certificates_gap_guard_is_mode_aware() {
     //   15 03 03 00 02 02 32
     //   ^^ content type alert        ^^ level fatal   ^^ description decode_error (50)
     // This is what "the listener has no certificate of its own" looks like on the wire: the process
-    // started (upstream `autohttps.go:185`) and a client that tries to handshake is told so, rather
-    // than the apply being refused. A listener that accepted and then did nothing fails here.
+    // started (upstream accepts the config — see the note above on `autohttps.go:142-146` and
+    // `app.go:568`, which supersede the earlier `:185` reading) and a client that tries to handshake
+    // is told so, rather than the apply being refused. A listener that accepted and then did nothing
+    // fails here.
     assert!(
         record.len() >= 7,
         "expected a TLS alert record, got {} bytes: {record:02x?}",
