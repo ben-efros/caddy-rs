@@ -26,7 +26,13 @@ jobs:
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    continue-on-error: true
+    # Do NOT add `continue-on-error: true` here. It was added in 8d48cd4c2584 to stop one failing
+    # matrix leg from blocking the release, but at job level it does the opposite of what the job
+    # graph needs: GitHub reports such a job as *successful*, so `release:` (`needs: build`) still
+    # runs and publishes whatever artifacts happen to exist — a partial or empty GitHub release with
+    # a green workflow. The "one leg must not cancel the others" intent is carried by
+    # `strategy.fail-fast: false` below, which is the correct knob; it keeps the other legs running
+    # while still letting the job's failure be visible to `needs:`.
     strategy:
       fail-fast: false
       matrix:
