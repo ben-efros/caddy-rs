@@ -14,6 +14,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+# WARN log when a client-authentication mode that does not verify the certificate is in effect
+# (SEC-MEDIUM D2).
+tracing = { workspace = true }
 
 # ACME (RFC 8555) account/JWS foundation: ES256 signing, SHA-256, HMAC and base64url.
 # Both crates are present in the offline registry cache used by this workspace.

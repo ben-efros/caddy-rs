@@ -118,7 +118,7 @@ use crate::{Error, Result};
 pub const CERTIFICATES_DIRECTORY: &str = "certificates";
 
 /// A certificate in storage form (PEM, so it can be inspected with standard tooling).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredCertificate {
     /// PEM-encoded certificate chain, leaf first.
     pub certificate_pem: Vec<String>,
@@ -142,6 +142,33 @@ pub struct StoredCertificate {
     /// newer Caddy metadata field survives a caddy-rs renewal.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata_extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// Manual `Debug` that redacts `private_key_pem` (SEC-MEDIUM D4).
+///
+/// The derived implementation printed the PKCS#8 PEM, so any `{:?}` of a record — a `tracing`
+/// field, an `unwrap()`/`expect()` message, `dbg!`, an error chain, or the derived `Debug` of
+/// [`MemoryStorage`] — leaked the private key into logs. Same approach as
+/// [`TokenCertificateKey`](crate::certificate::TokenCertificateKey)'s manual `Debug`. A token-held
+/// record carries no PEM, which is shown as `<empty>` so it stays distinguishable.
+impl std::fmt::Debug for StoredCertificate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let private_key = if self.private_key_pem.is_empty() {
+            "<empty>"
+        } else {
+            "<redacted>"
+        };
+        formatter
+            .debug_struct("StoredCertificate")
+            .field("certificate_pem", &self.certificate_pem)
+            .field("private_key_pem", &private_key)
+            .field("token_key", &self.token_key)
+            .field("domains", &self.domains)
+            .field("not_after_unix", &self.not_after_unix)
+            .field("issuer_data", &self.issuer_data)
+            .field("metadata_extra", &self.metadata_extra)
+            .finish()
+    }
 }
 
 /// Async certificate storage backend.
@@ -1252,6 +1279,39 @@ mod tests {
             issuer_data: None,
             metadata_extra: BTreeMap::new(),
         }
+    }
+
+    /// SEC-MEDIUM D4: `{:?}` of a stored certificate (a `tracing` field, an `unwrap()`/`expect`
+    /// message, a `dbg!`, an error chain, or the derived `Debug` of `MemoryStorage`) must never
+    /// print the private key.
+    #[tokio::test]
+    async fn debug_output_never_contains_private_key_material() {
+        let mut certificate = example();
+        certificate.private_key_pem =
+            "-----BEGIN PRIVATE KEY-----\nTOP-SECRET-KEY-BODY\n-----END PRIVATE KEY-----\n"
+                .to_string();
+        let debug = format!("{certificate:?}");
+        let pretty = format!("{certificate:#?}");
+        for text in [&debug, &pretty] {
+            assert!(!text.contains("TOP-SECRET-KEY-BODY"), "{text}");
+            assert!(!text.contains("PRIVATE KEY"), "{text}");
+            // The rest stays useful for diagnostics.
+            assert!(text.contains("StoredCertificate"), "{text}");
+            assert!(text.contains("example.com"), "{text}");
+            assert!(text.contains("4000000000"), "{text}");
+            assert!(text.contains("private_key_pem"), "{text}");
+        }
+        // The derived Debug of the in-memory backend prints its stored values.
+        let storage = MemoryStorage::new();
+        storage.store("k", &certificate).await.unwrap();
+        let debug = format!("{storage:?}");
+        assert!(!debug.contains("TOP-SECRET-KEY-BODY"), "{debug}");
+        // A record without a key (token-held) is visibly distinguishable from a redacted key.
+        certificate.private_key_pem = String::new();
+        assert!(
+            format!("{certificate:?}").contains("<empty>"),
+            "{certificate:?}"
+        );
     }
 
     const ACME_ISSUER: &str = "acme-v02.api.letsencrypt.org-directory";
