@@ -21,12 +21,15 @@
 //!
 //! Simplifications (see the task report for the divergence entries):
 //!
-//! - Synthetic unit-test requests without a `Host` header skip the host check (the real HTTP server
-//!   always supplies one; Caddy would have rejected a host-less HTTP/1.1 request earlier). A
-//!   port-less `Host` (for example `Host: localhost` from CLI/test harnesses) is accepted when it
-//!   matches an allowed host's host part, and host enforcement is skipped entirely for ephemeral
-//!   (`listen ...:0`) admin listeners whose bound port is unknown to the configuration; Caddy
-//!   compares host:port exactly against its statically configured listener.
+//! - Synthetic unit-test requests without a `Host` header skip the host check (the server
+//!   transport always supplies one: the URI authority for absolute-form and HTTP/2 requests, else
+//!   the `Host` header; a host-less HTTP/1.0 request therefore passes, which no browser can
+//!   send). A present-but-empty or non-UTF-8 `Host` is rejected, like Caddy. A port-less `Host`
+//!   (for example `Host: localhost` from CLI/test harnesses) is accepted when it matches an
+//!   allowed host's host part, uniformly for `localhost`, `127.0.0.1` and `[::1]`; host names
+//!   compare case-insensitively (Caddy compares exactly); and host enforcement is skipped
+//!   entirely for ephemeral (`listen ...:0`) admin listeners whose bound port is unknown to the
+//!   configuration, where Caddy compares host:port exactly against its configured listener.
 //! - Caddy distinguishes `origins: null` (derive from the listen address) from `origins: []`
 //!   (allow none). The shared `AdminConfig` uses `Option<Vec<String>>` so `Some([])` (explicitly
 //!   empty) blocks all origins while `None` (absent) derives the defaults from the listen address.
@@ -226,47 +229,44 @@ impl OriginPolicy {
         if !self.enforce_host {
             return Ok(());
         }
-        let Some(host) = headers
-            .get(http::header::HOST)
-            .and_then(|value| value.to_str().ok())
-        else {
+        // No `Host` header at all is a synthetic request; the server transport always supplies
+        // one (from the URI authority or the header). A header that is present but empty or not
+        // UTF-8 is a real request whose host Go would see as "" / garbage: reject it rather than
+        // treating it as absent.
+        let Some(raw) = headers.get(http::header::HOST) else {
             return Ok(());
+        };
+        let rejected = |shown: &str| OriginViolation {
+            status: StatusCode::FORBIDDEN,
+            message: format!("host not allowed: {shown}"),
+        };
+        let Ok(host) = raw.to_str() else {
+            return Err(rejected(&String::from_utf8_lossy(raw.as_bytes())));
         };
         let host = host.trim();
         if host.is_empty() {
-            return Ok(());
+            return Err(rejected(host));
         }
-        // Exact host:port match is Caddy's comparison. Synthetic clients (the CLI test harness,
-        // `curl` against the default loopback listener without an explicit port) send a port-less
-        // Host; accept that when it matches an allowed host's host part. Documented divergence:
-        // Caddy would reject a port-less Host when its allow-list entries include the port.
-        let portless = !host.contains(':');
-        let request_host_part = host
-            .rsplit_once(':')
-            .map(|(host_part, _)| host_part)
-            .unwrap_or(host);
+        // Caddy compares `host:port` exactly and case-sensitively. caddy-rs differs in two
+        // listed ways: names compare case-insensitively (DNS names are), and a port-less `Host`
+        // (the CLI test harness, `curl` to a bare name) is accepted when it names an allowed
+        // host, uniformly for `localhost`, `127.0.0.1` and `[::1]`.
+        let (request_host, request_port) = split_host_port(host);
         if self.allowed.iter().any(|allowed| {
             if allowed.host.eq_ignore_ascii_case(host) {
                 return true;
             }
-            let (allowed_host_part, allowed_port) = allowed
-                .host
-                .rsplit_once(':')
-                .unwrap_or((allowed.host.as_str(), ""));
-            // Port-less synthetic Host: compare the host part.
-            if portless && allowed_host_part.eq_ignore_ascii_case(host) {
-                return true;
+            let (allowed_host, allowed_port) = split_host_port(&allowed.host);
+            if !allowed_host.eq_ignore_ascii_case(request_host) {
+                return false;
             }
-            // Ephemeral admin listeners configured with port 0: the active generation records
-            // `:0` but the runtime bound a real port, so match any port for that host.
-            allowed_port == "0" && allowed_host_part.eq_ignore_ascii_case(request_host_part)
+            // Port-less request, or an ephemeral admin listener configured with port 0 (the
+            // active generation records `:0` but the runtime bound a real port).
+            request_port.is_none() || allowed_port == Some("0")
         }) {
             return Ok(());
         }
-        Err(OriginViolation {
-            status: StatusCode::FORBIDDEN,
-            message: format!("host not allowed: {host}"),
-        })
+        Err(rejected(host))
     }
 
     fn origin_allowed(&self, origin: &ParsedOrigin) -> bool {
@@ -276,6 +276,25 @@ impl OriginPolicy {
             }
             allowed.host.eq_ignore_ascii_case(&origin.host)
         })
+    }
+}
+
+/// Split an authority into host (brackets kept for IPv6) and optional port.
+fn split_host_port(authority: &str) -> (&str, Option<&str>) {
+    if authority.starts_with('[') {
+        return match authority.find(']') {
+            Some(end) => match authority[end + 1..].strip_prefix(':') {
+                Some(port) => (&authority[..=end], Some(port)),
+                None => (&authority[..=end], None),
+            },
+            None => (authority, None),
+        };
+    }
+    match authority.rsplit_once(':') {
+        // More than one colon without brackets is a bare IPv6 literal, not host:port.
+        Some((host, _)) if host.contains(':') => (authority, None),
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
     }
 }
 
@@ -671,6 +690,31 @@ mod tests {
             HeaderValue::from_static("plain.example:8443"),
         );
         assert!(policy.check(&headers).is_ok());
+    }
+
+    #[test]
+    fn host_check_edge_cases_match_caddy_or_are_listed_differences() {
+        let policy = OriginPolicy::from_admin(Some(&admin(false, &[])));
+        let check = |host: &[u8]| {
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::HOST, HeaderValue::from_bytes(host).unwrap());
+            policy.check(&headers)
+        };
+        // Port-less hosts are accepted consistently for every default loopback name (a
+        // documented difference from Caddy, which compares host:port exactly): `localhost`,
+        // `127.0.0.1` and the bracketed IPv6 form behave the same.
+        for host in ["localhost", "127.0.0.1", "[::1]", "[::1]:2019"] {
+            assert!(check(host.as_bytes()).is_ok(), "{host}");
+        }
+        // A wrong port is not.
+        for host in ["localhost:2020", "[::1]:2020", "127.0.0.1:1"] {
+            assert!(check(host.as_bytes()).is_err(), "{host}");
+        }
+        // An empty or non-UTF-8 `Host` is a request Go would route as host "" and reject; it must
+        // not slip through as if the header were missing.
+        assert!(check(b"").is_err(), "empty Host header");
+        assert!(check(b"   ").is_err(), "blank Host header");
+        assert!(check(b"\xff\xfe:2019").is_err(), "non-UTF-8 Host header");
     }
 
     #[test]

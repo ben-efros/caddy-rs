@@ -3011,6 +3011,36 @@ where
     }
 }
 
+/// The headers the admin API sees for one request, with `Host` resolved the way Go's net/http
+/// sets `Request.Host` (what Caddy's `checkHost` compares): the URI authority when the request
+/// line carries one (absolute-form HTTP/1.x, or the HTTP/2 `:authority` pseudo-header, which has
+/// no `Host` header at all), otherwise the `Host` header. More than one `Host` header is a `400`,
+/// as in Go. Without this a prior-knowledge HTTP/2 (h2c) request, or an absolute-form target
+/// naming a foreign host, skipped the DNS-rebinding check (SEC-MEDIUM-ADMIN-SERVER A1).
+#[allow(clippy::result_large_err)] // the error is the ready-to-send admin response
+fn admin_request_headers(
+    mut headers: http::HeaderMap,
+    uri: &http::Uri,
+) -> Result<http::HeaderMap, caddy_rs_admin::AdminResponse> {
+    if headers.get_all(http::header::HOST).iter().count() > 1 {
+        return Err(caddy_rs_admin::AdminResponse::api_error(
+            http::StatusCode::BAD_REQUEST,
+            "too many Host headers",
+        ));
+    }
+    if let Some(authority) = uri.authority() {
+        // `URL.Host` has no userinfo.
+        let host = authority
+            .as_str()
+            .rsplit_once('@')
+            .map_or(authority.as_str(), |(_, host)| host);
+        if let Ok(value) = http::HeaderValue::from_str(host) {
+            headers.insert(http::header::HOST, value);
+        }
+    }
+    Ok(headers)
+}
+
 /// Convert an admin response to the hyper response the connection serves.
 fn admin_hyper_response(response: caddy_rs_admin::AdminResponse) -> hyper::Response<Body> {
     let mut builder = hyper::Response::builder().status(response.status);
@@ -3043,8 +3073,13 @@ impl hyper::service::Service<hyper::Request<Incoming>> for AdminService {
         let body_slots = Arc::clone(&self.body_slots);
         Box::pin(async move {
             let (parts, body) = request.into_parts();
-            let body = match read_admin_request_body(&api, &body_slots, &parts.headers, body).await
-            {
+            let headers = match admin_request_headers(parts.headers, &parts.uri) {
+                Ok(headers) => headers,
+                Err(rejection) => {
+                    return Ok::<_, std::convert::Infallible>(admin_hyper_response(rejection))
+                }
+            };
+            let body = match read_admin_request_body(&api, &body_slots, &headers, body).await {
                 Ok(body) => body,
                 Err(rejection) => {
                     return Ok::<_, std::convert::Infallible>(admin_hyper_response(rejection))
@@ -3059,7 +3094,7 @@ impl hyper::service::Service<hyper::Request<Incoming>> for AdminService {
                 .handle(AdminRequest {
                     method: parts.method,
                     path,
-                    headers: parts.headers,
+                    headers,
                     body,
                     client_identity: caddy_rs_admin::ClientIdentity::NotPresented,
                 })
@@ -3650,10 +3685,19 @@ pub(crate) async fn bind_admin_remote(
                             let body_slots = Arc::clone(&body_slots);
                             async move {
                                 let (parts, body) = request.into_parts();
+                                let headers = match admin_request_headers(parts.headers, &parts.uri)
+                                {
+                                    Ok(headers) => headers,
+                                    Err(rejection) => {
+                                        return Ok::<_, std::convert::Infallible>(
+                                            admin_hyper_response(rejection),
+                                        )
+                                    }
+                                };
                                 let body = match read_admin_request_body(
                                     &api,
                                     &body_slots,
-                                    &parts.headers,
+                                    &headers,
                                     body,
                                 )
                                 .await
@@ -3674,7 +3718,7 @@ pub(crate) async fn bind_admin_remote(
                                     .handle(AdminRequest {
                                         method: parts.method,
                                         path,
-                                        headers: parts.headers,
+                                        headers,
                                         body,
                                         client_identity: identity,
                                     })
@@ -4661,6 +4705,182 @@ mod admin_limits_tests {
         );
         drop(holders);
         handle.stop().await;
+    }
+}
+
+/// End-to-end tests of the admin DNS-rebinding `Host` check (SEC-MEDIUM-ADMIN-SERVER A1) on a real
+/// listener with a non-zero, known port. A listener configured with port 0 turns the check off
+/// (the port is unknown to the allow-list), so these bind a port first and then configure it.
+#[cfg(test)]
+mod admin_host_check_tests {
+    use super::{admin_request_headers, bind_admin};
+    use caddy_rs_admin::{AdminApi, OriginPolicy};
+    use caddy_rs_core::{AdminConfig, GenerationStore};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    async fn listener() -> (super::ListenerHandle, SocketAddr) {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe port");
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let listen = format!("127.0.0.1:{port}");
+        let policy = OriginPolicy::from_admin(Some(&AdminConfig {
+            listen: Some(listen.clone()),
+            ..AdminConfig::default()
+        }));
+        let api = AdminApi::new(Arc::new(GenerationStore::with_builtin_registry()))
+            .with_origin_policy(policy);
+        let handle = bind_admin(&listen, api, None).await.expect("bind admin");
+        let address = handle.socket_addr.expect("bound address");
+        assert_eq!(address.port(), port);
+        (handle, address)
+    }
+
+    /// Send a raw HTTP/1.1 request and return its status code.
+    async fn status_of(address: SocketAddr, request: &str) -> u16 {
+        let mut stream = TcpStream::connect(address).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            stream.read_to_end(&mut response),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&response);
+        text.split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("no status line in {text:?}"))
+    }
+
+    fn get(target: &str, headers: &[String]) -> String {
+        let mut request = format!("GET {target} HTTP/1.1\r\nConnection: close\r\n");
+        for header in headers {
+            request.push_str(header);
+            request.push_str("\r\n");
+        }
+        request.push_str("\r\n");
+        request
+    }
+
+    #[tokio::test]
+    async fn own_host_is_served_and_foreign_host_is_refused_with_and_without_origin_headers() {
+        let (handle, address) = listener().await;
+        let own = format!("Host: {address}");
+        let foreign = format!("Host: evil.example:{}", address.port());
+        let origin = format!("Origin: http://{address}");
+        let cross_site = "Sec-Fetch-Mode: cors".to_string();
+
+        for (extra, label) in [
+            (vec![], "no Origin or Sec-Fetch-Mode"),
+            (vec![origin.clone()], "Origin"),
+            (vec![origin.clone(), cross_site.clone()], "Origin + Sec-Fetch-Mode"),
+            (vec![cross_site.clone()], "Sec-Fetch-Mode alone"),
+        ] {
+            let mut with_own = vec![own.clone()];
+            with_own.extend(extra.clone());
+            let status = status_of(address, &get("/config/", &with_own)).await;
+            // `Sec-Fetch-Mode` alone has no Origin to validate, which Caddy rejects with 403
+            // after the Host passed; every other combination with the own Host is served.
+            let expected = if label == "Sec-Fetch-Mode alone" { 403 } else { 200 };
+            assert_eq!(status, expected, "own Host, {label}");
+
+            let mut with_foreign = vec![foreign.clone()];
+            with_foreign.extend(extra);
+            assert_eq!(
+                status_of(address, &get("/config/", &with_foreign)).await,
+                403,
+                "foreign Host must be refused, {label}"
+            );
+        }
+        handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn absolute_form_target_host_wins_over_the_host_header() {
+        let (handle, address) = listener().await;
+        let own = format!("Host: {address}");
+        let evil = format!("http://evil.example:{}/config/", address.port());
+        assert_eq!(
+            status_of(address, &get(&evil, std::slice::from_ref(&own))).await,
+            403,
+            "Go uses the request-line host, so a foreign absolute-form target is a rebinding attempt"
+        );
+        let good = format!("http://{address}/config/");
+        let foreign = format!("Host: evil.example:{}", address.port());
+        assert_eq!(
+            status_of(address, &get(&good, &[foreign])).await,
+            200,
+            "and an own absolute-form target is served whatever the header says"
+        );
+        handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn multiple_host_headers_are_a_400_like_go() {
+        let (handle, address) = listener().await;
+        let own = format!("Host: {address}");
+        assert_eq!(
+            status_of(address, &get("/config/", &[own.clone(), own])).await,
+            400
+        );
+        handle.stop().await;
+    }
+
+    /// Prior-knowledge HTTP/2 carries only `:authority` (no `Host` header), so the check used to
+    /// be skipped entirely for h2c clients.
+    #[tokio::test]
+    async fn http2_authority_is_checked_like_the_host_header() {
+        let (handle, address) = listener().await;
+        let request = |authority: String| async move {
+            let tcp = TcpStream::connect(address).await.expect("connect");
+            let (mut sender, connection) = h2::client::handshake(tcp).await.expect("h2 handshake");
+            tokio::spawn(connection);
+            let request = http::Request::builder()
+                .uri(format!("http://{authority}/config/"))
+                .body(())
+                .unwrap();
+            let (response, _) = sender.send_request(request, true).expect("send");
+            response.await.expect("response").status().as_u16()
+        };
+        assert_eq!(request(address.to_string()).await, 200);
+        assert_eq!(
+            request(format!("evil.example:{}", address.port())).await,
+            403,
+            "a foreign :authority over h2c must be refused"
+        );
+        handle.stop().await;
+    }
+
+    #[test]
+    fn request_headers_resolve_host_like_go() {
+        let uri = |text: &str| text.parse::<http::Uri>().unwrap();
+        let with_host = |value: &str| {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(http::header::HOST, value.parse().unwrap());
+            headers
+        };
+        // Origin-form keeps the header.
+        let resolved = admin_request_headers(with_host("a.example"), &uri("/x")).unwrap();
+        assert_eq!(resolved.get(http::header::HOST).unwrap(), "a.example");
+        // An authority (absolute-form / :authority) replaces it; userinfo is not part of the host.
+        let resolved =
+            admin_request_headers(with_host("a.example"), &uri("http://u:p@b.example:1/x")).unwrap();
+        assert_eq!(resolved.get(http::header::HOST).unwrap(), "b.example:1");
+        // And supplies it when the header is absent (HTTP/2).
+        let resolved = admin_request_headers(http::HeaderMap::new(), &uri("http://c.example/x"))
+            .unwrap();
+        assert_eq!(resolved.get(http::header::HOST).unwrap(), "c.example");
+        // Neither: still absent.
+        let resolved = admin_request_headers(http::HeaderMap::new(), &uri("/x")).unwrap();
+        assert!(resolved.get(http::header::HOST).is_none());
+        // Two Host headers: 400.
+        let mut headers = with_host("a.example");
+        headers.append(http::header::HOST, "b.example".parse().unwrap());
+        let rejected = admin_request_headers(headers, &uri("/x")).unwrap_err();
+        assert_eq!(rejected.status, http::StatusCode::BAD_REQUEST);
     }
 }
 
