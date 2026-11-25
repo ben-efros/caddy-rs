@@ -320,6 +320,38 @@ tracing output; with the old `warn!(totp_uri = ...)` it fails with the secret in
   username like authn (the `ALICE` test flipped). Whitespace-only passwords are refused; Unicode
   NFC normalisation is documented as not applied because the crate is not a dependency.
 
+## Third review round
+
+- **Restart loop (high).** The previous change stored a TOTP *code* (valid 30 s) in the environment
+  file and had `serve` re-prove it on every start; the user store is in memory, so every start
+  re-ran the bootstrap with a stale code, rolled the admin back and exited 1 (a systemd restart
+  loop). `serve` now enrols `PM_BOOTSTRAP_ADMIN_TOTP_SECRET` as an *active* factor with no code
+  (`AuthnService::totp_activate_with_secret`); the code is checked once, by `install`, and never
+  stored. Test: `the_bootstrap_factor_is_active_and_survives_every_restart` (three boots on fresh
+  stores, login with a code derived from the secret), plus `install_checks_the_code_once_and_never_needs_it_again`.
+- **Username oracle (medium).** The fail-closed full table of the previous round made unknown names
+  answer 429 (no hash) for up to a day after a flood while real accounts answered 401. The tracker is
+  now two maps: known accounts (never evicted, never refused) and a capped oldest-first map of
+  invented names. Tests: `an_adaptive_flood_of_invented_names_cannot_touch_a_penalised_account`
+  (100 000 invented names) and `unknown_and_known_names_stay_indistinguishable_through_a_flood`.
+  The earlier "for the duration of the flood" caveat no longer applies.
+- **Daily total survives success (low).** A success removed the whole entry, refunding the 24 h
+  count. It now resets only the streak and level, and the window is two half-day buckets (sliding in
+  12 h steps). Tests: `a_success_ends_the_streak_but_not_the_daily_total`,
+  `the_daily_window_slides_in_half_day_steps`.
+- **Secret strength (low).** Operator TOTP secrets must be at least 128 bits (RFC 4226), typed error
+  `AuthError::InvalidTotpSecret`; tests use 160-bit secrets and
+  `totp_secrets_below_128_bits_are_refused` keeps an 80-bit one as the negative case.
+- **Argv and `--help` (low).** `hide_env_values` on the password and code arguments; the secret has
+  no flag, only the environment variable.
+- **Environment file (low).** Written through a `create_new` 0600 temporary file renamed over the
+  target (a looser existing file is never truncated in place), unrelated variables preserved, stale
+  code lines dropped, line breaks refused (`the_environment_file_is_replaced_atomically_and_keeps_unrelated_lines`,
+  `credentials_with_line_breaks_are_refused_not_written`). It now holds password and TOTP secret
+  together, so it is not a second factor against a reader of the file.
+- **Deleted user (nit).** `store_refresh_token` refuses an insert for a user that no longer exists
+  (`a_login_racing_a_user_deletion_gets_no_token`).
+
 ## Exact program-repository text to merge
 
 `docs/compatibility/BEHAVIOR-DIVERGENCES.md`, new entry (`caddy-rs extension`, no stock Caddy

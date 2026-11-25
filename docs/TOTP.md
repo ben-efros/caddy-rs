@@ -14,7 +14,7 @@ are documented in [AUTHN.md](AUTHN.md); passkeys and the `caddy-rs setup` comman
 | Replay / downgrade detection with bounded lookback | Implemented |
 | Enrolment methods `totp_setup` / `totp_disable` | Implemented as service methods |
 | PM API login with a TOTP second factor | Implemented (`totp_code` field, JSON alias `totpCode`) |
-| `pm-cli` bootstrap admin with `PM_BOOTSTRAP_ADMIN_TOTP` | Implemented (T-AUTH-002): `bootstrap_admin` enrols the operator-supplied `PM_BOOTSTRAP_ADMIN_TOTP_SECRET` with `totp_setup_with_secret` (the two variables must be set together), then proves possession with `totp_confirm` using the supplied code. The secret stays *pending* until the code is confirmed, so an abandoned bootstrap cannot lock the operator out. A wrong code or malformed secret rolls the admin back; the secret is never echoed |
+| `pm-cli` bootstrap admin with `PM_BOOTSTRAP_ADMIN_TOTP_SECRET` | `serve` enrols the operator-provisioned secret (>= 128 bits, environment only) as an *active* factor on every start with `totp_activate_with_secret`, no code (the user store is rebuilt from the environment at each boot). `install` checks one current code in `PM_BOOTSTRAP_ADMIN_TOTP` against the secret once and never stores it. A malformed or short secret removes the admin; the secret is never echoed |
 | TOTP enrolment HTTP endpoints | Not implemented — no PM API route calls `totp_setup` |
 | `caddy-rs setup --auth-method totp` | **Implemented** for first boot (T-SETUP-003): `step=begin` mints the secret and returns the `otpauth://` URI, `step=verify` proves possession and enrols the admin credential, closing the activation window. The credential is in process memory only (DIV-0152); persistence is T-SETUP-005. See [CLI.md](CLI.md#first-boot-enrollment) |
 

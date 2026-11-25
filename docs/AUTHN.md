@@ -130,7 +130,8 @@ so response time does not reveal whether an account exists.
   in again once the account's epoch is above 0), and `update_role` now revokes refresh tokens like
   the other epoch-bumping operations. Every session-retiring operation bumps the epoch *first* and
   revokes second, and `UserStore::store_refresh_token` must refuse (`RefreshTokenRevoked`) an insert
-  whose epoch no longer matches the user's, atomically with the insert, so a login or refresh that
+  whose epoch no longer matches the user's, or whose user no longer exists (a login racing
+  `delete_user`), atomically with the insert, so a login or refresh that
   straddled the bump cannot leave a token that survives the revoke.
 - **No grace period (trade-off).** Re-presenting a just-rotated token is reuse: a client that
   retries a refresh after losing the response (timeout, dropped connection) ends all of the user's
@@ -163,9 +164,12 @@ API, the CLI enrolment flow, any future caller) inherits it. `AuthnConfig::login
   period while the backoff level is non-zero. A key idle for `2 * max_lockout` has its failure count
   restarted but its backoff level only decays by one per idle period, and a key that still has a
   level re-locks on its first further failure. On top of that every key totals its failures over a
-  rolling 24 hours: past 20 the full `max_lockout` applies to every further failure however long
-  the key was idle, which bounds the guesses per key to about 116 a day with the defaults (idling
-  to reset the count used to allow about 240). `max_lockout` must not exceed one day
+  rolling 24 hours (two half-day buckets, so it slides in 12-hour steps and counts the last 12 to
+  24 hours): past 20 the full `max_lockout` applies to every further failure however long the key
+  was idle, which bounds the guesses per key to about 116 a day with the defaults (idling to reset
+  the count used to allow about 240; right at a bucket boundary up to twice the cap can fall in one
+  hour). A successful authentication restarts the failure streak and backoff level but **not** this
+  daily total, so legitimate logins do not refund a paced guesser. `max_lockout` must not exceed one day
   (`AuthError::InvalidConfig`).
 - Password failures and TOTP failures during `login` share one per-username budget. Direct
   `totp_verify` calls (confirm, disable, re-enrol) spend a per-account budget (`totp:<user id>`)
@@ -175,18 +179,14 @@ API, the CLI enrolment flow, any future caller) inherits it. `AuthnConfig::login
   state does not reveal which usernames are real. The store matches names case-sensitively (`Bob`
   and `bob` are two accounts), so the key is not case-folded: a store that folds case must fold
   here too. Keys over 128 bytes are replaced by a SHA-256 digest.
-- **A full table fails closed, it does not evict.** Entries are retained for 24 hours after their
-  last activity (a sweep, at most once a second while the table is full, drops older ones), so an
-  attacker cannot push invented names to a penalty and then evict the victim. When `max_tracked`
-  is reached: a key for an account that exists (`login` looks the name up first) may displace the
-  least penalised entry of an *unknown* name; a key for an unknown name is turned away with
-  `TooManyAttempts` for `base_lockout`; when only known entries remain, a new known key is turned
-  away as well. Consequences, accepted deliberately: during a flood of invented usernames a
-  mistyped username is refused rather than reported as bad credentials, so for the duration of
-  the flood an observer can tell existing names (admitted) from invented ones (refused), and the
-  flood can pin the unknown-name slots for as long as it lasts. It cannot lock out existing
-  accounts, which always have a slot unless more than `max_tracked` real accounts are under attack
-  at once.
+- **Two maps, so invented names cannot touch real accounts.** Keys of accounts that exist (`login`
+  looks the name up first) live in their own map, bounded by the number of accounts, never evicted
+  and never refused. Keys of names with no account live in a separate map capped at `max_tracked`
+  with oldest-first eviction. Nothing is ever refused because a table is full, so a flood of
+  invented usernames can neither reset a victim's penalty nor create a username oracle: an unknown
+  name is counted and locked exactly like a known one, still pays for the dummy password hash, and
+  is answered `InvalidCredentials` (or the same `TooManyAttempts` once *that* name's own key is
+  locked) exactly like an existing account with a wrong password.
 - `update_password` verifies the current password through the same per-username budget, so a stolen
   access token cannot guess the password at line speed.
 - Counters are in-process and shared by clones of the service; they reset on restart.

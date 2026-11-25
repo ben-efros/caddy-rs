@@ -157,16 +157,25 @@ credentials deletes a stale file left by an earlier install. Supply the email an
 
 The normal way to enrol a second factor is `POST /api/v1/auth/totp/setup` (then `/confirm`) after the
 first login: the server returns the secret and the `otpauth://` URI over the authenticated session.
-For unattended provisioning, `PM_BOOTSTRAP_ADMIN_TOTP_SECRET` (a base32 secret you generated and
-already added to your authenticator) **together with** `PM_BOOTSTRAP_ADMIN_TOTP` (a code it
-currently shows) enrols that factor at start: the secret is enrolled pending, the code proves it, and
-a wrong code or malformed secret removes the administrator again. Setting only one of the two is
-refused with an error before anything is created. Earlier versions let `PM_BOOTSTRAP_ADMIN_TOTP`
-stand alone and generated the secret at start, which could never work because no one can know a code
-for a secret that does not exist yet. Neither value is ever logged or echoed in an error, and
-`install` stores them in the 0600 environment file with the password. The code is only valid for its
-30-second step, so start the service immediately after generating it (the bootstrap only runs when
-no users exist).
+
+For unattended provisioning, set `PM_BOOTSTRAP_ADMIN_TOTP_SECRET` to a base32 secret you generated
+(at least 128 bits, 160 recommended, e.g. `head -c20 /dev/urandom | base32`) and already added to your
+authenticator. It is read from the environment only: there is deliberately no command-line flag
+(arguments are visible in the process listing), and `--help` does not print environment values.
+`serve` enrols that secret as an **active** factor for the bootstrap administrator on *every* start,
+with no code, because the user store is in memory and is rebuilt from the environment at each boot;
+the secret is the proof of possession you provisioned. Pass a current code once, at `install` time,
+in `PM_BOOTSTRAP_ADMIN_TOTP`: `install` checks it against the secret (so a mis-copied secret fails the
+install instead of locking you out at the next start) and **never stores the code**. `install` refuses
+a secret without a code, or a code without a secret, before changing anything. Neither value is
+logged or echoed in an error. `serve` ignores `PM_BOOTSTRAP_ADMIN_TOTP` (and warns if it is set), so an
+environment file written by an earlier version, which held a code, keeps working: reinstall to drop it.
+
+The environment file (`/etc/caddy-rs-pm.env`) now holds the bootstrap password **and the TOTP secret**
+together, so it is *not* a second factor against anyone who can read it. It must stay root-owned, mode
+0600; `install` writes it through a fresh 0600 temporary file renamed into place (an existing looser
+file is never truncated in place), keeps any other variables you added, and refuses values containing a
+line break.
 
 `PM_BOOTSTRAP_ADMIN_PASSWORD` must be at least 8 characters; a shorter one makes the service fail to
 start with an error naming the variable.
