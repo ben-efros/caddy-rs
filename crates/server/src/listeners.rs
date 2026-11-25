@@ -2892,11 +2892,14 @@ pub(crate) const ADMIN_MAX_CONCURRENT_BODIES: usize = 4;
 /// The body cap for the next admin request: [`ADMIN_MAX_BODY_BYTES`], or none when the active
 /// generation sets `stock_compat true`.
 fn admin_body_limit(api: &AdminApi) -> Option<usize> {
-    let stock_compat = api
-        .store()
+    (!api_stock_compat(api)).then_some(ADMIN_MAX_BODY_BYTES)
+}
+
+/// Whether the active generation sets `stock_compat true`.
+fn api_stock_compat(api: &AdminApi) -> bool {
+    api.store()
         .current()
-        .is_some_and(|generation| generation.config().stock_compat());
-    (!stock_compat).then_some(ADMIN_MAX_BODY_BYTES)
+        .is_some_and(|generation| generation.config().stock_compat())
 }
 
 /// Total time one admin request body may take to arrive: stock Caddy's admin `ReadTimeout`, which
@@ -3192,13 +3195,49 @@ fn set_admin_socket_permissions(path: &std::path::Path) -> std::io::Result<()> {
 /// now at `socket_path`, so cleanup removes only that file.
 fn bind_admin_unix_private(
     socket_path: &std::path::Path,
+    stock_compat: bool,
 ) -> std::io::Result<(UnixListener, SocketIdentity)> {
     use std::io::{Error, ErrorKind};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
 
     let existing = match std::fs::symlink_metadata(socket_path) {
-        Ok(metadata) if metadata.file_type().is_socket() => Some(SocketIdentity::of(&metadata)),
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            // Liveness probe: a socket something still accepts on belongs to a running process
+            // (typically a second instance with the same admin path); stealing it would silently
+            // redirect that instance's admin clients. Stock Caddy removes unconditionally, so
+            // `stock_compat true` keeps doing that. Only "nobody is listening" (refused/gone)
+            // means stale; any other failure to probe is reported rather than assumed stale.
+            if !stock_compat {
+                match std::os::unix::net::UnixStream::connect(socket_path) {
+                    Ok(_live) => {
+                        return Err(Error::new(
+                            ErrorKind::AddrInUse,
+                            format!(
+                                "admin socket {} is in use by a running process; stop it, choose \
+                                 another admin address, or set stock_compat to replace it anyway",
+                                socket_path.display()
+                            ),
+                        ));
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            ErrorKind::ConnectionRefused | ErrorKind::NotFound
+                        ) => {}
+                    Err(error) => {
+                        return Err(Error::new(
+                            error.kind(),
+                            format!(
+                                "cannot tell whether admin socket {} is stale: {error}",
+                                socket_path.display()
+                            ),
+                        ));
+                    }
+                }
+            }
+            Some(SocketIdentity::of(&metadata))
+        }
         Ok(_) => {
             return Err(Error::new(
                 ErrorKind::AlreadyExists,
@@ -3216,13 +3255,27 @@ fn bind_admin_unix_private(
         _ => std::path::Path::new("."),
     };
     let mut staging = None;
+    // 8 random hex digits normally; 4 when that would push the staged path past `sun_path` but
+    // the final path itself fits (a squatter then has 65 536 names to guess, still retried on
+    // collision and only able to delay, not redirect, the bind).
+    let parent_length = parent.as_os_str().as_bytes().len();
+    let digits = if parent_length + 1 + 9 + 2 < SUN_PATH_CAPACITY {
+        8
+    } else {
+        4
+    };
     for _ in 0..16 {
         let mut random = [0_u8; 4];
         getrandom::getrandom(&mut random).map_err(Error::other)?;
-        let candidate = parent.join(format!(
-            ".{:02x}{:02x}{:02x}{:02x}",
-            random[0], random[1], random[2], random[3]
-        ));
+        let name = if digits == 8 {
+            format!(
+                ".{:02x}{:02x}{:02x}{:02x}",
+                random[0], random[1], random[2], random[3]
+            )
+        } else {
+            format!(".{:02x}{:02x}", random[0], random[1])
+        };
+        let candidate = parent.join(name);
         // `sun_path` limits the path the socket is *bound* at, which is the staged one.
         let bound_length = candidate.join("s").as_os_str().as_bytes().len();
         if bound_length >= SUN_PATH_CAPACITY
@@ -3274,6 +3327,20 @@ fn bind_admin_unix_private(
 /// `sun_path` capacity including the trailing NUL (108 on Linux, 104 on the BSDs and macOS).
 const SUN_PATH_CAPACITY: usize = if cfg!(target_os = "linux") { 108 } else { 104 };
 
+/// Whether a failed `link(2)` means "this filesystem cannot hard-link" (so the re-checked
+/// `rename` fallback applies) rather than a real failure: `EPERM` (for example FUSE and
+/// `fs.protected_hardlinks`), `EOPNOTSUPP`/`ENOTSUP` and `ENOSYS`. `EACCES`, `EMLINK`, `ENOSPC`,
+/// `EDQUOT`, `EROFS`, `EIO` and the like are surfaced to the operator.
+fn hard_link_unsupported(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code) if code == libc::EPERM
+            || code == libc::EOPNOTSUPP
+            || code == libc::ENOTSUP
+            || code == libc::ENOSYS
+    )
+}
+
 /// Move the already-bound, already-`0600` staged socket to its final path without clobbering
 /// anything that is not the stale socket we saw earlier.
 ///
@@ -3305,13 +3372,18 @@ fn install_staged_socket(
         None => match std::fs::hard_link(staged, final_path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == ErrorKind::AlreadyExists => Err(changed()),
-            Err(_no_hard_links) => match std::fs::symlink_metadata(final_path) {
-                Err(error) if error.kind() == ErrorKind::NotFound => {
-                    std::fs::rename(staged, final_path)
+            Err(error) if hard_link_unsupported(&error) => {
+                match std::fs::symlink_metadata(final_path) {
+                    Err(error) if error.kind() == ErrorKind::NotFound => {
+                        std::fs::rename(staged, final_path)
+                    }
+                    Ok(_) => Err(changed()),
+                    Err(error) => Err(error),
                 }
-                Ok(_) => Err(changed()),
-                Err(error) => Err(error),
-            },
+            }
+            // Permission, quota, link-count and other real failures are reported, not papered
+            // over with a rename that would then be allowed to replace.
+            Err(error) => Err(error),
         },
         Some(expected) => match std::fs::symlink_metadata(final_path) {
             Ok(metadata)
@@ -3336,8 +3408,8 @@ async fn bind_admin_unix(
     api: AdminApi,
 ) -> Result<ListenerHandle, Error> {
     let socket_path = std::path::Path::new(path);
-    let (listener, identity) =
-        bind_admin_unix_private(socket_path).map_err(|error| Error::bind(configured, error))?;
+    let (listener, identity) = bind_admin_unix_private(socket_path, api_stock_compat(&api))
+        .map_err(|error| Error::bind(configured, error))?;
     let (shutdown, mut receiver) = watch::channel(false);
     let (force, mut force_receiver) = watch::channel(false);
     let tracker = Arc::new(ConnectionTracker::default());
@@ -5124,6 +5196,83 @@ mod admin_unix_tests {
             vec![std::ffi::OsString::from("admin.sock")],
             "{names:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_second_listener_does_not_steal_a_live_admin_socket() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (configured, path) = unix_listen(directory.path());
+        let first = bind_admin(&configured, api(), None).await.expect("bind");
+        let error = bind_admin(&configured, api(), None)
+            .await
+            .err()
+            .expect("a live socket must not be replaced");
+        assert!(error.to_string().contains("in use by a running process"), "{error}");
+        // The first instance still owns the path and still answers.
+        let response = raw_exchange(
+            &path,
+            b"GET /config/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        first.stop().await;
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn stock_compat_replaces_a_live_admin_socket_like_stock_caddy() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (configured, path) = unix_listen(directory.path());
+        let first = bind_admin(&configured, api(), None).await.expect("bind");
+        let store = Arc::new(GenerationStore::with_builtin_registry());
+        store
+            .load(
+                caddy_rs_core::Config::from_value(serde_json::json!({"stock_compat": true}))
+                    .expect("config"),
+            )
+            .expect("load");
+        let second = bind_admin(&configured, AdminApi::new(store), None)
+            .await
+            .expect("stock_compat replaces unconditionally");
+        assert!(path.exists());
+        second.stop().await;
+        first.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_final_path_that_fits_binds_when_only_the_short_staging_name_does() {
+        // Parent of 98 bytes: the 8-digit staged path would be 110 bytes (> 107), the 4-digit one
+        // 106; the final path is 105.
+        let (_base, directory) = directory_of_length(98);
+        let path = directory.join("a.sock");
+        assert!(path.as_os_str().len() <= 107);
+        let configured = format!("unix/{}", path.display());
+        let handle = bind_admin(&configured, api(), None)
+            .await
+            .expect("falls back to the short staging name");
+        handle.stop().await;
+    }
+
+    #[test]
+    fn only_unsupported_hard_links_fall_back_to_rename() {
+        let errno = std::io::Error::from_raw_os_error;
+        for code in [libc::EPERM, libc::EOPNOTSUPP, libc::ENOSYS] {
+            assert!(super::hard_link_unsupported(&errno(code)), "errno {code}");
+        }
+        for code in [
+            libc::EACCES,
+            libc::EMLINK,
+            libc::ENOSPC,
+            libc::EDQUOT,
+            libc::EROFS,
+            libc::EIO,
+            libc::EEXIST,
+            libc::ENOENT,
+            libc::EXDEV,
+        ] {
+            assert!(!super::hard_link_unsupported(&errno(code)), "errno {code}");
+        }
+        assert!(!super::hard_link_unsupported(&std::io::Error::other("x")));
     }
 
     #[tokio::test]
