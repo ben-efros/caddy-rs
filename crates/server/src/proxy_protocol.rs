@@ -8,7 +8,8 @@
 //!
 //! Supported configuration (`apps.http.servers.*.listener_wrappers[i]`):
 //!
-//! * `timeout`: maximum time to read the header (Caddy duration; zero/absent disables it);
+//! * `timeout`: maximum time to read the whole header (Caddy duration; zero/absent means
+//!   go-proxyproto's 10 s default, never "unbounded");
 //! * `allow` / `deny`: CIDR ranges. Allowed peers have a PROXY header required/used (`USE`), denied
 //!   peers have a header rejected (`REJECT`); other peers follow `fallback_policy`;
 //! * `fallback_policy`: `IGNORE` (default; use header when present, accept without one), `USE`
@@ -32,6 +33,9 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
 use caddy_rs_core::{ProxyProtocolConfig, ProxyProtocolPolicy};
+
+/// go-proxyproto's `DefaultReadHeaderTimeout`, used when the wrapper's `timeout` is absent or zero.
+const DEFAULT_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum length of a PROXY protocol v1 header line (including CRLF), per the spec.
 const V1_MAX_LEN: usize = 107;
@@ -88,9 +92,12 @@ pub(crate) struct ProxyProtocolSettings {
 impl ProxyProtocolSettings {
     /// Parse the wrapper options from the core configuration.
     pub(crate) fn from_config(config: &ProxyProtocolConfig) -> Result<Self, String> {
+        // go-proxyproto (what Caddy's wrapper uses) treats a zero `ReadHeaderTimeout` as its
+        // 10 s default rather than "no limit", so an absent or zero `timeout` still bounds the
+        // header read and a silent client cannot hold the connection forever.
         let timeout = match config.timeout {
             Some(timeout) if !timeout.is_zero() => Some(timeout.as_duration()),
-            _ => None,
+            _ => Some(DEFAULT_HEADER_TIMEOUT),
         };
         let allow = config
             .allow
@@ -498,7 +505,14 @@ where
     }
 
     let mut stream = stream;
-    let (parsed, prefix) = read_header(&mut stream, settings.timeout).await?;
+    // One deadline over the whole header (go-proxyproto sets a connection read deadline), so a
+    // client trickling a byte at a time cannot stretch it with per-read timeouts.
+    let (parsed, prefix) = match settings.timeout {
+        Some(timeout) => tokio::time::timeout(timeout, read_header(&mut stream, None))
+            .await
+            .map_err(|_| ProxyProtocolError::Timeout(timeout))??,
+        None => read_header(&mut stream, None).await?,
+    };
     let header = match parsed {
         Some(header) => header,
         None => match policy {
@@ -982,6 +996,46 @@ mod tests {
         drop(writer);
         let result = wrap(reader, Some(peer), Some(local), &deny).await;
         assert!(result.is_err(), "a denied peer's PROXY header is rejected");
+    }
+
+    /// A client that connects and sends nothing must not hold the connection forever when the
+    /// wrapper has no `timeout`: go-proxyproto defaults a zero `ReadHeaderTimeout` to 10 s
+    /// (SEC-MEDIUM-ADMIN-SERVER A4 follow-up). Virtual time; fails (hangs until the test timeout
+    /// guard) when the read is unbounded.
+    #[tokio::test(start_paused = true)]
+    async fn silent_client_is_dropped_after_the_default_header_timeout() {
+        for config in [serde_json::json!({}), serde_json::json!({"timeout": 0})] {
+            let config: ProxyProtocolConfig = serde_json::from_value(config).unwrap();
+            let settings = ProxyProtocolSettings::from_config(&config).unwrap();
+            let (_client, server) = tokio::io::duplex(64);
+            let peer: SocketAddr = "198.51.100.9:1234".parse().unwrap();
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(60),
+                wrap(server, Some(peer), None, &settings),
+            )
+            .await
+            .expect("an unbounded PROXY header read never finishes");
+            match outcome {
+                Err(ProxyProtocolError::Timeout(after)) => {
+                    assert_eq!(after, Duration::from_secs(10));
+                }
+                Err(other) => panic!("expected a timeout, got {other}"),
+                Ok(_) => panic!("a silent client must not pass the wrapper"),
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_timeout_overrides_the_default() {
+        let config: ProxyProtocolConfig =
+            serde_json::from_value(serde_json::json!({"timeout": 2_000_000_000_i64})).unwrap();
+        let settings = ProxyProtocolSettings::from_config(&config).unwrap();
+        let (_client, server) = tokio::io::duplex(64);
+        match wrap(server, None, None, &settings).await {
+            Err(ProxyProtocolError::Timeout(after)) => assert_eq!(after, Duration::from_secs(2)),
+            Err(other) => panic!("expected a timeout, got {other}"),
+            Ok(_) => panic!("a silent client must not pass the wrapper"),
+        }
     }
 
     async fn parse_bytes(

@@ -722,3 +722,122 @@ async fn second_load_files_certificate_with_unsupported_key_is_named() {
         "{message}"
     );
 }
+
+/// A TLS listener with a short `read_header_timeout` (and optionally `read_timeout`).
+fn config_with_handshake_budget(read_header_timeout: &str, read_timeout: Option<&str>) -> Config {
+    let mut server = serde_json::json!({
+        "listen": ["127.0.0.1:0"],
+        "tls_connection_policies": [{}],
+        "read_header_timeout": read_header_timeout,
+        "routes": [{"handle": [{"handler": "static_response", "body": "ok"}]}]
+    });
+    if let Some(read_timeout) = read_timeout {
+        server["read_timeout"] = serde_json::json!(read_timeout);
+    }
+    Config::from_value(serde_json::json!({
+        "admin": {"disabled": true},
+        "apps": {
+            "http": {"http_port": 0, "servers": {"srv0": server}},
+            "tls": {"certificates": {"load_pem": [
+                {"certificate": EXAMPLE_CERT, "key": EXAMPLE_KEY}
+            ]}}
+        }
+    }))
+    .expect("test config decodes")
+}
+
+/// Wait up to `limit` for the server to close `stream`; `true` when it did (EOF or reset).
+async fn closed_within(stream: &mut TcpStream, limit: Duration) -> bool {
+    let mut buffer = [0_u8; 256];
+    tokio::time::timeout(limit, async {
+        loop {
+            match stream.read(&mut buffer).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await
+    .is_ok()
+}
+
+// SEC-MEDIUM-ADMIN-SERVER A4: Go bounds the TLS handshake by min(ReadTimeout, ReadHeaderTimeout);
+// before the fix a silent or partial ClientHello pinned a task and a descriptor forever.
+#[tokio::test]
+async fn silent_tls_client_is_dropped_after_the_read_header_timeout() {
+    let (runtime, address, _data) = start(config_with_handshake_budget("300ms", None)).await;
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    let started = std::time::Instant::now();
+    assert!(
+        closed_within(&mut stream, Duration::from_secs(5)).await,
+        "a client that never sends a ClientHello must be disconnected"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(250),
+        "the budget is not applied early: {:?}",
+        started.elapsed()
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn partial_client_hello_is_dropped_after_the_budget() {
+    let (runtime, address, _data) = start(config_with_handshake_budget("300ms", None)).await;
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    // A TLS record header announcing 512 handshake bytes, then silence.
+    stream
+        .write_all(&[0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00])
+        .await
+        .expect("write partial hello");
+    assert!(
+        closed_within(&mut stream, Duration::from_secs(5)).await,
+        "a stalled partial ClientHello must be disconnected"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn read_timeout_tightens_the_handshake_budget_like_go() {
+    // read_header_timeout is generous (1h) but read_timeout is 300ms: Go uses the smaller.
+    let (runtime, address, _data) = start(config_with_handshake_budget("1h", Some("300ms"))).await;
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    assert!(
+        closed_within(&mut stream, Duration::from_secs(5)).await,
+        "min(read_timeout, read_header_timeout) bounds the handshake"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn prompt_tls_handshake_still_succeeds_under_a_budget() {
+    let (runtime, address, _data) = start(config_with_handshake_budget("5s", None)).await;
+    let _stream =
+        tls_connect_with_roots(address, "example.com", &["http/1.1"], &[EXAMPLE_CERT]).await;
+    runtime.shutdown().await;
+}
+
+// A connection that is still in its TLS handshake when the runtime force-closes must not outlive
+// the shutdown: before the fix the handshake did not observe the force signal, so shutdown waited
+// out its whole 2 s drain ("listener tasks are detached") and the socket stayed open.
+#[tokio::test]
+async fn forced_shutdown_closes_connections_still_in_the_tls_handshake() {
+    let (runtime, address, _data) = start(config_with_handshake_budget("1h", None)).await;
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    stream
+        .write_all(&[0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00])
+        .await
+        .expect("write partial hello");
+    // Let the server accept and enter the handshake.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let started = std::time::Instant::now();
+    runtime.shutdown().await;
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "forced shutdown must not wait for a half-open handshake: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        closed_within(&mut stream, Duration::from_secs(1)).await,
+        "the half-open connection is closed by the forced shutdown"
+    );
+}
