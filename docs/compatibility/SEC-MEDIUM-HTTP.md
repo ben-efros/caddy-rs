@@ -167,3 +167,55 @@ directory that may contain such files must configure `hide` explicitly, for exam
 auto-hides its own config and data directories (see `auto_hide_entries`); that is unrelated.
 
 Register: no divergence; no entry proposed.
+
+## B5. `templates`: `env` function and default root (stock parity kept, opt-in allow list added)
+
+### Upstream source of truth (Caddy v2.11.9)
+
+- `modules/caddyhttp/templates/tplcontext.go` `funcEnv` returns `os.Getenv(varName)` for any name,
+  and the `placeholder` function resolves `env.NAME` through the replacer, so a template author can
+  read every process environment variable (database passwords, API keys). The default `file_root`
+  is the request's `{http.vars.root}`, falling back to the working directory (`templates.go`
+  `Provision`/`ServeHTTP`). This build matches both, intentionally; neither was changed.
+
+### Opt-in hardening: `env_allow`
+
+A caddy-rs extension field on the `templates` handler, `env_allow`: an array of exact environment
+variable names (non-empty strings; matching is case-sensitive). When present, `env "NAME"` and
+`placeholder "env.NAME"` / `ph "env.NAME"` (which would otherwise bypass the list) can read only
+the listed variables; any other name aborts the template with an execution error, which the
+transform reports as an empty 500 (a loud failure, not an empty string that would hide the
+misconfiguration). `env_allow: []` denies every variable. Absent or `null` is exactly stock
+behaviour. A non-array value or a non-string/empty element is a located config error
+(`<path>.env_allow` / `<path>.env_allow[N]`).
+
+Recommended for any deployment where template authors are less trusted than the process owner.
+Related operator guidance: do not run `templates` over content users can upload, and keep
+`file_root` narrow (file functions are already confined to it).
+
+### stock_compat
+
+Not tied to `stock_compat`: the field is opt-in, so omitting it is stock Caddy in both modes, and
+setting it is an explicit operator choice that `stock_compat` does not override.
+
+### Tests
+
+`crates/http/src/templates.rs`: `env_is_unrestricted_without_env_allow_like_stock_caddy`,
+`env_allow_restricts_env_and_the_env_placeholder`, `empty_env_allow_denies_every_variable`,
+`env_allow_config_is_validated_with_located_errors` (the last three failed before: `env_allow` was
+an unknown field).
+
+Register: extension, no divergence from stock for existing configurations. Proposed entry:
+
+```
+- DIV id: (assign)
+- Area: HTTP
+- Caddy behaviour: the `templates` `env` function and the `env.` placeholder read any process
+  environment variable; there is no way to restrict them.
+- caddy-rs behaviour: the optional `env_allow` field (array of exact names) restricts both to the
+  listed variables; other names are a template error (HTTP 500). Absent = stock behaviour.
+- Rationale: opt-in defence in depth against secret disclosure by template authors without changing
+  any existing configuration.
+- Status: extension
+- Test: `crates/http/src/templates.rs` `env_allow_restricts_env_and_the_env_placeholder`
+```
