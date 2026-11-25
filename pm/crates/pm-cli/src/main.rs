@@ -1127,10 +1127,8 @@ async fn serve(global: GlobalArgs, args: ServeArgs) -> Result<(), CliError> {
     info!(management_addr = %local_addr, "management API listening");
 
     // Systemd readiness notification.
-    let sd_notify_enabled = !args.no_sd_notify && sd_notify::booted().unwrap_or(false);
-    if sd_notify_enabled {
-        sd_notify::notify(true, &[NotifyState::Ready])
-            .map_err(|e| CliError::SdNotify(e.to_string()))?;
+    if should_notify_systemd(args.no_sd_notify, sd_notify::booted()) {
+        sd_notify::notify(&[NotifyState::Ready]).map_err(|e| CliError::SdNotify(e.to_string()))?;
         info!("systemd readiness notification sent");
     }
 
@@ -1745,9 +1743,43 @@ fn decode_token_claims(token: &str) -> Result<serde_json::Value, CliError> {
     Ok(claims)
 }
 
+/// Whether to send the systemd readiness notification.
+///
+/// Split out of `serve` so the decision is testable without binding a port: `--no-sd-notify` always
+/// wins, and an environment that cannot answer "am I under systemd?" (`booted()` erroring, e.g. a
+/// sandbox where `/run/systemd/system` is unreadable) is treated as "not under systemd" rather than
+/// failing the start-up — a readiness notification is a nicety, not a precondition for serving.
+fn should_notify_systemd(no_sd_notify: bool, booted: std::io::Result<bool>) -> bool {
+    !no_sd_notify && booted.unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The readiness notification is sent only when the daemon is under systemd and was not told
+    /// to skip it. Covers the four combinations, including the error case: `booted()` fails in a
+    /// sandbox where `/run/systemd/system` is unreadable, and that must not stop the daemon from
+    /// starting (the previous code used the same `unwrap_or(false)` inline, so this pins it).
+    #[test]
+    fn the_readiness_notification_is_sent_only_under_systemd_and_only_when_enabled() {
+        assert!(
+            should_notify_systemd(false, Ok(true)),
+            "under systemd, flag absent: notify"
+        );
+        assert!(
+            !should_notify_systemd(true, Ok(true)),
+            "--no-sd-notify always wins"
+        );
+        assert!(
+            !should_notify_systemd(false, Ok(false)),
+            "not under systemd: nothing to notify"
+        );
+        assert!(
+            !should_notify_systemd(false, Err(std::io::Error::other("unreadable"))),
+            "an undeterminable environment must not fail start-up"
+        );
+    }
 
     /// Assert a unit line has exactly one `key=` label and return its value.
     ///
