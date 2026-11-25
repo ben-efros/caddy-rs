@@ -1154,6 +1154,25 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_text_in_global_security_headers_rejects_assembly() {
+        // E3: a persisted global config (written before validation existed, or by another path)
+        // must not reach the data plane carrying `{env.*}`.
+        let hosts = vec![proxy_host(1, &["example.com"], HostTls::disabled())];
+        let settings = ConfigSettings::default().with_security_headers(headers_config(json!({
+            "content_security_policy": "{env.CF_API_TOKEN}"
+        })));
+
+        let error = assemble_from_hosts(&hosts, &settings).expect_err("placeholder rejected");
+        assert!(
+            matches!(
+                error,
+                ConfigError::InvalidSecurityHeaders { host_id: 1, .. }
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn empty_security_headers_object_uses_secure_defaults() {
         let security = headers_config(json!({}));
         assert_eq!(security.x_frame_options.as_deref(), Some("DENY"));
