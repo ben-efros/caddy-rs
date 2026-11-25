@@ -1789,8 +1789,8 @@ async fn serve_wrapped<I>(
     context: ConnectionContext,
     permit: ConnectionPermit,
     generation: Option<Arc<Generation>>,
-    shutdown: watch::Receiver<bool>,
-    force: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<bool>,
+    mut force: watch::Receiver<bool>,
     tracked: TrackedConnection,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1799,7 +1799,20 @@ async fn serve_wrapped<I>(
         .wrappers
         .proxy_protocol()
     {
-        Some(settings) => match crate::proxy_protocol::wrap(stream, peer, local, settings).await {
+        Some(settings) => match bounded_handshake(
+            crate::proxy_protocol::wrap(stream, peer, local, settings),
+            // The wrapper enforces its own (default 10 s) header deadline; this only adds the
+            // shutdown signals.
+            Duration::from_secs(86_400),
+            &mut shutdown,
+            &mut force,
+        )
+        .await
+        .unwrap_or_else(|abort| {
+            Err(crate::proxy_protocol::ProxyProtocolError::Io(io::Error::other(
+                format!("connection abandoned during shutdown: {abort:?}"),
+            )))
+        }) {
             Ok(wrapped) => wrapped,
             Err(error) => {
                 tracing::warn!(
@@ -1832,6 +1845,51 @@ async fn serve_wrapped<I>(
     .await;
 }
 
+/// How long a connection still in its TLS handshake (or PROXY header read) may live after a
+/// graceful stop begins. Go's `Server.Shutdown` closes connections that never got past `StateNew`
+/// once they are a few seconds old rather than waiting for them.
+const HANDSHAKE_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Why a pre-request phase (PROXY header, TLS handshake) was abandoned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhaseAbort {
+    /// The budget ran out.
+    TimedOut,
+    /// A graceful stop began and [`HANDSHAKE_SHUTDOWN_GRACE`] elapsed.
+    ShutdownGrace,
+    /// A forced shutdown.
+    Forced,
+}
+
+/// Drive `phase` to completion, but give up after `budget`, when a forced shutdown arrives, or
+/// [`HANDSHAKE_SHUTDOWN_GRACE`] after a graceful one begins. Without this a half-open handshake
+/// ignored the shutdown signals and kept its tracker guard (and task) until its own budget ended.
+async fn bounded_handshake<F: Future>(
+    phase: F,
+    budget: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+    force: &mut watch::Receiver<bool>,
+) -> Result<F::Output, PhaseAbort> {
+    use tokio::time::Instant;
+    tokio::pin!(phase);
+    let budget_end = Instant::now() + budget;
+    let mut grace_end: Option<Instant> = None;
+    loop {
+        let (deadline, on_deadline) = match grace_end {
+            Some(grace_end) if grace_end < budget_end => (grace_end, PhaseAbort::ShutdownGrace),
+            _ => (budget_end, PhaseAbort::TimedOut),
+        };
+        tokio::select! {
+            output = &mut phase => return Ok(output),
+            _ = tokio::time::sleep_until(deadline) => return Err(on_deadline),
+            _ = force.changed() => return Err(PhaseAbort::Forced),
+            _ = shutdown.changed(), if grace_end.is_none() => {
+                grace_end = Some(Instant::now() + HANDSHAKE_SHUTDOWN_GRACE);
+            }
+        }
+    }
+}
+
 /// Terminate TLS when the listener is a TLS listener, then serve the connection.
 #[allow(clippy::too_many_arguments)]
 async fn serve_accepted<I>(
@@ -1842,8 +1900,8 @@ async fn serve_accepted<I>(
     context: ConnectionContext,
     permit: ConnectionPermit,
     generation: Option<Arc<Generation>>,
-    shutdown: watch::Receiver<bool>,
-    force: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<bool>,
+    mut force: watch::Receiver<bool>,
     tracked: TrackedConnection,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1875,9 +1933,11 @@ async fn serve_accepted<I>(
             // A token-held key signs inside the PKCS#11 token: hold a token handshake permit and
             // bound the whole handshake by the token budget (T-TLS-097).
             Some(pool) => {
-                match tokio::time::timeout(
-                    handshake_timeout,
+                match bounded_handshake(
                     caddy_rs_tls::tls_server::accept_external_key_handshake(acceptor, stream, pool),
+                    handshake_timeout,
+                    &mut shutdown,
+                    &mut force,
                 )
                 .await
                 {
@@ -1888,13 +1948,20 @@ async fn serve_accepted<I>(
                         tracing::debug!(%error, "TLS handshake failed");
                         return;
                     }
-                    Err(_elapsed) => {
-                        tracing::debug!(?handshake_timeout, "TLS handshake timed out");
+                    Err(abort) => {
+                        tracing::debug!(?handshake_timeout, ?abort, "TLS handshake abandoned");
                         return;
                     }
                 }
             }
-            None => match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
+            None => match bounded_handshake(
+                acceptor.accept(stream),
+                handshake_timeout,
+                &mut shutdown,
+                &mut force,
+            )
+            .await
+            {
                 Ok(Ok(stream)) => stream,
                 Ok(Err(error)) => {
                     // TLS handshake failures are client-side errors (wrong SNI, protocol
@@ -1902,8 +1969,8 @@ async fn serve_accepted<I>(
                     tracing::debug!(%error, "TLS handshake failed");
                     return;
                 }
-                Err(_elapsed) => {
-                    tracing::debug!(?handshake_timeout, "TLS handshake timed out");
+                Err(abort) => {
+                    tracing::debug!(?handshake_timeout, ?abort, "TLS handshake abandoned");
                     return;
                 }
             },
@@ -3990,6 +4057,110 @@ mod client_certificate_tests {
             !unverified.verified,
             "an unverified listener must not claim verification"
         );
+    }
+}
+
+/// Virtual-time tests for [`bounded_handshake`]: a half-open handshake must observe the shutdown
+/// signals (SEC-MEDIUM-ADMIN-SERVER A4 follow-up).
+#[cfg(test)]
+mod bounded_handshake_tests {
+    use super::{bounded_handshake, PhaseAbort, HANDSHAKE_SHUTDOWN_GRACE};
+    use std::time::Duration;
+    use tokio::sync::watch;
+
+    fn channels() -> (
+        watch::Sender<bool>,
+        watch::Sender<bool>,
+        watch::Receiver<bool>,
+        watch::Receiver<bool>,
+    ) {
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (force, force_rx) = watch::channel(false);
+        (shutdown, force, shutdown_rx, force_rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completes_when_the_phase_finishes_first() {
+        let (_s, _f, mut shutdown, mut force) = channels();
+        let result = bounded_handshake(
+            async { 7_u8 },
+            Duration::from_secs(60),
+            &mut shutdown,
+            &mut force,
+        )
+        .await;
+        assert_eq!(result, Ok(7));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn times_out_at_the_budget() {
+        let (_s, _f, mut shutdown, mut force) = channels();
+        let started = tokio::time::Instant::now();
+        let result = bounded_handshake(
+            std::future::pending::<()>(),
+            Duration::from_secs(60),
+            &mut shutdown,
+            &mut force,
+        )
+        .await;
+        assert_eq!(result, Err(PhaseAbort::TimedOut));
+        assert_eq!(started.elapsed(), Duration::from_secs(60));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forced_shutdown_abandons_immediately() {
+        let (_s, force, mut shutdown, mut force_rx) = channels();
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move {
+            bounded_handshake(
+                std::future::pending::<()>(),
+                Duration::from_secs(3600),
+                &mut shutdown,
+                &mut force_rx,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        force.send(true).unwrap();
+        assert_eq!(task.await.unwrap(), Err(PhaseAbort::Forced));
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn graceful_shutdown_caps_the_remaining_budget() {
+        let (shutdown_tx, _f, mut shutdown, mut force) = channels();
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move {
+            bounded_handshake(
+                std::future::pending::<()>(),
+                Duration::from_secs(3600),
+                &mut shutdown,
+                &mut force,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        shutdown_tx.send(true).unwrap();
+        assert_eq!(task.await.unwrap(), Err(PhaseAbort::ShutdownGrace));
+        assert_eq!(started.elapsed(), Duration::from_secs(2) + HANDSHAKE_SHUTDOWN_GRACE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_nearly_spent_budget_is_not_extended_by_the_shutdown_grace() {
+        let (shutdown_tx, _f, mut shutdown, mut force) = channels();
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move {
+            bounded_handshake(
+                std::future::pending::<()>(),
+                Duration::from_secs(3),
+                &mut shutdown,
+                &mut force,
+            )
+            .await
+        });
+        shutdown_tx.send(true).unwrap();
+        assert_eq!(task.await.unwrap(), Err(PhaseAbort::TimedOut));
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
     }
 }
 

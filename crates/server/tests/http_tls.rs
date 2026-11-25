@@ -815,3 +815,29 @@ async fn prompt_tls_handshake_still_succeeds_under_a_budget() {
         tls_connect_with_roots(address, "example.com", &["http/1.1"], &[EXAMPLE_CERT]).await;
     runtime.shutdown().await;
 }
+
+// A connection that is still in its TLS handshake when the runtime force-closes must not outlive
+// the shutdown: before the fix the handshake did not observe the force signal, so shutdown waited
+// out its whole 2 s drain ("listener tasks are detached") and the socket stayed open.
+#[tokio::test]
+async fn forced_shutdown_closes_connections_still_in_the_tls_handshake() {
+    let (runtime, address, _data) = start(config_with_handshake_budget("1h", None)).await;
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    stream
+        .write_all(&[0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00])
+        .await
+        .expect("write partial hello");
+    // Let the server accept and enter the handshake.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let started = std::time::Instant::now();
+    runtime.shutdown().await;
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "forced shutdown must not wait for a half-open handshake: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        closed_within(&mut stream, Duration::from_secs(1)).await,
+        "the half-open connection is closed by the forced shutdown"
+    );
+}
