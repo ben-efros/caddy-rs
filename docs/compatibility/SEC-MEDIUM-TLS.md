@@ -207,3 +207,34 @@ No existing DIV entry. Optional note under the TLS/ACME area of `BEHAVIOR-DIVERG
 > caddy-rs caps every ACME/OCSP/CA-bundle HTTP response body at 4 MiB and fails the request with a
 > located transport error beyond that; stock Caddy relies on bounded readers inside acmez/certmagic.
 > This is a hardening with no configuration surface and no `stock_compat` switch.
+
+## D4 — `Debug` of stored certificates and CSRs redacts private keys
+
+### Upstream
+
+Not applicable: Go's `fmt` does not print `certmagic.CertificateResource.PrivateKeyPEM` unless asked,
+and certmagic never logs the resource; the concern is specific to Rust's derived `Debug`.
+
+### Previous caddy-rs behaviour
+
+`StoredCertificate` (`crates/tls/src/storage.rs`) and `CertificateRequest`
+(`crates/tls/src/acme/csr.rs`) derived `Debug`, so `{:?}` printed the PKCS#8 private key PEM. Any
+`tracing` field, `unwrap()`/`expect()` message, `dbg!`, error chain, or the derived `Debug` of
+`MemoryStorage` (it prints its stored values) would write the private key to logs.
+
+### Implemented behaviour (unconditional)
+
+Both types have a manual `Debug`, in the style of `TokenCertificateKey`, that prints
+`private_key_pem: "<redacted>"` (or `"<empty>"` for token-held records with no PEM) and every other
+field unchanged. Serialization, equality and storage formats are untouched.
+
+### Tests
+
+`crates/tls/src/storage.rs::debug_output_never_contains_private_key_material` (plain and `{:#?}`
+output of `StoredCertificate` and of a populated `MemoryStorage`; token-held marker);
+`crates/tls/src/acme/csr.rs::certificate_request_debug_never_contains_the_private_key`. Both failed on
+the derived `Debug` and pass with the manual one.
+
+### Exact program-repository text to merge
+
+None: no divergence from stock Caddy (internal hardening, no configuration surface).

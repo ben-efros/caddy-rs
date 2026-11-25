@@ -168,13 +168,32 @@ pub trait CsrSigner {
 }
 
 /// A generated certificate signing request and its private key.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CertificateRequest {
     der: Vec<u8>,
     private_key_pem: String,
     public_key: Vec<u8>,
     key_type: CertificateKeyType,
     domains: Vec<String>,
+}
+
+/// Manual `Debug` that redacts the generated private key (SEC-MEDIUM D4).
+impl std::fmt::Debug for CertificateRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let private_key = if self.private_key_pem.is_empty() {
+            "<empty>"
+        } else {
+            "<redacted>"
+        };
+        formatter
+            .debug_struct("CertificateRequest")
+            .field("der", &self.der)
+            .field("private_key_pem", &private_key)
+            .field("public_key", &self.public_key)
+            .field("key_type", &self.key_type)
+            .field("domains", &self.domains)
+            .finish()
+    }
 }
 
 impl CertificateRequest {
@@ -1061,6 +1080,22 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use aws_lc_rs::signature::UnparsedPublicKey;
+
+    /// SEC-MEDIUM D4 (same class as `StoredCertificate`): `{:?}` of a CSR must not print the
+    /// generated private key.
+    #[test]
+    fn certificate_request_debug_never_contains_the_private_key() {
+        let request = CertificateRequest::generate(&["example.test".to_string()]).unwrap();
+        let pem = request.private_key_pem().to_string();
+        assert!(pem.contains("PRIVATE KEY"), "fixture must carry a PEM key");
+        let body_line = pem.lines().nth(1).expect("PEM body line").to_string();
+        for debug in [format!("{request:?}"), format!("{request:#?}")] {
+            assert!(!debug.contains(&body_line), "{debug}");
+            assert!(!debug.contains("PRIVATE KEY"), "{debug}");
+            assert!(debug.contains("CertificateRequest"), "{debug}");
+            assert!(debug.contains("example.test"), "{debug}");
+        }
+    }
 
     const RSA_4096_CERT_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
 MIIJQgIBADANBgkqhkiG9w0BAQEFAASCCSwwggkoAgEAAoICAQCh1JZxoHuUBRPg
