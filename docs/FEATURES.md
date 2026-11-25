@@ -245,6 +245,19 @@ continue down the handler chain, so place the handler before the ones it protect
 `unix//path`, or a placeholder that expands per request. Per-upstream `max_requests` caps how many
 requests may run against that upstream at once.
 
+#### Request-derived dials (SSRF guard)
+
+A dial that contains placeholders (`{http.request.header.X-Backend}:80`) is chosen partly by the
+client, and `dynamic_upstreams` names may be request-derived too. By default such connections are refused when the resolved address is loopback, unspecified, link-local (including
+`169.254.169.254`), multicast, broadcast, `100.64.0.0/10`, `192.0.0.192` or `fd00:ec2::/32`, and
+`unix/` targets are refused. The handler field `dial_allow` is the placeholder-free allow list:
+IP addresses or CIDR ranges that may be dialled despite the rule (`["127.0.0.0/8"]`) and
+`unix/<absolute path>` prefixes (`["unix//run/app"]`). `dial_allow` is JSON-only (no Caddyfile
+syntax) and a malformed entry fails at load with the JSON path. `stock_compat true` disables the
+guard (stock Caddy dials whatever the expansion yields). The per-expansion client cache is capped
+at 1024 entries (least recently used evicted). See
+[SEC-MEDIUM-PROXY](compatibility/SEC-MEDIUM-PROXY.md).
+
 ### Load balancing
 
 Set `load_balancing.selection_policy` to choose a policy. The default is `random`.

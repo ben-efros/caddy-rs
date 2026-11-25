@@ -43,6 +43,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::client::TlsStream;
 use tower_service::Service;
 
+use crate::dial_guard::DialGuard;
 use crate::dns::{DnsResolver, IpVersion, ResolverAddress, SystemDnsResolver};
 use crate::tls::UpstreamTls;
 use crate::upstream::{Transport, Upstream};
@@ -281,6 +282,10 @@ pub struct TransportTuning {
     /// `MaxConnsPerHost` bucket. Sharing the map is what keeps the normal client and the
     /// HTTP/1.1-only upgrade client for one upstream under a single limit.
     pub(crate) conn_limiters: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    /// Egress policy applied to the *resolved* addresses of every dial made with this tuning
+    /// (SEC-MEDIUM-PROXY C3). `None` (the default and fixed upstreams) dials anything; clients for
+    /// request-derived dials carry a [`DialGuard`].
+    pub dial_guard: Option<Arc<DialGuard>>,
 }
 
 impl Default for TransportTuning {
@@ -293,9 +298,13 @@ impl Default for TransportTuning {
             local_address: None,
             resolver: None,
             conn_limiters: Arc::new(Mutex::new(HashMap::new())),
+            dial_guard: None,
         }
     }
 }
+
+/// Size at which [`TransportTuning::connection_limiter`] starts discarding idle per-dial limiters.
+const MAX_CONNECTION_LIMITERS: usize = 4096;
 
 impl TransportTuning {
     /// The `max_conns_per_host` limiter for `dial`, created once per dial and shared by every
@@ -308,6 +317,13 @@ impl TransportTuning {
             .conn_limiters
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Request-derived dials add one entry per distinct expansion; drop the limiters no live
+        // connection holds once the map is large so it cannot grow without bound
+        // (SEC-MEDIUM-PROXY C3). A dropped idle limiter is recreated on demand, which is
+        // equivalent because no connection is counted against it.
+        if limiters.len() >= MAX_CONNECTION_LIMITERS && !limiters.contains_key(dial) {
+            limiters.retain(|_, limiter| Arc::strong_count(limiter) > 1);
+        }
         Some(Arc::clone(
             limiters
                 .entry(dial.to_string())
@@ -912,6 +928,26 @@ async fn acquire_connection_permit(
 async fn dial_tcp(address: &str, tuning: &TransportTuning) -> io::Result<TcpStream> {
     let (host, port) = split_host_port(address)?;
     let mut addresses = resolve_upstream(host, port, tuning).await?;
+    if let Some(guard) = &tuning.dial_guard {
+        // Filter the resolved addresses (not the dial text): a host name that resolves to a
+        // restricted address is refused exactly like the literal.
+        let mut refusal = None;
+        addresses.retain(|address| match guard.check_ip(address.ip()) {
+            Ok(()) => true,
+            Err(message) => {
+                refusal.get_or_insert(message);
+                false
+            }
+        });
+        if addresses.is_empty() {
+            if let Some(message) = refusal {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("upstream `{address}`: {message}"),
+                ));
+            }
+        }
+    }
     if let Some(local) = tuning.local_address {
         addresses.retain(|address| address.is_ipv4() == local.is_ipv4());
         if addresses.is_empty() {

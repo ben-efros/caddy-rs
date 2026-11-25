@@ -90,6 +90,58 @@ route, IPv6 ranges, mapped range spelling, mixed families, matcher on a mapped p
 `crates/proxy/src/trusted_proxies.rs` `ipv4_mapped_ipv6_addresses_are_canonicalised` (mapped peer,
 mapped forwarded entries, strict and non-strict, untrusted mapped peer).
 
+## C3 — request-derived dials: SSRF guard and bounded caches
+
+### Upstream source of truth (v2.11.9)
+
+`modules/caddyhttp/reverseproxy/reverseproxy.go` (`Upstream.Dial` expanded with the replacer in
+`fillDialInfo`) and `upstream.go`: Caddy permits placeholders in `dial` and dials whatever the
+expansion yields. This is stock behaviour; caddy-rs hardens it.
+
+### The weakness
+
+With `dial {http.request.header.X-Backend}:80` a client sends `X-Backend: 169.254.169.254` (cloud
+metadata) or `unix//var/run/docker.sock`. Separately, every distinct expansion added a cached client
+(`dynamic_clients`), a `max_conns_per_host` limiter and, for discovery, a `dynamic_hosts` entry that
+were never evicted, so a client choosing the expansion could grow memory without bound.
+
+### Implemented behaviour
+
+- **Caches (unconditional, behaviour-preserving).** `dynamic_clients` is an LRU capped at 1024
+  entries (`MAX_DYNAMIC_CLIENTS`); the least recently used pair is dropped on insert and its pool is
+  released when in-flight requests finish. `dynamic_hosts` keeps only the current pool or hosts with
+  requests in flight once it exceeds 1024. The per-dial `max_conns_per_host` limiter map drops
+  limiters that no live connection holds once it reaches 4096.
+- **Egress guard (secure default; `stock_compat true` = stock).** Clients created for request-derived
+  dials (placeholder dials and `dynamic_upstreams` discoveries) carry a `DialGuard`
+  (`crates/proxy/src/dial_guard.rs`). The check runs in `dial_tcp` on the **resolved** addresses, so a
+  hostname resolving to a restricted address is refused too (also on the IPv4-mapped form). Refused by
+  default: loopback, unspecified, link-local (`169.254.0.0/16`, `fe80::/10`), multicast, broadcast,
+  `100.64.0.0/10`, `192.0.0.192`, `fd00:ec2::/32`. RFC 1918 and ULA private ranges are NOT refused so
+  ordinary internal backends keep working. Unix-socket expansions are refused unless the path lies
+  below a `unix/<absolute prefix>` allow entry (a `..` component or relative path is never allowed;
+  symlinks are not resolved).
+- **`dial_allow` (new handler field, JSON only).** The placeholder-free allow list: IP/CIDR entries
+  and `unix/<absolute path prefix>` entries. A malformed entry is a located load error
+  (`...dial_allow[i]`); the field is validated in every mode.
+- **`stock_compat true`** builds the handler with the guard off: stock behaviour (no check).
+  Directly constructed handlers (tests/embedders) also default to the guard off, like the security
+  profile; the router factories pass `!stock_compat`.
+
+Known limits: a DNS name can change between the guard's resolution and the dial only inside the one
+`dial_tcp` call (the same resolved list is dialled), so there is no rebind window; NAT64/6to4 spellings
+of restricted IPv4 addresses are not recognised; `dial_allow` has no host-name entries.
+
+### Tests that pin it
+
+`crates/proxy/src/dial_guard.rs` (restricted/ordinary address tables, allow entries, unix prefixes,
+malformed entries); `crates/proxy/src/handler.rs`
+`request_derived_dials_cannot_reach_restricted_addresses_by_default`,
+`dial_allow_and_stock_compat_permit_what_the_guard_denies`, `unix_expansions_need_a_dial_allow_prefix`,
+`factory_enables_the_dial_guard_unless_stock_compat`, `dial_allow_is_validated_at_load`,
+`dynamic_client_cache_is_bounded_and_evicts_least_recently_used`,
+`dynamic_hosts_are_bounded_but_keep_the_current_pool`.
+
 ## Proposed register entries (program repository)
 
 ```text
@@ -124,4 +176,24 @@ mapped forwarded entries, strict and non-strict, untrusted mapped peer).
 - Tracking: SEC-MEDIUM-PROXY C2
 - Test: `crates/l4/src/matchers.rs` `ipv4_mapped_ipv6_peers_match_ipv4_ranges`;
   `crates/proxy/src/trusted_proxies.rs` `ipv4_mapped_ipv6_addresses_are_canonicalised`
+```
+
+```text
+## DIV-NNNN — request-derived reverse_proxy dials are checked against an egress guard
+
+- Area: reverse_proxy
+- Caddy behaviour: a placeholder in `dial` (or a request-derived dynamic-upstream name) is expanded
+  and dialled without restriction, including loopback, link-local/metadata addresses and Unix
+  sockets; per-expansion state is never evicted.
+- caddy-rs behaviour: resolved addresses of request-derived dials in loopback, unspecified,
+  link-local, multicast, broadcast, 100.64.0.0/10, 192.0.0.192 or fd00:ec2::/32, and Unix-socket
+  expansions, are refused unless the handler's `dial_allow` lists them. `stock_compat true` disables
+  the check. Per-expansion clients, limiters and discovered hosts are bounded (LRU / in-use only).
+- Rationale: prevents SSRF to cloud metadata and local sockets through client-controlled dials and
+  unbounded memory growth through distinct expansions.
+- Status: intentional divergence, secure default (caches: parity-preserving)
+- Tracking: SEC-MEDIUM-PROXY C3
+- Test: `crates/proxy/src/handler.rs` `request_derived_dials_cannot_reach_restricted_addresses_by_default`,
+  `dial_allow_and_stock_compat_permit_what_the_guard_denies`,
+  `dynamic_client_cache_is_bounded_and_evicts_least_recently_used`
 ```

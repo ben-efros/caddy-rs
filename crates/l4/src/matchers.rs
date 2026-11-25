@@ -1011,7 +1011,10 @@ mod tests {
     fn ipv4_mapped_ipv6_peers_match_ipv4_ranges() {
         let mapped: IpAddr = "::ffff:203.0.113.7".parse().unwrap();
         let v4_range = IpRange::parse("203.0.113.0/24").unwrap();
-        assert!(v4_range.contains(mapped), "mapped peer is inside the v4 range");
+        assert!(
+            v4_range.contains(mapped),
+            "mapped peer is inside the v4 range"
+        );
         assert!(!v4_range.contains("::ffff:203.0.114.7".parse().unwrap()));
         assert!(IpRange::parse("0.0.0.0/0").unwrap().contains(mapped));
         assert!(IpRange::parse("203.0.113.7").unwrap().contains(mapped));
