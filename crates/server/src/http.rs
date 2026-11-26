@@ -185,21 +185,34 @@ pub(crate) async fn serve_request_with_automatic(
     }
 }
 
-/// Serve one already-buffered request through the router (the HTTP/3 path).
+/// The request body of one HTTP/3 request, as handed to the router.
+#[cfg(feature = "http3")]
+pub(crate) enum H3RequestBody {
+    /// The whole body, already collected (bounded and reserved against the buffered-body budget by
+    /// the caller). Used when a handler in the route tree needs the complete body up front.
+    Buffered(Bytes),
+    /// A body fed chunk by chunk from the QUIC stream while the handler consumes it, so a file of
+    /// any size flows through without being held in memory. The status is set by the body reader
+    /// when the upload fails (timeout, length mismatch, transport error); see [`serve_internal_h3`].
+    Streaming(StreamingBody, Arc<std::sync::atomic::AtomicU16>),
+}
+
+/// Serve one HTTP/3 request through the router.
 ///
-/// HTTP/3 requests arrive through `h3` as `http::Request<()>` plus a stream; the server collects
-/// the request body first (bounded by the server's `max_request_body_size`, matching the buffered
-/// HTTP/1.1 path) and then runs the exact same internal [`caddy_rs_http::Request`] pipeline as
+/// HTTP/3 requests arrive through `h3` as `http::Request<()>` plus a stream. The body is either
+/// already collected (bounded by the buffered-body limit and budget) or a stream the handlers pull
+/// from, bounded lazily by `max_request_body_size` exactly like HTTP/1.1 and HTTP/2. This then runs
+/// the exact same internal [`caddy_rs_http::Request`] pipeline as
 /// HTTP/1.1/HTTP/2: server-level trusted-proxy resolution, `tls.alpn`, local-address variables and
 /// [`caddy_rs_http::Router::handle_upgradable`]. Protocol upgrades (WebSocket/WebTransport) are not
 /// supported over HTTP/3 and are reported as `501 Not Implemented` instead of a silent downgrade.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "http3")]
-pub(crate) async fn serve_internal_buffered(
+pub(crate) async fn serve_internal_h3(
     limits: &ServerLimits,
     router: Arc<Router>,
     parts: http::request::Parts,
-    body: Bytes,
+    body: H3RequestBody,
     remote_addr: Option<SocketAddr>,
     local_addr: Option<SocketAddr>,
     tls: bool,
@@ -230,7 +243,7 @@ pub(crate) async fn serve_internal_buffered(
             );
         }
     }
-    if let Some(limit) = limit {
+    if let (Some(limit), H3RequestBody::Buffered(body)) = (limit, &body) {
         if body.len() as u64 > limit {
             return served_response_with_identity(
                 limits,
@@ -249,10 +262,23 @@ pub(crate) async fn serve_internal_buffered(
     internal.tls_connection = tls_connection;
     internal.client_certificate = client_certificate;
     internal.sni = sni;
-    if let Some(access_log) = access_log {
-        internal = internal.with_access_log(access_log);
+    if let Some(access_log) = &access_log {
+        internal = internal.with_access_log(Arc::clone(access_log));
     }
-    internal.body = body;
+    let mut body_failure = None;
+    match body {
+        H3RequestBody::Buffered(body) => internal.body = body,
+        H3RequestBody::Streaming(mut stream, failure) => {
+            body_failure = Some(failure);
+            // The limit is applied lazily by `RequestBody::with_limit`; the shared counter records
+            // the bytes the handlers actually read (Caddy's `bytes_read`).
+            if let Some(access_log) = &access_log {
+                stream = stream.with_counter(access_log.request_bytes());
+            }
+            internal =
+                internal.with_streaming_body(RequestBody::streaming(stream).with_limit(limit));
+        }
+    }
     if let Some(local) = local_addr {
         internal
             .vars
@@ -273,7 +299,25 @@ pub(crate) async fn serve_internal_buffered(
     }
     trusted_proxies.apply(&mut internal);
     let is_head = internal.method == http::Method::HEAD;
-    match router.handle_upgradable(internal).await {
+    let outcome = router.handle_upgradable(internal).await;
+    // The request body failed mid-stream (the client stalled, sent a body that disagrees with its
+    // `Content-Length`, or the stream broke). A proxy upstream may have seen the failed body as a
+    // complete, shorter one and answered success; the client must never be told its upload
+    // succeeded, so the handler's answer is replaced.
+    if let Some(status) = body_failure
+        .as_ref()
+        .map(|failure| failure.load(std::sync::atomic::Ordering::SeqCst))
+        .filter(|status| *status != 0)
+        .and_then(|status| StatusCode::from_u16(status).ok())
+    {
+        let text = if status == StatusCode::REQUEST_TIMEOUT {
+            "408 Request Timeout"
+        } else {
+            "400 Bad Request"
+        };
+        return served_response_with_identity(limits, status_response(status, text));
+    }
+    match outcome {
         Ok(ResponseOutcome::Response(response)) => ServedResponse::Response(
             to_hyper_streaming_with_identity(response, is_head, &limits.server_identity),
         ),
