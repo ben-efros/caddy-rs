@@ -1785,11 +1785,18 @@ impl ServerRuntime {
     }
 
     async fn stop_all(&mut self) {
-        // Force-close remaining connections, then give their tasks a bounded moment to observe the
-        // force signal and drop their tracker guards. Go's Shutdown only returns once its
-        // connections are done; without this wait, connection tasks outlive the runtime and leak.
+        // Force-close connections on the HTTP listeners so idle keep-alive connections don't
+        // delay shutdown. The admin endpoint is deliberately NOT force-closed here: an in-flight
+        // `POST /stop` response (200 OK) must be written to the client before the process exits,
+        // and `std::process::exit` skips async-I/O flushing, so aborting the admin connection
+        // would drop the reply and make a client observe no response. `wait_for_trackers_closed`
+        // below waits for admin connections to drain their responses first (bounded by the
+        // timeout), so the `/stop` reply is delivered before `release_shutdown_latch` and the
+        // subsequent `process::exit`.
         let trackers = self.trackers();
-        self.force_all();
+        for handle in self.listeners.values() {
+            handle.begin_force();
+        }
         let remaining = wait_for_trackers_closed(&trackers, Duration::from_secs(2)).await;
         if remaining > 0 {
             tracing::warn!(
@@ -1797,11 +1804,17 @@ impl ServerRuntime {
                 "connections still active after forced shutdown; listener tasks are detached"
             );
         }
+        // Stop ACCEPTING on the admin endpoint without forcing its connections. `stop_forcibly`
+        // would call `begin_force`, which drops an admin connection without waiting for in-flight
+        // work -- and the in-flight work here is the `POST /stop` reply this teardown exists to let
+        // through. The drain above already waited (bounded) for those responses to be written, so a
+        // graceful stop is enough; anything still open past the bound is left to the process exit,
+        // exactly as before.
         if let Some(admin) = self.admin.take() {
-            admin.stop_forcibly().await;
+            admin.stop().await;
         }
         if let Some(admin_remote) = self.admin_remote.take() {
-            admin_remote.stop_forcibly().await;
+            admin_remote.stop().await;
         }
         let listeners = std::mem::take(&mut self.listeners);
         for (_, handle) in listeners {
@@ -3448,6 +3461,75 @@ mod shutdown_latch_tests {
             "the /stop exit path removes the admin socket the process owns"
         );
         runtime.stop_all().await;
+    }
+
+    /// `stop_all` must NOT force-close the admin endpoint.
+    ///
+    /// `POST /stop` is served *on* the admin connection, and its 200 OK is written after the handler
+    /// returns. A forced admin connection is dropped without waiting for in-flight work
+    /// (`crates/server/src/listeners.rs`, the `force.changed()` arm drops the connection outright), so
+    /// force-closing it from `stop_all` races the reply: the client that asked to stop can observe no
+    /// response, and the subsequent `std::process::exit` skips async-I/O flushing so the reply can
+    /// never be retried. The HTTP listeners must still be force-closed -- idle keep-alive connections
+    /// there really would delay shutdown.
+    ///
+    /// Asserted on the runtime's own state rather than on a stderr notice, so it holds for both the
+    /// TCP and the Unix admin endpoint and does not depend on timing: `force` is a `watch` channel, so
+    /// "was this listener forced" is directly observable after `stop_all` returns.
+    #[tokio::test]
+    async fn stop_all_force_closes_http_listeners_but_not_the_admin_endpoint() {
+        let store = Arc::new(GenerationStore::with_builtin_registry());
+        let mut runtime = ServerRuntime::new(Arc::clone(&store));
+        store
+            .load(
+                Config::from_value(serde_json::json!({
+                    "admin": {"listen": "127.0.0.1:0"},
+                    "apps": {"http": {"servers": {"srv0": {"listen": ["127.0.0.1:0"]}}}}
+                }))
+                .expect("configuration decodes"),
+            )
+            .expect("configuration loads");
+        runtime.apply().await.expect("initial apply");
+        assert!(
+            runtime.admin.is_some(),
+            "the admin endpoint is running, so stop_all has something to leave un-forced"
+        );
+
+        // Observe the senders before stop_all takes the handles apart.
+        let admin_forces: Vec<_> = runtime
+            .admin_handles()
+            .map(|handle| handle.force.subscribe())
+            .collect();
+        let http_forces: Vec<_> = runtime
+            .listeners
+            .values()
+            .map(|handle| handle.force.subscribe())
+            .collect();
+        assert!(
+            !admin_forces.is_empty(),
+            "there is an admin listener to check"
+        );
+        assert!(
+            !http_forces.is_empty(),
+            "there is an HTTP listener to check"
+        );
+
+        runtime.stop_all().await;
+
+        for (index, force) in admin_forces.iter().enumerate() {
+            assert!(
+                !*force.borrow(),
+                "stop_all {index} force-closed the admin endpoint, which races the in-flight \
+                 POST /stop reply it is itself serving"
+            );
+        }
+        for (index, force) in http_forces.iter().enumerate() {
+            assert!(
+                *force.borrow(),
+                "stop_all {index} left an HTTP listener un-forced, so idle keep-alive \
+                 connections can delay shutdown"
+            );
+        }
     }
 }
 
