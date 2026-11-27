@@ -1627,7 +1627,27 @@ async fn http3_stalled_upload_closes_the_connection_instead_of_reusing_it() {
     let closed = tokio::time::timeout(Duration::from_secs(10), connection.closed())
         .await
         .expect("the server must close the connection after abandoning the upload");
-    let _ = closed;
+    // The close must be the one this fix introduces, not any close: an idle timeout or a
+    // client-side drop would also satisfy "the connection eventually closed" and would let the
+    // unfixed pump pass. Pin the exact signature the abandoned-read path emits.
+    match closed {
+        quinn::ConnectionError::ApplicationClosed(close) => {
+            assert_eq!(
+                u64::from(close.error_code),
+                0,
+                "the abandoned-upload close carries application error 0, got {:?}",
+                close
+            );
+        }
+        other => panic!("the abandoned upload must close the connection, not {other:?}"),
+    }
+    // ... and it must be attributable to the read timeout, not to an idle timeout (30s by default
+    // in quinn): the fix closes within roughly `read_idle_timeout`.
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the close must follow the 1s read timeout, took {:?}",
+        started.elapsed()
+    );
     if let Ok(response) = &outcome {
         // If a response was delivered first it must be the 408; a 200 would mean the stalled body
         // was treated as a complete upload.
