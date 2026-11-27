@@ -3463,21 +3463,30 @@ mod shutdown_latch_tests {
         runtime.stop_all().await;
     }
 
-    /// `stop_all` must NOT force-close the admin endpoint.
+    /// `stop_all` must NOT force-close the admin endpoint, and MUST force the HTTP listeners
+    /// BEFORE it waits for them.
     ///
     /// `POST /stop` is served *on* the admin connection, and its 200 OK is written after the handler
-    /// returns. A forced admin connection is dropped without waiting for in-flight work
-    /// (`crates/server/src/listeners.rs`, the `force.changed()` arm drops the connection outright), so
-    /// force-closing it from `stop_all` races the reply: the client that asked to stop can observe no
-    /// response, and the subsequent `std::process::exit` skips async-I/O flushing so the reply can
-    /// never be retried. The HTTP listeners must still be force-closed -- idle keep-alive connections
-    /// there really would delay shutdown.
+    /// returns. A forced connection is dropped without waiting for in-flight work
+    /// (`crates/server/src/listeners.rs`, the `force.changed()` arm drops it outright), so
+    /// force-closing admin from `stop_all` races the reply: the client that asked to stop can observe
+    /// no response, and the `process::exit` that follows skips async-I/O flushing so it can never be
+    /// retried. The HTTP listeners are the opposite case and must still be forced, or idle keep-alive
+    /// connections there delay shutdown.
     ///
-    /// Asserted on the runtime's own state rather than on a stderr notice, so it holds for both the
-    /// TCP and the Unix admin endpoint and does not depend on timing: `force` is a `watch` channel, so
-    /// "was this listener forced" is directly observable after `stop_all` returns.
+    /// TWO ASSERTIONS, because the obvious one is not enough. "HTTP is forced when `stop_all`
+    /// returns" cannot distinguish the designs: the teardown further down calls `stop_forcibly()` on
+    /// every HTTP handle, which forces them too, so both a correct `stop_all` and one that never
+    /// forces HTTP early reach that post-condition. Measured: deleting the early force loop left the
+    /// post-condition assertion passing. What the early loop actually buys is ORDER -- HTTP is forced
+    /// before the bounded drain, not after -- so that is what is asserted here, by holding a
+    /// connection open on the HTTP tracker and timing how long `stop_all` takes: forced before the
+    /// wait, it returns immediately; forced after, it must wait out the whole bound.
+    ///
+    /// Both `force` and the tracker are `watch`/`Arc` state on the runtime itself, so this holds for
+    /// either transport and does not depend on a stderr notice.
     #[tokio::test]
-    async fn stop_all_force_closes_http_listeners_but_not_the_admin_endpoint() {
+    async fn stop_all_force_closes_http_listeners_before_draining_but_never_forces_admin() {
         let store = Arc::new(GenerationStore::with_builtin_registry());
         let mut runtime = ServerRuntime::new(Arc::clone(&store));
         store
@@ -3495,7 +3504,8 @@ mod shutdown_latch_tests {
             "the admin endpoint is running, so stop_all has something to leave un-forced"
         );
 
-        // Observe the senders before stop_all takes the handles apart.
+        // Observe the senders, and hold one HTTP connection open, before stop_all takes the handles
+        // apart. The held guard keeps the drain from completing until the force lands.
         let admin_forces: Vec<_> = runtime
             .admin_handles()
             .map(|handle| handle.force.subscribe())
@@ -3513,21 +3523,59 @@ mod shutdown_latch_tests {
             !http_forces.is_empty(),
             "there is an HTTP listener to check"
         );
+        // A REAL connection to a bound HTTP listener. A synthetic tracker guard would not do: the
+        // force only sends on the listener's watch channel, and it is the connection TASK that drops
+        // its guard on seeing it, so a synthetic guard outlives the force and makes the timing
+        // assertion below measure nothing but the bound itself.
+        let address = runtime
+            .listeners
+            .values()
+            .find_map(|handle| handle.socket_addr)
+            .expect("an HTTP listener with a bound TCP address");
+        let held =
+            std::net::TcpStream::connect(address).expect("open a connection to the listener");
+        let http_tracker = runtime
+            .listeners
+            .values()
+            .next()
+            .expect("an HTTP listener")
+            .tracker();
+        // Wait for the listener task to admit the connection before stopping.
+        let waited = std::time::Instant::now();
+        while http_tracker.active() == 0 && waited.elapsed() < std::time::Duration::from_secs(5) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            http_tracker.active() > 0,
+            "the test needs an admitted HTTP connection for the timing assertion to mean anything"
+        );
 
+        let started = std::time::Instant::now();
         runtime.stop_all().await;
+        let elapsed = started.elapsed();
+        drop(held);
 
+        // ORDER: the drain is bounded at 2s. Force-before-wait returns immediately because the forced
+        // connection stops being counted; force-after-wait cannot, because nothing has dropped the
+        // held connection yet, so it must sit out the bound.
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "stop_all took {elapsed:?}: the HTTP listeners were forced only after the drain, so an \
+             idle keep-alive connection held the shutdown for the whole bound -- the cost the early \
+             force exists to prevent"
+        );
+        for (index, force) in http_forces.iter().enumerate() {
+            assert!(
+                *force.borrow(),
+                "stop_all {index} left an HTTP listener un-forced, so idle keep-alive connections \
+                 can delay shutdown"
+            );
+        }
         for (index, force) in admin_forces.iter().enumerate() {
             assert!(
                 !*force.borrow(),
                 "stop_all {index} force-closed the admin endpoint, which races the in-flight \
                  POST /stop reply it is itself serving"
-            );
-        }
-        for (index, force) in http_forces.iter().enumerate() {
-            assert!(
-                *force.borrow(),
-                "stop_all {index} left an HTTP listener un-forced, so idle keep-alive \
-                 connections can delay shutdown"
             );
         }
     }
