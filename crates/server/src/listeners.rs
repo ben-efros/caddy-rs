@@ -1260,6 +1260,9 @@ async fn serve_h3_connection(
                         // resolves the reader's `cancelled` receiver), even if the handler
                         // answered without consuming the whole upload.
                         let mut _body_reader = None;
+                        // Set by the body reader if it had to return with a read still in flight;
+                        // the connection is closed in that case (see the pump).
+                        let body_abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
                         // Status the reader records when the streamed upload fails, so the client
                         // is never told success for an upload that did not complete.
                         let body_failure = Arc::new(std::sync::atomic::AtomicU16::new(0));
@@ -1275,6 +1278,7 @@ async fn serve_h3_connection(
                                 body_idle_timeout,
                                 declared_length,
                                 Arc::clone(&body_failure),
+                                Arc::clone(&body_abandoned),
                             ));
                             streamed_body = Some(StreamingBody::from_chunks(receiver));
                         }
@@ -1531,6 +1535,19 @@ async fn serve_h3_connection(
                         if failed {
                             continue;
                         }
+                        // A body read was abandoned while in flight, so this request's receive
+                        // stream cannot be dropped safely (h3-quinn took it into the read future;
+                        // dropping it calls `stop_sending` on an absent stream and panics -- see
+                        // `pump_h3_request_body`). The response above has already been written, so
+                        // the client has its answer; close the connection cleanly and stop serving
+                        // it. Closing is what lets the stream go without that drop panicking.
+                        if body_abandoned.load(std::sync::atomic::Ordering::SeqCst) {
+                            tracing::debug!(
+                                "HTTP/3 request body read abandoned mid-flight; closing the connection"
+                            );
+                            connection.close(0u32.into(), b"");
+                            break;
+                        }
                         continue;
                     }
                     Ok(None) => break,
@@ -1591,6 +1608,10 @@ async fn pump_h3_request_body<S>(
     idle: Duration,
     declared: Option<u64>,
     failure_status: Arc<std::sync::atomic::AtomicU16>,
+    // Set when the pump had to return while `recv_data()` was still pending. The connection loop
+    // then closes the QUIC connection instead of dropping a stream h3-quinn has taken out of its
+    // `Option` (T-H3-STREAM-PANIC-FLAKE).
+    abandoned: Arc<std::sync::atomic::AtomicBool>,
 ) where
     S: h3::quic::RecvStream,
 {
@@ -1606,12 +1627,25 @@ async fn pump_h3_request_body<S>(
         // with code 0); `stop_sending` is called only where the previous read has completed and
         // the stream is back in place.
         let next = tokio::select! {
-            _ = &mut cancelled => return,
+            _ = &mut cancelled => {
+                // The request is over while a read is pending. h3-quinn has TAKEN the QUIC stream
+                // into that read future, and puts it back only when the future completes, so this
+                // `RequestStream` can no longer be dropped: its `Drop` calls `stop_sending`, which
+                // unwraps the absent stream and panics (h3-quinn 0.0.10 lib.rs:392-394). Under
+                // `panic = "abort"` that is a client-triggerable kill of the whole server. Mark the
+                // abandonment and return; the connection loop closes the connection, which is the
+                // only clean way to stop caring about this stream (T-H3-STREAM-PANIC-FLAKE).
+                abandoned.store(true, Ordering::SeqCst);
+                return;
+            }
             next = tokio::time::timeout(idle, reader.recv_data()) => next,
         };
         let failure: (&'static str, Option<Code>) = match next {
             Err(_elapsed) => {
-                // Do not touch the stream: its read is still pending (see above).
+                // The read is still pending, so the stream is still taken (see the cancel arm):
+                // report the timeout to the handler, then let the connection loop close the
+                // connection rather than drop a stream that cannot be dropped safely.
+                abandoned.store(true, Ordering::SeqCst);
                 failure_status.store(408, Ordering::SeqCst);
                 let _ = chunks
                     .send(Err(caddy_rs_http::body::BodyError::Upstream(Box::new(
@@ -1648,15 +1682,24 @@ async fn pump_h3_request_body<S>(
                         Some(Code::H3_MESSAGE_ERROR),
                     )
                 } else {
+                    // These two arms must NOT call `stop_sending`. The read that produced this
+                    // chunk has completed, but the stream is only guaranteed to be back in the
+                    // `Option` until the next `recv_data()` -- and a panic backtrace taken while
+                    // this fix was being measured showed exactly this call unwrapping `None` at
+                    // h3-quinn lib.rs:394 under load. Abandoning instead lets the connection loop
+                    // close the connection, which stops caring about the stream at all.
                     tokio::select! {
                         _ = &mut cancelled => {
-                            reader.stop_sending(Code::H3_NO_ERROR);
+                            // The request is over while this chunk is unsent. Tell the client to
+                            // stop sending via the connection close (route (b), T-H3-STREAM-PANIC-FLAKE).
+                            abandoned.store(true, Ordering::SeqCst);
                             return;
                         }
                         sent = chunks.send(Ok(chunk)) => {
                             if sent.is_err() {
-                                // The handler dropped the body; stop the upload.
-                                reader.stop_sending(Code::H3_NO_ERROR);
+                                // The handler dropped the body; stop the upload by closing the
+                                // connection rather than touching the stream.
+                                abandoned.store(true, Ordering::SeqCst);
                                 return;
                             }
                             continue;
