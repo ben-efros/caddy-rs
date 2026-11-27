@@ -1564,11 +1564,23 @@ async fn http3_buffering_route_keeps_the_buffered_ceiling() {
     runtime.shutdown().await;
 }
 
-/// A client that stalls mid-upload is cut off after `read_idle_timeout`, and the QUIC connection serves
-/// other requests afterwards. QUIC keep-alive PINGs keep the connection itself alive, so without a
-/// body read timeout the handler (and its upstream connection) would be held forever.
+/// A client that stalls mid-upload is cut off after `read_idle_timeout` by CLOSING the QUIC
+/// connection (T-H3-STREAM-PANIC-FLAKE, DIV-0167).
+///
+/// QUIC keep-alive PINGs keep the connection itself alive, so without a body read timeout the
+/// handler (and its upstream connection) would be held forever -- that part is unchanged, and the
+/// upload is still cut off promptly.
+///
+/// What changed is HOW the upload is cut off. When the body read times out, h3-quinn has taken the
+/// QUIC stream into the pending read future and restores it only when that read completes, so the
+/// request stream can no longer be stopped or dropped: `stop_sending` (which the drop calls) unwraps
+/// the absent stream and panics, and under `panic = "abort"` a client could kill the whole server.
+/// The only clean way to stop caring about that stream is to close the connection, so the client
+/// observes the connection close rather than a `408` on a connection it can keep using. This test
+/// used to assert the 408 plus a follow-up request on the SAME connection, i.e. the contract this
+/// fix deliberately replaces; the name says what it now asserts.
 #[tokio::test]
-async fn http3_stalled_upload_is_cut_off_and_frees_the_connection() {
+async fn http3_stalled_upload_closes_the_connection_instead_of_reusing_it() {
     record_panics();
     let upstream = spawn_counting_upstream().await;
     let tcp = free_port();
@@ -1601,35 +1613,115 @@ async fn http3_stalled_upload_is_cut_off_and_frees_the_connection() {
     // ... and then say nothing, without finishing the stream.
 
     let started = std::time::Instant::now();
-    let response = tokio::time::timeout(Duration::from_secs(15), stalled.recv_response())
+    // The cut-off is observed as the connection closing. Either the request fails with the close, or
+    // a response arrives and the connection is closed right after; both must happen promptly.
+    let outcome = tokio::time::timeout(Duration::from_secs(15), stalled.recv_response())
         .await
-        .expect("the stalled upload must be cut off, not held open")
-        .expect("a response (the proxy reports the failed body)");
-    assert_eq!(
-        response.status(),
-        408,
-        "a body that stalled past read_idle_timeout is a request timeout"
-    );
+        .expect("the stalled upload must be cut off, not held open");
     assert!(
         started.elapsed() < Duration::from_secs(10),
         "cut off after roughly the 1s read timeout, took {:?}",
         started.elapsed()
     );
+    // The connection must now be gone: the server closed it, which is the whole point of the fix.
+    let closed = tokio::time::timeout(Duration::from_secs(10), connection.closed())
+        .await
+        .expect("the server must close the connection after abandoning the upload");
+    let _ = closed;
+    if let Ok(response) = &outcome {
+        // If a response was delivered first it must be the 408; a 200 would mean the stalled body
+        // was treated as a complete upload.
+        assert_eq!(
+            response.status(),
+            408,
+            "a body that stalled past read_idle_timeout is a request timeout"
+        );
+    } else {
+        // The close is the client's signal; it must not be a timeout or a local error.
+        let error = outcome.err().expect("checked above");
+        assert!(
+            error.to_string().contains("ApplicationClose")
+                || error.to_string().contains("Connection"),
+            "the upload must be cut off by the connection closing, not by {error}"
+        );
+    }
 
-    // The connection is usable again for a normal request.
+    // The connection is NOT reused: a later request on it fails rather than being served.
     let request = http::Request::builder()
         .method("GET")
         .uri("https://example.com/after")
         .body(())
         .unwrap();
-    let mut follow_up = send_request.send_request(request).await.expect("send");
-    follow_up.finish().await.expect("finish");
-    // The upstream is a plain counting server: any 2xx proves the request loop is free again.
-    let response = tokio::time::timeout(Duration::from_secs(15), follow_up.recv_response())
+    let follow_up = send_request.send_request(request).await;
+    let served = match follow_up {
+        Err(_) => false,
+        Ok(mut follow_up) => {
+            let _ = follow_up.finish().await;
+            matches!(
+                tokio::time::timeout(Duration::from_secs(5), follow_up.recv_response()).await,
+                Ok(Ok(_))
+            )
+        }
+    };
+    assert!(
+        !served,
+        "the connection was closed by the fix, so a later request on it must not be served"
+    );
+    drop(driver);
+    runtime.shutdown().await;
+    assert_no_task_panics();
+}
+
+/// A NORMAL (non-stalled) request must still leave its connection usable: the close above is
+/// reserved for the abandoned-read case and must not be the price of every HTTP/3 request.
+/// This is the control for `http3_stalled_upload_closes_the_connection_instead_of_reusing_it`.
+#[tokio::test]
+async fn http3_normal_request_keeps_the_connection_usable() {
+    record_panics();
+    let upstream = spawn_counting_upstream().await;
+    let tcp = free_port();
+    let udp = free_port();
+    let (runtime, status) = start(config_with_options(
+        tcp,
+        Some(udp),
+        Some(&["h1", "h2", "h3"]),
+        proxy_routes(upstream, serde_json::json!({})),
+        serde_json::json!({"read_idle_timeout": "1s"}),
+    ))
+    .await;
+    let address = udp_address(&status, udp);
+
+    let endpoint = quic_endpoint(client_config(vec![b"h3".to_vec()]));
+    let connection = connect(&endpoint, address).await.expect("QUIC connect");
+    let (driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(connection.clone()))
         .await
-        .expect("a later request on the same connection is served")
-        .expect("response");
-    assert_eq!(response.status(), 200);
+        .expect("HTTP/3 client");
+
+    // A complete upload followed by a complete GET, both on the same connection.
+    for (method, path, body) in [("POST", "/first", Some("hello")), ("GET", "/second", None)] {
+        let mut builder = http::Request::builder()
+            .method(method)
+            .uri(format!("https://example.com{path}"));
+        if body.is_some() {
+            builder = builder.header("content-length", body.unwrap().len().to_string());
+        }
+        let mut stream = send_request
+            .send_request(builder.body(()).unwrap())
+            .await
+            .expect("send");
+        if let Some(body) = body {
+            stream
+                .send_data(Bytes::from(body.to_string()))
+                .await
+                .expect("send the body");
+        }
+        stream.finish().await.expect("finish");
+        let response = tokio::time::timeout(Duration::from_secs(15), stream.recv_response())
+            .await
+            .expect("a response arrives")
+            .expect("response");
+        assert_eq!(response.status(), 200, "{method} {path}");
+    }
     drop(driver);
     runtime.shutdown().await;
     assert_no_task_panics();
