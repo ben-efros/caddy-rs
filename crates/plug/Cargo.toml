@@ -26,4 +26,4 @@ wasm-runtime = ["dep:wasmtime"]
 serde = { workspace = true }
 caddy-rs-core = { workspace = true }
 async-trait = { workspace = true }
-wasmtime = { version = "50", optional = true }
+wasmtime = { version = "51", optional = true }
