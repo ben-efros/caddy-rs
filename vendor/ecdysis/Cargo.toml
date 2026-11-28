@@ -139,4 +139,4 @@ features = [
 # env_logger/waitgroup are absent from this workspace's offline cargo cache.
 
 [target.'cfg(target_os = "linux")'.dependencies.tokio-seqpacket]
-version = "0.7"
+version = "0.9"
